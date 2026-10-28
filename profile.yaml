@@ -123,7 +123,7 @@ company_answers:
       - "I want to work remotely"
     "If you selected working remotely above, which state would you plan to work remotely from?": "New York"
     "What percentage of the time are you willing to travel?": "0%"
-    "Target Compensation": "$30/hr"
+    "Target Compensation": "61-65k"
   GuidePoint Security:
     "Which statement best describes your experience building or managing CI/CD pipelines?": "General user pushing code and triggering pipelines"
     "Which statement best describes your experience with Cloud Infrastructure and IaC?": "Basic - I have a conceptual cloud knowledge but limited hands-on IaC experience"
