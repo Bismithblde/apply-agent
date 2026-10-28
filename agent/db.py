@@ -575,7 +575,7 @@ def end_run(run_id: int, **counts: Any) -> None:
 
 def get_account_row(tenant_key: str) -> sqlite3.Row | None:
     with connect() as c:
-        return c.execute("SELECT * FROM accounts WHERE tenant_key=?", (tenant_key,)).fetchone()
+        return c.execute("SELECT * FROM accounts WHERE tenant_key=? COLLATE NOCASE", (tenant_key,)).fetchone()
 
 
 def put_account_row(tenant_key: str, company: str, login_url: str, email: str, password_enc: str,

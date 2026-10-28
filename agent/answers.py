@@ -660,7 +660,13 @@ def _company_confirmed_answer(field: Field, job: Job, profile: dict,
                         if not selected or any(v is None for v in selected):
                             selected = None
                     else:
-                        selected = _coerce(field, value, option_matcher)
+                        if field.options:
+                            opt = matching_option(value, field.options)
+                            if opt is None:
+                                return Answer(field.key, None, "unknown", "company option unavailable")
+                            selected = opt
+                        else:
+                            selected = _coerce(field, value, option_matcher)
                     if selected is not None:
                         return Answer(field.key, selected, "bank", "company answer confirmed in profile")
     if company == "compeer financial":
@@ -815,8 +821,7 @@ _RULES: list[tuple[re.Pattern, Resolver, str]] = [(re.compile(rx, re.I), fn, src
     (r"export control|itar\b|citizen or permanent resident of (?:one or more of )?(?:the )?(?:countries listed|following countries)|sanctioned countr", _sanctioned_countries, "profile"),
     (r"\b(relatives?|family members?)\b.{0,80}\b(employ|work|current)|related to (anyone|an employee|any employee)"
      r"|\b(employ|work)\w*\b.{0,60}\b(relatives?|family members?)\b", _p("preferences.relatives_at_company"), "profile"),
-    (r"previously (been )?(employed|worked)|worked (here|for us) before|former employee|ever (been )?(employed|worked) (by|at|for)"
-     r"|current or former employee", _p("preferences.previously_employed_here"), "profile"),
+    (r"(?:previously|ever|currently)\s+(?:been\s+)?(?:employed|worked|intern\w*)|worked\s+(?:here|for\s+us)\s+before|former\s+employee|(?:ever|currently)\s+(?:been\s+)?(?:employed|working)\s+(?:by|at|for)|(?:current|former)\s+or\s+(?:current|former)\s+employee|currently\s+an\s+(?:employee|intern|worker|contractor)", _p("preferences.previously_employed_here"), "profile"),
     (r"non-?compete|restrictive covenant", _p("preferences.non_compete"), "profile"),
     (r"consider (me|you) for other|other (job )?(opportunities|openings|roles|positions)|talent (pool|community|network)|interested in a (?:full[- ]time|permanent|future) role|full[- ]time role within",
      _p("preferences.consider_other_roles"), "profile"),
@@ -861,13 +866,13 @@ def _coerce(field: Field, value: Any, option_matcher: Callable[[list[str], str],
             else:
                 hit = (matching_option(candidate, field.options) if field.kind in ("select", "combobox")
                        else best_option(candidate, field.options))
-            if not hit:
+            if not hit and not _needs_fact_evidence(field):
                 idx = llm.pick_option(field.options, candidate, field.label or field.name)
                 if idx is not None and 0 <= idx < len(field.options):
                     hit = field.options[idx]
             if hit:
                 return [hit] if field.kind == "checkbox" else hit
-        if searchable_options(field) or (option_matcher and field.kind == "select"):
+        if searchable_options(field):
             first = cands[0]
             return ("Yes" if first else "No") if isinstance(first, bool) else str(first)
         return None
@@ -1587,13 +1592,13 @@ def _validate(f: Field, r: dict, evidence: list[_Evidence], job_text: str = "",
                     hit = None
             else:
                 hit = p if p in f.options else matching_option(p, f.options)
-            if not hit:
+            if not hit and not factual:
                 idx = llm.pick_option(f.options, p, f.label or f.name)
                 if idx is not None and 0 <= idx < len(f.options):
                     hit = f.options[idx]
             if not hit:
                 return Answer(f.key, None, "unknown", f"LLM option not in list: {p[:60]}")
-            if factual and src == "bank" and not negative_or_na and not _option_supported(hit, f, cited):
+            if factual and src == "bank" and not _option_supported(hit, f, cited):
                 return Answer(f.key, None, "unknown", f"selected option lacks evidence: {hit[:60]}")
             mapped.append(hit)
         return Answer(f.key, mapped if f.kind == "checkbox" else mapped[0], src, note)

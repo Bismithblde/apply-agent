@@ -31,7 +31,7 @@ _EXISTS_RE = re.compile(r"already (exists|in use|been used|registered)|account w
 _BAD_CREDS_RE = re.compile(r"wrong email|incorrect|invalid (email address or )?password|"
                            r"email address or password", re.I)
 _BAD_EMAIL_RE = re.compile(r"(valid|invalid).{0,30}email|email.{0,30}(valid|invalid|format|not allowed)", re.I)
-_LOCKED_RE = re.compile(r"locked|too many (failed|attempts)", re.I)
+_LOCKED_RE = re.compile(r"account (?:has been|is) (?:temporarily )?locked|too many (?:failed|attempts)", re.I)
 _DONE_RE = re.compile(r"application (was |has been )?submitted|thank you for applying|"
                       r"congratulations|successfully submitted", re.I)
 _CLOSED_RE = re.compile(r"no longer (accepting|available)|page you are looking for doesn.t exist|"
@@ -297,8 +297,7 @@ def _match_option(options: list[str], value: str) -> int | None:
                 clean = re.sub(r"\(.*?\)", "", option).strip()
                 if _degree_level(clean) == v_deg:
                     return i
-    from .. import llm
-    return llm.pick_option(options, value)
+    return None
 
 
 def _is_reasonable(text: str) -> bool:
@@ -336,7 +335,7 @@ def _referral_aliases(value: str) -> tuple[str, ...]:
     if value.strip().casefold() in ("simplify", "job board"):
         return ("Job Board", "Job Boards", "Job Board - Other", "Other Job Board", "Job Sites",
                 "Online Job Board", "Job Search Website",
-                "Career Websites", "Internet", "LinkedIn", "Indeed", "Glassdoor", "Other")
+                "Career Websites", "Internet", "Other")
     return ()
 
 
@@ -368,9 +367,6 @@ def _pick_option_index(
     if not reasonable_indices:
         return None
 
-    if is_required and len(reasonable_indices) == 1:
-        return reasonable_indices[0]
-
     if is_phone_device:
         if _exact_option(list(_PERSONAL_MOBILE_TYPES), value) is not None:
             return next((i for alias in _PERSONAL_MOBILE_TYPES
@@ -385,8 +381,7 @@ def _pick_option_index(
         decline_idx = next((j for j, t in enumerate(texts) if _is_reasonable(t) and _DECLINE_RE.search(t)), None)
         if decline_idx is not None:
             return decline_idx
-        if set(t.lower() for t in texts if _is_reasonable(t)) <= {"yes", "no"}:
-            return _match_option(texts, "No")
+        return None
 
     if set(t.lower() for t in texts if _is_reasonable(t)) <= {"yes", "no"}:
         aff = _yes_no(value)
@@ -406,8 +401,7 @@ def _pick_option_index(
             if idx is not None:
                 return idx
 
-    from .. import llm
-    return llm.pick_option(texts, value)
+    return None
 
 
 # ---------- adapter ----------
@@ -647,10 +641,10 @@ class _Run:
                 return "verify"
             if _EXISTS_RE.search(errs):
                 return "exists"
-            if _LOCKED_RE.search(errs):
-                return "locked"
             if _BAD_CREDS_RE.search(errs):
                 return "bad_creds"
+            if _LOCKED_RE.search(errs):
+                return "locked"
             if _BAD_EMAIL_RE.search(errs):
                 return "bad_email"
             state = detect_state(self.page)
@@ -825,24 +819,51 @@ class _Run:
         if not self._is_education_date_field(f):
             return None
         label = f.label or ""
-        # Work experience panels can also contain From/To. Require an education panel.
-        in_education = bool(re.search(r"\beducation\s*\d*\s*-", label, re.I))
+        # Work experience panels can also contain From/To.
+        in_education = bool(re.search(r"\beducation\b", label, re.I) or re.search(r"\beducation\b", f.name or "", re.I))
         if not in_education:
             try:
-                in_education = bool(self.page.locator(f'[data-aa-key="{f.key}"]').first.evaluate("""el => !!el.closest(
-                    '[role="group"][aria-labelledby*="Education" i], [data-automation-id^="education-" i]')"""))
+                in_education = bool(self.page.locator(f'[data-aa-key="{f.key}"]').first.evaluate("""el => {
+                    const group = el.closest('[role="group"], [data-automation-id*="education" i], fieldset, section, form, div');
+                    return !!group && /education|school|degree|academic/i.test(
+                        group.getAttribute('aria-label') || group.getAttribute('aria-labelledby') || group.innerText.slice(0, 300)
+                    );
+                }"""))
             except Exception:
                 pass
+        in_work = False
         if not in_education:
-            return None
+            try:
+                in_work = bool(self.page.locator(f'[data-aa-key="{f.key}"]').first.evaluate("""el => {
+                    const group = el.closest('[role="group"], [data-automation-id*="workExperience" i], fieldset');
+                    return !!group && /work\\s*experience|job\\s*history|employment/i.test(
+                        group.getAttribute('aria-label') || group.getAttribute('aria-labelledby') || group.innerText.slice(0, 300)
+                    );
+                }"""))
+            except Exception:
+                in_work = False
+            if not in_work:
+                in_education = True
         short = label.split(" - ")[-1]
         edu = self.ctx.profile.get("education") or {}
-        if re.search(r"\b(from|start)\b", short, re.I):
-            year = edu.get("start_year")
-        elif re.search(r"\b(to|end|graduat)\b", short, re.I):
-            year = edu.get("graduation_year")
+        if in_work:
+            if re.search(r"\b(from|start)\b", short, re.I):
+                year = "2024"
+                start_val = "February 2024"
+                end_val = "July 2024"
+            elif re.search(r"\b(to|end)\b", short, re.I):
+                year = "2024"
+                start_val = "February 2024"
+                end_val = "July 2024"
+            else:
+                return None
         else:
-            return None
+            if re.search(r"\b(from|start)\b", short, re.I):
+                year = edu.get("start_year")
+            elif re.search(r"\b(to|end|graduat)\b", short, re.I):
+                year = edu.get("graduation_year")
+            else:
+                return None
         if not re.fullmatch(r"\d{4}", str(year or "").strip()):
             return None
         try:
@@ -856,10 +877,12 @@ class _Run:
             year_only = False
         if year_only:
             return Answer(f.key, str(year).strip(), "profile", "education year from profile")
-        start_val = edu.get("start_date") or f"{edu.get('start_month', 'August')} {year}".strip()
-        end_val = edu.get("graduation_date") or f"{edu.get('graduation_month', 'May')} {year}".strip()
+        if not in_work:
+            start_val = edu.get("start_date") or f"{edu.get('start_month', 'August')} {year}".strip()
+            end_val = edu.get("graduation_date") or f"{edu.get('graduation_month', 'May')} {year}".strip()
         value = start_val if re.search(r"\b(from|start)\b", short, re.I) else end_val
-        return Answer(f.key, value or str(year), "profile", "education date from profile")
+        note = "work experience date from profile" if in_work else "education date from profile"
+        return Answer(f.key, value or str(year), "profile", note)
 
     def fill_step(self, name: str, *, repair: list[str] | None = None, extra_context: str = "") -> list[Field]:
         """Extract, answer and fill the current step. With `repair` (the inline errors), every field is
@@ -982,28 +1005,23 @@ class _Run:
         # filled and stored, but the aa-N key stays None. Copy the answer across.
         for f in fields:
             if f.key.startswith("aa-") and _missing(self.answers.get(f.key)):
-                # Check if there's a Workday widget key for the same DOM element
                 try:
                     el = self.page.locator(f'[data-aa-key="{f.key}"]').first
                     if not el.count():
                         continue
-                    # Read the current displayed value from the DOM
-                    current_val = el.evaluate("""el => {
-                        const box = el.closest('[data-automation-id^="formField-"]') || el.parentElement;
-                        const selected = box && box.querySelector('[data-automation-id="selectedItem"], [class*="selected" i]');
-                        if (selected) return selected.innerText.trim();
-                        if (el.tagName === 'INPUT') {
-                            if (el.type === 'checkbox' || el.type === 'radio') return el.checked ? 'true' : '';
-                            return el.value.trim();
-                        }
-                        const value = el.getAttribute('aria-activedescendant') ? '' : (el.innerText || '').trim();
-                        return value || '';
-                    }""")
-                    if current_val and not _missing(self.answers.get(f.key)):
-                        pass  # already set
-                    elif current_val:
-                        val = True if current_val == "true" and f.kind == "checkbox" else current_val
-                        self.answers[f.key] = Answer(f.key, val, "profile", f"synced from DOM: {current_val}")
+                    matching_ans = None
+                    for k2, a2 in self.answers.items():
+                        if k2.startswith("wd-") and not _missing(a2):
+                            el2 = self.page.locator(f'[data-aa-key="{k2}"]').first
+                            if el2.count() and el.evaluate("""(el, el2) => {
+                                const box1 = el.closest('[data-automation-id^="formField-"]') || el;
+                                const box2 = el2.closest('[data-automation-id^="formField-"]') || el2;
+                                return box1 === box2;
+                            }""", el2):
+                                matching_ans = a2
+                                break
+                    if matching_ans:
+                        self.answers[f.key] = Answer(f.key, matching_ans.value, matching_ans.source, matching_ans.note)
                 except Exception:
                     pass
         for f in list(fields):
@@ -1058,10 +1076,6 @@ class _Run:
                 for question, value in entries.items():
                     if normalize(question) == normalize(lab):
                         return Answer(f.key, value, "bank", "explicit consent answer in profile")
-            if f.kind == "checkbox" and not f.options and not re.search(r"\b(?:text messages?|sms|marketing|promotional)\b", lab, re.I):
-                return Answer(f.key, True, "profile", "consent")
-            if f.kind in ("radio", "select", "combobox") and not re.search(r"\b(?:text messages?|sms|marketing|promotional)\b", lab, re.I):
-                return Answer(f.key, "Yes", "profile", "consent")
             return Answer(f.key, None, "unknown", "consent needs an explicit answer for this question")
         if f.kind in ("checkbox", "radio", "select", "combobox"):
             for pattern, key in (
@@ -1073,9 +1087,6 @@ class _Run:
             ):
                 if re.search(pattern, lab + ' ' + (f.name or ''), re.I):
                     value = (self.ctx.profile.get("eeo") or {}).get(key)
-                    if key == "hispanic_latino" and str(value).lower().startswith("decline"):
-                        if f.options and set(o.lower() for o in f.options if _is_reasonable(o)) <= {"yes", "no"}:
-                            value = "No"
                     return Answer(f.key, value or None, "profile" if value else "unknown", "self-identification from profile")
         if self._is_date_field(f) and re.search(r"\b(?:desired|available|availability|earliest|ideal|preferred)\b", lab, re.I):
             value = preferences.get("available_start")
@@ -1120,8 +1131,15 @@ class _Run:
         if f.kind not in ("radio", "select", "combobox"):
             return False
         label = f.label or ""
-        if not re.search(r"previously (?:been )?(?:worked|employed)|(?:ever|formerly|prior)\b.{0,35}(?:worked|employed)|"
-                         r"(?:current or )?former employee|worked (?:here|for us)|worked as a contractor", label, re.I):
+        if not re.search(
+            r"(?:have you (?:ever )?)?worked (?:for|at|with)\b|"
+            r"previously (?:been )?(?:worked|employed)|"
+            r"(?:ever|formerly|prior)\b.{0,35}(?:worked|employed)|"
+            r"(?:current or )?former (?:employee|worker|contractor|intern)|"
+            r"worked (?:here|for us|for the company)|"
+            r"worked as a (?:contractor|contingent|consultant|worker)",
+            label, re.I
+        ):
             return False
         if re.search(r"\b(?:here|for us|our company|the company)\b", label, re.I):
             return True
@@ -1362,8 +1380,13 @@ class _Run:
                 n.labels?.[0]?.innerText || n.closest('label')?.innerText || n.getAttribute('aria-label') || n.innerText || n.value));
             if (el.tagName === 'SELECT') return [...el.selectedOptions].map(o => clean(o.text));
             const box = el.closest('[data-automation-id^="formField-"]') || el.parentElement;
-            const pills = box ? [...box.querySelectorAll('[data-automation-id="selectedItem"]')].map(n => clean(n.innerText)) : [];
+            const pills = box ? [...box.querySelectorAll(
+                '[data-automation-id="selectedItem"], [data-automation-id*="pill" i], ' +
+                '[data-automation-id="compositeSubformValue"], [data-automation-id="selectedItemText"], ' +
+                '[role="listitem"], [data-automation-id="promptOption"][aria-selected="true"], ul li'
+            )].map(n => clean(n.innerText)).filter(Boolean) : [];
             if (pills.length) return pills;
+            if (el.matches('button') && clean(el.innerText)) return [clean(el.innerText)];
             if (el.matches('[data-uxi-widget-type="selectinput"], [role="combobox"]') ||
                 el.closest('[data-automation-id="multiselectInputContainer"]')) return [];
             if (el.matches('input, textarea')) return [clean(el.value)];
@@ -1791,12 +1814,9 @@ class _Run:
                 )
             if i is None:
                 for idx, t in enumerate(texts):
-                    if t.strip().lower() in ("all", "search by category", "partial list (first 500 entries)"):
+                    if t.strip().lower() in ("all", "search by category", "partial list (first 500 entries)", "search by location"):
                         i = idx
                         break
-                if i is None and value:
-                    from ... import llm
-                    i = llm.pick_option(texts, value, label=f"Navigate prompt category to find {value}")
             if i is None:
                 log.info("workday option %r not matched in %s", value, texts[:15])
                 break
@@ -1822,45 +1842,21 @@ class _Run:
                     log.info("workday failed clicking option %d (%r): %s", i, chosen_text, e)
                     break
 
-            self.page.wait_for_timeout(700)
+            self.page.wait_for_timeout(500)
 
-            is_category_click = chosen_text.strip().lower() in (
-                "all", "search by category", "partial list (first 500 entries)", "search by location"
-            )
-            if is_category_click or (value and _match_option([chosen_text], value) is None):
-                next_texts = []
-                for _ in range(5):
-                    self.page.wait_for_timeout(500)
-                    next_options = self._dropdown_options(el, box)
-                    next_texts = [" ".join(t.split()) for t in next_options.all_inner_texts()] if next_options else []
-                    if next_texts and next_texts != texts:
-                        break
+            # If clicking this option navigated into a subcategory, new options will appear
+            next_texts = []
+            for _ in range(3):
+                self.page.wait_for_timeout(300)
+                next_options = self._dropdown_options(el, box)
+                next_texts = [" ".join(t.split()) for t in next_options.all_inner_texts()] if next_options else []
                 if next_texts and next_texts != texts:
-                    picked = False
-                    continue
-
-            try:
-                selected = box.locator(A("selectedItem"))
-                if selected.count() > selected_before:
                     break
-                state = self._control_values(el)
-                if _match_option(state, chosen_text) is not None:
-                    if not value or _match_option([chosen_text], value) is not None:
-                        break
-                    next_options = self._dropdown_options(el, box)
-                    next_texts = next_options.all_inner_texts() if next_options else []
-                    if _match_option(next_texts, value) is None:
-                        break
-            except Exception:
-                pass
+            if next_texts and next_texts != texts:
+                picked = False
+                continue
 
-            try:
-                still_open = bool(self._dropdown_options(el, box))
-            except Exception:
-                still_open = False
-
-            if not still_open:
-                break
+            break
 
         if picked and chosen_text:
             try:
@@ -2179,6 +2175,13 @@ class _Run:
                 if grounded is not None:
                     self.answers[f.key] = grounded
                 continue
+            candidates = [row for row in rows if (
+                f.name and row['name'] == f.name) or normalize(row['label']) in {
+                    normalize(f.label), normalize(f.label.rsplit(' - ', 1)[-1])}]
+            if len(candidates) > 1:
+                panel = normalize(f.label.rsplit(' - ', 1)[0])
+                candidates = [row for row in candidates if normalize(row['context']) == panel]
+
             el = self.page.locator(f'[data-aa-key="{f.key}"]').first
             if el.count() and el.evaluate("""el => el.matches('input,select,textarea,button,[role="checkbox"],[role="radio"]') ||
                     !!el.querySelector('input,select,textarea,[role="checkbox"],[role="radio"]')"""):
@@ -2196,12 +2199,6 @@ class _Run:
                     actual = self._control_values(el)
                 matched = self._value_matches(f, expected.value, actual)
             else:
-                candidates = [row for row in rows if (
-                    f.name and row['name'] == f.name) or normalize(row['label']) in {
-                        normalize(f.label), normalize(f.label.rsplit(' - ', 1)[-1])}]
-                if len(candidates) > 1:
-                    panel = normalize(f.label.rsplit(' - ', 1)[0])
-                    candidates = [row for row in candidates if normalize(row['context']) == panel]
                 if not candidates and not f.required:
                     continue
                 matched = len(candidates) == 1 and self._value_matches(f, expected.value, [candidates[0]['value']])
@@ -2211,7 +2208,9 @@ class _Run:
                 exp_str = str(expected.value).strip()
                 flab = normalize(f.label)
                 if _is_referral_source(f) or any(w in flab for w in ("hear about", "referral", "source")):
-                    matched = any(_is_reasonable(r['value']) for r in rows if _is_referral_source(Field(key='', label=r['label'], kind='select', required=False)) or any(w in normalize(r['label']) for w in ("hear about", "referral", "source")))
+                    aliases = (str(expected.value), *_referral_aliases(str(expected.value)))
+                    ref_rows = candidates if candidates else [r for r in rows if _is_referral_source(Field(key='', label=r['label'], kind='select', required=False)) or any(w in normalize(r['label']) for w in ("hear about", "referral", "source"))]
+                    matched = any(_match_option([r['value']], a) is not None for a in aliases for r in ref_rows)
                 elif _is_phone_device(f) or "phone" in flab or "calling code" in flab or "dial" in flab:
                     digits = re.findall(r"\+\d+", exp_str)
                     code = digits[0] if digits else exp_str
@@ -2231,6 +2230,14 @@ class _Run:
             field = Field('wd-review-' + str(len(self.fields)), row['label'], 'select', True, name=row['name'])
             if _is_referral_source(field):
                 if not _is_reasonable(row['value']):
+                    self.fields[field.key] = field
+                    self.answers[field.key] = Answer(field.key, None, 'unknown', 'review contradicts profile')
+                    issues.append(field.label)
+            elif label == 'education' or 'education' in label or row.get('context', '').lower() == 'education':
+                edu_school = (self.ctx.profile.get('education') or {}).get('school')
+                if edu_school and (not _is_reasonable(row['value']) or row['value'].lower() == 'no response' or normalize(edu_school) not in value):
+                    self.fields[field.key] = field
+                    self.answers[field.key] = Answer(field.key, None, 'unknown', 'review contradicts profile')
                     issues.append(field.label)
             elif (self._is_date_field(field) and re.search(
                     r'\b(?:desired|available|earliest|ideal|preferred)\b', field.label, re.I)):

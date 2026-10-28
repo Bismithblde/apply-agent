@@ -125,8 +125,8 @@ company_answers:
     "What percentage of the time are you willing to travel?": "0%"
     "Target Compensation": "$30/hr"
   GuidePoint Security:
-    "Which statement best describes your experience building or managing CI/CD pipelines?": "I have coursework or personal project experience"
-    "Which statement best describes your experience with Cloud Infrastructure and IaC?": "I have coursework or personal project experience"
+    "Which statement best describes your experience building or managing CI/CD pipelines?": "General user pushing code and triggering pipelines"
+    "Which statement best describes your experience with Cloud Infrastructure and IaC?": "Basic - I have a conceptual cloud knowledge but limited hands-on IaC experience"
     "Did you hear about GPSU from any of the below organizations?": "None of the above"
     "Are you a GuidePoint Security Employee Referral?": "No"
     "Are you related to or associated with a Customer or Vendor Partner of GuidePoint Security?": "No"
