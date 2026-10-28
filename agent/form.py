@@ -380,14 +380,16 @@ _READ_JS = r"""
     for (let i = 0; a && i < 5; i++, a = a.parentElement) {
       if (a.querySelectorAll('[data-aa-key]').length > 1) break;
       if ([...a.querySelectorAll('[role=combobox]')].some(c => c !== el)) break;
-      hasDisplay ||= !!a.querySelector('[class*="placeholder" i], [class*="single-value" i], [class*="singleValue" i]')
+      hasDisplay ||= !!a.querySelector('[class*="placeholder" i], [class*="single-value" i], [class*="singleValue" i], [class*="multi-value" i], [class*="multiValue" i]')
         || /value-container/i.test(a.className || '');
       const sv = a.querySelector('[class*="single-value" i], [class*="singleValue" i]');
-      if (sv) {
-        single = clean(sv.innerText);
-        metadata = clean([sv, ...sv.querySelectorAll('[aria-label], [title], img[alt]')]
+      const mv = [...a.querySelectorAll('[class*="multi-value" i], [class*="multiValue" i]')];
+      if (sv || mv.length) {
+        single = sv ? clean(sv.innerText) : mv.map(m => clean(m.innerText)).join(', ');
+        const node = sv || mv[0];
+        metadata = clean([node, ...node.querySelectorAll('[aria-label], [title], img[alt]')]
           .map(n => n.getAttribute('aria-label') || n.getAttribute('title') || n.getAttribute('alt')).join(' '));
-        const countryNode = [sv, ...sv.querySelectorAll('[data-country-code], [class*="iti__flag"]')]
+        const countryNode = [node, ...node.querySelectorAll('[data-country-code], [class*="iti__flag"]')]
           .find(n => n.hasAttribute('data-country-code') || /\biti__[a-z]{2}\b/.test(n.className || ''));
         const country = countryNode && (countryNode.getAttribute('data-country-code')
           || (countryNode.className.match(/\biti__([a-z]{2})\b/) || [])[1]);
@@ -851,6 +853,8 @@ def _verify(scope, f: Field, expected: str) -> bool:
         shown = (got.get("single") if got.get("hasDisplay") else
                  got.get("value") or got.get("ownText")) or ""
         if option_matches(expected, shown):
+            return True
+        if any(option_matches(expected, part.strip()) for part in shown.split(",")):
             return True
         metadata = got.get("metadata") or ""
         if metadata and option_matches(expected, f"{metadata} {shown}"):
