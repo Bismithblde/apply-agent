@@ -321,8 +321,6 @@ def _is_phone_device(f: Field) -> bool:
 
 
 def _is_referral_source(f: Field) -> bool:
-    if f.kind not in ("select", "combobox"):
-        return False
     return bool(re.search(r"\b(?:how|where)\b.{0,60}\b(?:hear|heard)\b.{0,50}\b(?:about|of)\b|"
                           r"\b(?:how|where)\b.{0,60}\b(?:learn|find|found)\b.{0,50}"
                           r"\b(?:position|role|job|opening|opportunity|vacancy|us)\b|"
@@ -1782,6 +1780,14 @@ class _Run:
                     is_required=is_required,
                 )
             if i is None:
+                for idx, t in enumerate(texts):
+                    if t.strip().lower() in ("all", "search by category", "partial list (first 500 entries)"):
+                        i = idx
+                        break
+                if i is None and value:
+                    from ... import llm
+                    i = llm.pick_option(texts, value, label=f"Navigate prompt category to find {value}")
+            if i is None:
                 log.info("workday option %r not matched in %s", value, texts[:15])
                 break
 
@@ -1808,14 +1814,11 @@ class _Run:
 
             self.page.wait_for_timeout(700)
 
-            if is_referral:
-                next_options = self._dropdown_options(el, box)
-                next_texts = [" ".join(t.split()) for t in next_options.all_inner_texts()] if next_options else []
-                if next_texts and next_texts != texts:
-                    # A category click may update the button before its required
-                    # leaf is chosen. Verify the leaf, never just the category.
-                    picked = False
-                    continue
+            next_options = self._dropdown_options(el, box)
+            next_texts = [" ".join(t.split()) for t in next_options.all_inner_texts()] if next_options else []
+            if next_texts and next_texts != texts:
+                picked = False
+                continue
 
             try:
                 selected = box.locator(A("selectedItem"))
@@ -2187,9 +2190,9 @@ class _Run:
                     # Check composite review cards (e.g. Legal Name, Address, Phone) or overall review text
                     exp_str = str(expected.value).strip()
                     flab = normalize(f.label)
-                    if _is_referral_source(f):
+                    if _is_referral_source(f) or any(w in flab for w in ("hear about", "referral", "source")):
                         matched = any(_is_reasonable(r['value']) for r in candidates) or any(
-                            _is_reasonable(r['value']) for r in rows if _is_referral_source(Field(key='', label=r['label'], kind='select', required=False))
+                            _is_reasonable(r['value']) for r in rows if _is_referral_source(Field(key='', label=r['label'], kind='select', required=False)) or any(w in normalize(r['label']) for w in ("hear about", "referral", "source"))
                         )
                     elif _is_phone_device(f) or "phone" in flab or "calling code" in flab or "dial" in flab:
                         digits = re.findall(r"\+\d+", exp_str)
