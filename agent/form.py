@@ -859,15 +859,9 @@ def _verify(scope, f: Field, expected: str) -> bool:
         metadata = got.get("metadata") or ""
         if metadata and option_matches(expected, f"{metadata} {shown}"):
             return True
-        # Calling code dropdowns (often labeled "Country" or "Country Code") may display only the dialed code (e.g. "+1")
-        code_match = re.search(r"\+\d+", shown.strip())
-        if code_match:
-            code = code_match.group(0)
-            if code in re.findall(r"\+\d+", expected):
-                return True
-            if code == "+1" and any(u in expected.lower() for u in ("united states", "usa", "us", "canada")):
-                return True
-        return False
+        # A control explicitly asking for a calling code may display that code alone.
+        return bool(re.search(r"\b(?:country code|calling code|dial(?:ing)? code)\b", f.label, re.I)
+                    and re.fullmatch(r"\+\d+", shown.strip()) and shown.strip() in re.findall(r"\+\d+", expected))
     if f.kind == "select":
         return option_matches(expected, got.get("value") or "")
     val = str(got.get("value") or "")

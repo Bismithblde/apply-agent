@@ -447,7 +447,8 @@ def _country(f: Field, p: dict) -> Any:
 
 def _citizenship_status(f: Field, p: dict) -> Any:
     if str(_get(p, "work_authorization.us_citizen")).lower() == "yes":
-        return ["U.S. Citizen", "US Citizen", "Citizen", "U.S. Citizen or National"]
+        return ["U.S. Citizen", "US Citizen", "Citizen", "U.S. Citizen or National",
+                "(a) U.S. citizen or national of the United States", "U.S. citizen or national of the United States"]
     return None
 
 
@@ -819,6 +820,8 @@ _RULES: list[tuple[re.Pattern, Resolver, str]] = [(re.compile(rx, re.I), fn, src
     (r"government\s+(?:employ|official|position)|employed by\b.{0,80}\bgovernment|public (?:official|institution)"
      r"|(?:prior|former|previous|past|within).{0,50}employed by\b.{0,80}\bgovernment", _p("preferences.government_employment"), "profile"),
     (r"export control|itar\b|citizen or permanent resident of (?:one or more of )?(?:the )?(?:countries listed|following countries)|sanctioned countr", _sanctioned_countries, "profile"),
+    (r"\b(?:active\s+)?security\s+clearance\b", lambda f, p: ["No", "None", "Never held a clearance", "Do not hold a clearance", "No clearance"], "profile"),
+    (r"\b(?:sat|act)\s+score\b", lambda f, p: ["Did not take/Do not recall", "Did not take", "N/A", "None", "Do not recall"], "profile"),
     (r"\b(relatives?|family members?)\b.{0,80}\b(employ|work|current)|related to (anyone|an employee|any employee)"
      r"|\b(employ|work)\w*\b.{0,60}\b(relatives?|family members?)\b", _p("preferences.relatives_at_company"), "profile"),
     (r"(?:previously|ever|currently)\s+(?:been\s+)?(?:employed|worked|intern\w*)|worked\s+(?:here|for\s+us)\s+before|former\s+employee|(?:ever|currently)\s+(?:been\s+)?(?:employed|working)\s+(?:by|at|for)|(?:current|former)\s+or\s+(?:current|former)\s+employee|currently\s+an\s+(?:employee|intern|worker|contractor)", _p("preferences.previously_employed_here"), "profile"),

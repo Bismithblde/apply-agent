@@ -134,7 +134,9 @@ company_answers:
     "Will you be physically located within the United States during the entire duration of the internship?": "Yes, I will be in the United States for the entire duration"
     "Where will you primarily be located during the internship?": "New York"
   Mach Industries:
-    "SAT Score": "N/A"
-    "ACT Score": "N/A"
-    "Active Security Clearance(s)?": "No"
-    "What location(s) are you interested in working at?": "Huntington Beach, CA"
+    "SAT Score": "Did not take/Do not recall"
+    "ACT Score": "Did not take/Do not recall"
+    "Active Security Clearance(s)?": "Never held a clearance"
+    "Citizenship Status": "(a) U.S. citizen or national of the United States"
+    "What location(s) are you interested in working at?":
+      - "Huntington Beach"
