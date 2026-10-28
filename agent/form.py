@@ -640,12 +640,12 @@ def _fill_one(scope, f: Field, value: Any) -> bool:
         if bool(state) != want:
             clicked = False
             elem_id = loc.get_attribute("id")
-            for sel in (f'[data-aa-opt="0"]', f'label[for="{elem_id}"]' if elem_id else None):
-                if sel and scope.locator(sel).count() and scope.locator(sel).first.is_visible():
+            if elem_id:
+                lbl = scope.locator(f'label[for="{elem_id}"]').first
+                if lbl.count() and lbl.is_visible():
                     try:
-                        scope.locator(sel).first.click(timeout=3000)
+                        lbl.click(timeout=3000)
                         clicked = True
-                        break
                     except Exception:
                         pass
             if not clicked:
@@ -653,6 +653,8 @@ def _fill_one(scope, f: Field, value: Any) -> bool:
                     loc.evaluate("""e => {
                         const lbl = e.closest('label') || document.querySelector('label[for="' + CSS.escape(e.id) + '"]');
                         if (lbl) { lbl.click(); return; }
+                        const opt = e.closest('fieldset, div, [role="group"]')?.querySelector('[data-aa-opt="0"]');
+                        if (opt) { opt.click(); return; }
                         const p = e.closest('[data-automation-id*="checkbox" i]') || e.parentElement;
                         (p || e).click();
                     }""")
