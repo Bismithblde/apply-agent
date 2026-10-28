@@ -1098,7 +1098,7 @@ def finish_application(job: Job, ctx, scope, fields: list[Field], answers: list[
     if state == "submitted":
         return _result(ApplyStatus.SUBMITTED, "submitted", fields, answers, shot, page.url)
     if state == "code":
-        ver = mail.wait_for_verification(submit_ts or (time.time() - 30), timeout=30, want="code")
+        ver = mail.wait_for_verification((submit_ts or time.time()) - 15, timeout=90, want="code")
         if ver and ver.code:
             code = ver.code.strip()
             # 1. Look for multi-box OTP inputs or inputs in security code section
