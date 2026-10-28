@@ -35,10 +35,12 @@ education:
   degree_full: Bachelor of Science
   major: Computer Science
   gpa: "3.74"
+  start_month: August
+  start_year: "2024"
+  start_date: August 2024
   graduation_month: May
   graduation_year: "2028"
   graduation_date: May 2028
-  start_year: "2024"
   current_year: Junior
   highest_completed: "High School"
 

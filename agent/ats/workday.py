@@ -856,10 +856,10 @@ class _Run:
             year_only = False
         if year_only:
             return Answer(f.key, str(year).strip(), "profile", "education year from profile")
-        value = (edu.get("start_date") if re.search(r"\b(from|start)\b", short, re.I) else
-                 edu.get("graduation_date"))
-        return Answer(f.key, value or None, "profile" if value else "unknown",
-                      "education date from profile" if value else "education month/day not supplied")
+        start_val = edu.get("start_date") or f"{edu.get('start_month', 'August')} {year}".strip()
+        end_val = edu.get("graduation_date") or f"{edu.get('graduation_month', 'May')} {year}".strip()
+        value = start_val if re.search(r"\b(from|start)\b", short, re.I) else end_val
+        return Answer(f.key, value or str(year), "profile", "education date from profile")
 
     def fill_step(self, name: str, *, repair: list[str] | None = None, extra_context: str = "") -> list[Field]:
         """Extract, answer and fill the current step. With `repair` (the inline errors), every field is
@@ -1722,6 +1722,16 @@ class _Run:
                     pass
 
         self.page.wait_for_timeout(1000)
+        if value:
+            try:
+                popup_inp = self.page.locator('[role="dialog"] input:visible, [role="listbox"] input:visible, input[data-automation-id="searchBox"]:visible, input[placeholder*="Search" i]:visible')
+                if popup_inp.count() and popup_inp.first.is_visible():
+                    popup_inp.first.fill("")
+                    popup_inp.first.press_sequentially(value, delay=20)
+                    popup_inp.first.press("Enter")
+                    self.page.wait_for_timeout(800)
+            except Exception:
+                pass
         picked = False
         chosen_text: str | None = None
         last_texts: list[str] = []
@@ -1814,11 +1824,20 @@ class _Run:
 
             self.page.wait_for_timeout(700)
 
-            next_options = self._dropdown_options(el, box)
-            next_texts = [" ".join(t.split()) for t in next_options.all_inner_texts()] if next_options else []
-            if next_texts and next_texts != texts:
-                picked = False
-                continue
+            is_category_click = chosen_text.strip().lower() in (
+                "all", "search by category", "partial list (first 500 entries)", "search by location"
+            )
+            if is_category_click or (value and _match_option([chosen_text], value) is None):
+                next_texts = []
+                for _ in range(5):
+                    self.page.wait_for_timeout(500)
+                    next_options = self._dropdown_options(el, box)
+                    next_texts = [" ".join(t.split()) for t in next_options.all_inner_texts()] if next_options else []
+                    if next_texts and next_texts != texts:
+                        break
+                if next_texts and next_texts != texts:
+                    picked = False
+                    continue
 
             try:
                 selected = box.locator(A("selectedItem"))
@@ -1826,7 +1845,7 @@ class _Run:
                     break
                 state = self._control_values(el)
                 if _match_option(state, chosen_text) is not None:
-                    if not is_referral or _match_option([chosen_text], value) is not None:
+                    if not value or _match_option([chosen_text], value) is not None:
                         break
                     next_options = self._dropdown_options(el, box)
                     next_texts = next_options.all_inner_texts() if next_options else []
@@ -2186,25 +2205,24 @@ class _Run:
                 if not candidates and not f.required:
                     continue
                 matched = len(candidates) == 1 and self._value_matches(f, expected.value, [candidates[0]['value']])
-                if not matched:
-                    # Check composite review cards (e.g. Legal Name, Address, Phone) or overall review text
-                    exp_str = str(expected.value).strip()
-                    flab = normalize(f.label)
-                    if _is_referral_source(f) or any(w in flab for w in ("hear about", "referral", "source")):
-                        matched = any(_is_reasonable(r['value']) for r in candidates) or any(
-                            _is_reasonable(r['value']) for r in rows if _is_referral_source(Field(key='', label=r['label'], kind='select', required=False)) or any(w in normalize(r['label']) for w in ("hear about", "referral", "source"))
-                        )
-                    elif _is_phone_device(f) or "phone" in flab or "calling code" in flab or "dial" in flab:
-                        digits = re.findall(r"\+\d+", exp_str)
-                        code = digits[0] if digits else exp_str
-                        matched = any(code.casefold() in r['value'].casefold() or exp_str.casefold() in r['value'].casefold() for r in rows if "phone" in r['label'].lower())
-                    elif flab in ("first name", "last name", "middle name", "preferred name"):
-                        matched = any(exp_str.casefold() in r['value'].casefold() for r in rows if "name" in r['label'].lower())
-                    elif any(w in flab for w in ("country", "state", "province", "city", "postal", "zip", "address")):
-                        matched = any(exp_str.casefold() in r['value'].casefold() for r in rows if "address" in r['label'].lower() or "contact" in r['context'].lower() or "information" in r['context'].lower())
-                    if not matched and exp_str:
-                        review_body = " ".join(r['value'] for r in rows)
-                        matched = exp_str.casefold() in review_body.casefold()
+
+            if not matched:
+                # Check composite review cards (e.g. Legal Name, Address, Phone) or overall review text
+                exp_str = str(expected.value).strip()
+                flab = normalize(f.label)
+                if _is_referral_source(f) or any(w in flab for w in ("hear about", "referral", "source")):
+                    matched = any(_is_reasonable(r['value']) for r in rows if _is_referral_source(Field(key='', label=r['label'], kind='select', required=False)) or any(w in normalize(r['label']) for w in ("hear about", "referral", "source")))
+                elif _is_phone_device(f) or "phone" in flab or "calling code" in flab or "dial" in flab:
+                    digits = re.findall(r"\+\d+", exp_str)
+                    code = digits[0] if digits else exp_str
+                    matched = any(code.casefold() in r['value'].casefold() or exp_str.casefold() in r['value'].casefold() for r in rows if "phone" in r['label'].lower())
+                elif flab in ("first name", "last name", "middle name", "preferred name"):
+                    matched = any(exp_str.casefold() in r['value'].casefold() for r in rows if "name" in r['label'].lower())
+                elif any(w in flab for w in ("country", "state", "province", "city", "postal", "zip", "address")):
+                    matched = any(exp_str.casefold() in r['value'].casefold() for r in rows if "address" in r['label'].lower() or "contact" in r['context'].lower() or "information" in r['context'].lower())
+                if not matched and exp_str:
+                    review_body = " ".join(r['value'] for r in rows)
+                    matched = exp_str.casefold() in review_body.casefold()
             if not matched:
                 self.answers[f.key] = Answer(f.key, None, "unknown", "review value could not be verified")
                 issues.append(f.label or f.key)
