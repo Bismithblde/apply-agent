@@ -1,0 +1,12 @@
+.venv/
+.env*
+data/
+logs/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+browser-profile*/
+secrets/
+.pytest_cache/
+*.log

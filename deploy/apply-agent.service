@@ -1,0 +1,14 @@
+[Unit]
+Description=Internship auto-applier (apply-agent)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ryanchen/Downloads/repos/solana/apply-agent
+ExecStart=/home/ryanchen/Downloads/repos/solana/apply-agent/run.sh
+Restart=on-failure
+RestartSec=60
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

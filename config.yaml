@@ -1,0 +1,116 @@
+# hybrid    = auto-submit only when every required field is answered from profile.yaml;
+#             anything needing a generated or unknown answer stops before submit and is queued.
+# fill_only = never click submit; everything is queued for review.
+# full      = submit whenever all required fields have any answer (including Gemini-written ones).
+submit_mode: full
+
+# Default interval for `python -m agent loop` when --every is not given.
+loop_every: 45m
+
+# Safety caps.
+max_submissions_per_run: 60
+max_submissions_per_night: 120
+seconds_between_applications: 20
+page_timeout_seconds: 45
+
+browser:
+  headless: true
+  # Persistent profile so logins/cookies (e.g. Ashby, Greenhouse MyGreenhouse) survive between runs.
+  user_data_dir: browser-profile
+
+schedule:
+  fetch_every: 30m          # how often sources are polled
+  apply_every: 45m          # how often the apply queue is drained
+  active_hours: "00:00-23:59"
+  run_while_user_active: true
+  concurrency: 1            # parallel browsers (2 max on a laptop)
+  nice: 10                  # lower CPU priority so it doesn't slow you down
+  job_timeout: 15m          # hard limit per application; a hung browser is killed and the job retried once
+  max_run_time: 3h          # a scheduled apply batch is killed (and its jobs requeued) after this long
+
+captcha:
+  provider: capsolver
+  timeout_seconds: 120
+  max_spend_per_night_usd: 3.00
+  # Invisible CAPTCHAs (reCAPTCHA v3, invisible hCaptcha) are left to run on submit; the job is queued
+  # only if a visible challenge appears afterwards.
+  passive_invisible: true
+  # Pay CapSolver for score-based reCAPTCHA v3 tokens (better scores). false = let the page run its own.
+  solve_v3: true
+
+email:
+  provider: gmail_api
+  plus_alias: true
+  verification_timeout_seconds: 180
+
+accounts:
+  password_length: 20
+  create_in_dry_run: false  # dry runs stop at "account required" instead of registering on the site
+
+notify:
+  desktop: true
+  ntfy: true                # uses NTFY_TOPIC from .env
+
+sources:
+  simplify:
+    enabled: true
+    url: https://raw.githubusercontent.com/SimplifyJobs/Summer2027-Internships/dev/.github/scripts/listings.json
+    # Only consider listings posted within this many days (0 = no limit).
+    max_age_days: 120
+  vanshb03:
+    enabled: true
+    url: https://raw.githubusercontent.com/vanshb03/Summer2027-Internships/dev/README.md
+  speedyapply:
+    enabled: true
+    url: https://raw.githubusercontent.com/speedyapply/2027-SWE-College-Jobs/main/README.md
+  ats_boards:
+    enabled: true
+    greenhouse: [stripe, databricks, anthropic, figma, robinhood]
+    lever: [palantir, plaid]
+    ashby: [openai, ramp, notion, linear]
+
+filters:
+  terms: ["Summer 2027"]
+  us_only: true
+  # Simplify categories that are always in scope.
+  software_categories: ["Software", "Software Engineering"]
+  # Categories only in scope when the title matches ai_title_keywords.
+  ai_categories: ["AI/ML/Data", "Data Science, AI & Machine Learning"]
+  ai_title_keywords:
+    - machine learning
+    - " ml "
+    - "ml "
+    - " ai "
+    - "ai "
+    - "ai/"
+    - artificial intelligence
+    - llm
+    - genai
+    - generative
+    - deep learning
+    - applied scientist
+    - research engineer
+    - ai engineer
+    - ml engineer
+    - computer vision
+    - nlp
+  # Titles containing any of these are skipped everywhere.
+  exclude_title_keywords:
+    - phd
+    - ph.d
+    - master
+    - mba
+    - analyst
+    - sales
+    - marketing
+    - hardware
+    - mechanical
+    - electrical
+    - co-op
+    - fall 2027
+    - spring 2027
+    - winter 2026
+    - winter 2027
+
+# ATS that the agent fills and may auto-submit. Everything else goes to the review queue.
+auto_ats: [greenhouse, lever, ashby, workday, generic]

@@ -1,0 +1,138 @@
+# Everything the agent is allowed to state about you. In hybrid mode, a required field
+# can only be auto-submitted if its answer comes from this file.
+resume_path: data/resume.pdf
+
+personal:
+  first_name: Ryan
+  last_name: Chen
+  full_name: Ryan Chen
+  preferred_name: Ryan
+  email: rc17452007@gmail.com
+  phone: "718-219-8854"
+  phone_country: United States (+1)
+  phone_device_type: Mobile
+  city: New York
+  state: New York
+  state_abbr: NY
+  country: United States
+  location: New York, NY
+  # Some forms (Workday) require a street address; jobs needing it are queued until you fill these in.
+  address_line1: "114-69 Taipei Ct"
+  address_line2: ""
+  postal_code: "11356"
+  county: Queens
+  languages: English
+  current_company: CRIZM (Stony Brook University)
+  current_title: Machine Learning Researcher
+  linkedin: https://www.linkedin.com/in/ryan-chen-4b0b23277
+  github: https://github.com/bismithblde
+  website: https://rychen.dev
+  portfolio: https://rychen.dev
+
+education:
+  school: Stony Brook University
+  degree: Bachelor's
+  degree_full: Bachelor of Science
+  major: Computer Science
+  gpa: "3.74"
+  graduation_month: May
+  graduation_year: "2028"
+  graduation_date: May 2028
+  start_year: "2024"
+  current_year: Junior
+  highest_completed: "High School"
+
+experience:
+  # Answer for "years of relevant/professional experience" (one 6-month internship so far).
+  years_professional: "0"
+
+work_authorization:
+  authorized_us: "Yes"
+  us_citizen: "Yes"
+  needs_sponsorship_now: "No"
+  needs_sponsorship_future: "No"
+  citizenship_country: United States
+
+preferences:
+  willing_to_relocate: "Yes"
+  open_to_remote: "Yes"
+  open_to_hybrid: "Yes"
+  open_to_onsite: "Yes"
+  internship_term: Summer 2027
+  available_start: May 2027
+  available_end: August 2027
+  internship_months: "3"
+  months_available: "3"
+  duration_months: "3"
+  over_18: "Yes"
+  how_did_you_hear: Simplify
+  previously_employed_here: "No"
+  non_compete: "No"
+  government_employment: "No"   # ever employed by a government entity / public official
+  relatives_at_company: "No"    # relatives or family members working at the company
+  personal_relationships_at_company: "No" # roommates, partners, or personal relationships at company
+  sms_opt_in: "false"
+  willing_to_travel: "Yes"
+  travel_percentage: "0-25%"
+  self_funded_relocation: "Yes"
+  full_time: "Yes"
+  remote_state: "New York"
+  consider_other_roles: "Yes"
+  background_check_ok: "Yes"
+  drug_test_ok: "Yes"
+
+# Voluntary self-identification. "Decline" answers are always safe to auto-submit.
+eeo:
+  gender: Decline to self-identify
+  pronouns: Decline to self-identify
+  race_ethnicity: Decline to self-identify
+  hispanic_latino: Decline to self-identify
+  veteran_status: I don't wish to answer
+  disability_status: I do not want to answer
+  sexual_orientation: Decline to self-identify
+  transgender: Decline to self-identify
+
+# Short reusable answers. Gemini may pick these verbatim (counts as "bank" in hybrid mode).
+answer_bank:
+  why_company: >-
+    I'm drawn to teams shipping real products to real users, and I want to grow as an engineer
+    by owning meaningful work end to end. Your team's focus and engineering culture match the kind
+    of environment where I do my best work.
+  about_me: >-
+    I'm a Computer Science student at Stony Brook University (GPA 3.74, graduating May 2028) who
+    builds systems and AI products. I wrote a C++ key-value store sustaining 159K ops/sec across
+    512 clients, built EcoCart's semantic search over 200K+ products with sub-100 ms latency, won
+    1st place at HackSBU, and currently do transformer-based ML research at CRIZM.
+  proudest_project: >-
+    A high-performance key-value store in C++: I replaced per-connection threads with event-driven
+    networking and a fixed worker pool, sharded the database across 64 independently locked shards,
+    and added a write-ahead log, sustaining 159K median ops/sec across 512 concurrent clients
+    without losing acknowledged writes during simulated crashes.
+  salary_expectation: Open to the standard intern compensation for this role.
+
+company_answers:
+  Neuralink:
+    "At this time we do not offer relocation assistance to interns. If hired, are you able to relocate on your own if you are not based locally?": "Yes"
+    "Which onsite location would you like to apply to?": "Austin"
+  National Information Solutions Cooperative:
+    "Are you currently employed at an NISC Member site?": "No"
+    "What locations are you interested in working from? (Select all that apply)":
+      - "Lake St. Louis, MO"
+      - "I want to work remotely"
+    "If you selected working remotely above, which state would you plan to work remotely from?": "New York"
+    "What percentage of the time are you willing to travel?": "0%"
+    "Target Compensation": "$30/hr"
+  GuidePoint Security:
+    "Which statement best describes your experience building or managing CI/CD pipelines?": "I have coursework or personal project experience"
+    "Which statement best describes your experience with Cloud Infrastructure and IaC?": "I have coursework or personal project experience"
+    "Did you hear about GPSU from any of the below organizations?": "None of the above"
+    "Are you a GuidePoint Security Employee Referral?": "No"
+    "Are you related to or associated with a Customer or Vendor Partner of GuidePoint Security?": "No"
+    "Are you able to work 25-29hrs/wk Monday-Friday supporting the Eastern Time Zone for 12 weeks? (Flexible hours)": "Yes"
+    "Will you be physically located within the United States during the entire duration of the internship?": "Yes, I will be in the United States for the entire duration"
+    "Where will you primarily be located during the internship?": "New York"
+  Mach Industries:
+    "SAT Score": "N/A"
+    "ACT Score": "N/A"
+    "Active Security Clearance(s)?": "No"
+    "What location(s) are you interested in working at?": "Huntington Beach, CA"

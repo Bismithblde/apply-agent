@@ -1,0 +1,110 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  .visually-hidden { position: absolute; width: 1px; height: 1px; clip: rect(0 0 0 0); overflow: hidden; }
+  .menu { border: 1px solid #ccc; }
+  .menu[hidden] { display: none; }
+  .yesno button[aria-pressed="true"] { background: black; color: white; }
+  .shim { opacity: 0; height: 1px; }
+</style>
+</head>
+<body>
+<h1>Software Engineering Intern</h1>
+<p>We build payments infrastructure. This internship is in New York.</p>
+<form id="application-form" onsubmit="window.__submitted = true; return false;">
+  <div><label for="first_name">First Name<span>*</span></label><input id="first_name" type="text"></div>
+  <div><label for="last_name">Last Name *</label><input id="last_name" type="text" required></div>
+  <div><input id="email" type="email" aria-label="Email" aria-required="true"></div>
+  <div><span id="phone-label">Phone</span><input id="phone" type="tel" aria-labelledby="phone-label"></div>
+  <input class="shim" aria-hidden="true" tabindex="-1" required>
+
+  <div role="group" aria-labelledby="upload-label-resume" aria-required="true">
+    <div id="upload-label-resume">Resume/CV<span class="required">*</span></div>
+    <button type="button" onclick="document.getElementById('resume').click()">Attach</button>
+    <label class="visually-hidden" for="resume">Attach</label>
+    <input id="resume" class="visually-hidden" type="file">
+  </div>
+
+  <div>
+    <label for="degree">Degree</label>
+    <select id="degree" required>
+      <option value="">Select...</option>
+      <option value="hs">High School</option>
+      <option value="ba">Bachelor's Degree</option>
+      <option value="ms">Master's Degree</option>
+    </select>
+  </div>
+
+  <fieldset>
+    <legend>Are you legally authorized to work in the United States? *</legend>
+    <label><input type="radio" name="auth" value="y" required> Yes, I am authorized</label>
+    <label><input type="radio" name="auth" value="n" required> No, I am not authorized</label>
+  </fieldset>
+
+  <div class="question">
+    <div class="application-label">Languages (check all that apply)</div>
+    <ul>
+      <li><label><input type="checkbox" name="lang" value="en"> English</label></li>
+      <li><label><input type="checkbox" name="lang" value="es"> Spanish</label></li>
+      <li><label><input type="checkbox" name="lang" value="zh"> Mandarin</label></li>
+    </ul>
+  </div>
+
+  <div>
+    <label id="school-label" for="school">School *</label>
+    <input id="school" role="combobox" aria-controls="school-list" aria-expanded="false" autocomplete="off">
+    <ul id="school-list" role="listbox" class="menu" hidden></ul>
+  </div>
+
+  <div class="field-entry">
+    <label class="question-title _required_x1">Requesting visa sponsorship?</label>
+    <div class="yesno">
+      <button type="button" aria-pressed="false">Yes</button>
+      <button type="button" aria-pressed="false">No</button>
+      <input type="checkbox" tabindex="-1" name="sponsor" style="display:none">
+    </div>
+  </div>
+
+  <div class="education-entry">
+    <label>Field of Study</label>
+    <input id="major" type="text">
+  </div>
+
+  <div>
+    <p>Why do you want to join us?</p>
+    <textarea id="why" rows="4"></textarea>
+  </div>
+
+  <label><input type="checkbox" id="consent" required> I agree to the privacy policy</label>
+
+  <button type="submit">Submit application</button>
+</form>
+<script>
+  const SCHOOLS = ['Stony Brook University', 'Stanford University', 'Brown University', 'Boston University'];
+  const input = document.getElementById('school');
+  const list = document.getElementById('school-list');
+  function render() {
+    const q = input.value.toLowerCase();
+    list.innerHTML = '';
+    SCHOOLS.filter(s => s.toLowerCase().includes(q)).forEach((s, i) => {
+      const li = document.createElement('li');
+      li.setAttribute('role', 'option');
+      li.textContent = s;
+      li.addEventListener('click', () => { input.value = s; list.hidden = true; input.setAttribute('aria-expanded', 'false'); });
+      list.appendChild(li);
+    });
+    list.hidden = false;
+    input.setAttribute('aria-expanded', 'true');
+  }
+  input.addEventListener('click', render);
+  input.addEventListener('input', render);
+  input.addEventListener('keydown', e => { if (e.key === 'Escape') { list.hidden = true; } });
+  document.querySelectorAll('.yesno button').forEach(b => b.addEventListener('click', () => {
+    b.parentElement.querySelectorAll('button').forEach(x => x.setAttribute('aria-pressed', 'false'));
+    b.setAttribute('aria-pressed', 'true');
+  }));
+</script>
+</body>
+</html>

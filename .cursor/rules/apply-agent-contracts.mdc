@@ -1,0 +1,76 @@
+---
+description: Shared interfaces, file ownership, and safety rules for building the internship auto-applier
+alwaysApply: true
+---
+
+# apply-agent build contracts
+
+Python 3.14 package `agent/` in this repo, run with `.venv/bin/python` (never system python, never a new venv).
+Sync Playwright API only (no asyncio). Config is `config.yaml`, facts about the applicant are `profile.yaml`,
+secrets are `.env` (never print secret values; read them via `os.environ` after `agent.config` loads dotenv).
+
+## Already built (do not rewrite; extend only with additive changes and say so in your report)
+- `agent/config.py`: `ROOT, DATA_DIR, SCREENSHOT_DIR, DB_PATH, LOG_DIR, load_config(), load_profile(), gemini_settings(), parse_duration()`
+- `agent/models.py`: `Job, Field, Answer, ApplyResult, ApplyStatus, detect_ats(), normalize_url(), dedupe_key()`.
+  `Field.key` is the value of the `data-aa-key` attribute stamped on the DOM element.
+  `Answer.source` is one of `profile | bank | generated | unknown`.
+- `agent/db.py`: SQLite helpers (`upsert_jobs, next_jobs, set_job_status, record_application, kv_get/kv_set,
+  get_account_row/put_account_row/set_account_verified, mail_is_seen/mark_mail_seen, add_captcha_spend/captcha_spend_since, night_start`).
+- `agent/llm.py`: `generate_text(prompt)`, `generate_json(prompt, schema, images=None, model=None)`, `vision_model()`,
+  `available()`, `LLMUnavailable`. Has timeouts + circuit breaker. Always catch `LLMUnavailable` and degrade.
+- `agent/browser.py`: `open_browser(config, visible=False)` context manager -> BrowserContext; `new_page(ctx)`; `human_pause()`.
+- `agent/ats/base.py`: `ApplyContext(page, browser, config, profile, submit_mode, dry_run, run_id)`,
+  `submit_decision(fields, answers, mode, dry_run) -> (bool, reason)`, `blocked_result(...)`, `Adapter` protocol.
+
+## Interfaces each owner must implement exactly (other modules import these names)
+
+`agent/sources/*.py` each expose `fetch(config: dict) -> list[Job]`. Job ids are stable: `f"{source}:{native_id}"`
+or `f"{source}:" + sha1(normalize_url(url))[:16]`.
+`agent/filters.py`: `keep(job, config) -> tuple[bool, str]`, `filter_jobs(jobs, config) -> list[Job]`.
+`agent/fetch.py`: `fetch_all(config) -> dict` with keys `fetched, matched, new, by_source` (calls `db.upsert_jobs`).
+
+`agent/form.py`:
+- `extract_fields(scope, root: str | None = None) -> list[Field]` (scope = Page or Frame; stamps `data-aa-key`)
+- `fill_fields(scope, fields: list[Field], answers: list[Answer]) -> list[str]` (returns keys that failed to fill)
+- `page_text(page, max_chars: int = 8000) -> str` (visible job-description text)
+- `click_text(scope, texts: list[str], roles=("button","link")) -> bool`
+`agent/answers.py`:
+- `answer_fields(fields, job, profile, *, job_text: str = "", extra_context: str = "") -> list[Answer]`
+  (deterministic profile/answer_bank matching first, Gemini for the rest; factual unknowns -> source "unknown",
+  never invent facts; essays/opinions may be "generated"; resume file inputs -> `profile["resume_path"]`)
+- `resume_text() -> str` (cached pypdf extraction of the resume)
+`agent/captcha.py`:
+- `@dataclass CaptchaOutcome(status: "none"|"solved"|"failed"|"budget"|"unsupported", kind: str = "", cost: float = 0.0, detail: str = "")`
+- `solve_if_present(page, config, job_id: str | None = None) -> CaptchaOutcome`
+`agent/mail.py`:
+- `@dataclass Verification(code: str | None, link: str | None, message_id: str, subject: str, sender: str)`
+- `wait_for_verification(after_ts: float, *, sender_hint: str | None = None, to_alias: str | None = None, timeout: float | None = None, want: "code"|"link"|"any" = "any") -> Verification | None`
+- `authorize_interactive() -> None`, `available() -> bool`
+`agent/vault.py`:
+- `@dataclass Account(tenant_key, email, password, company, login_url, verified: bool)`
+- `tenant_key_for(url) -> str`, `get(tenant_key) -> Account | None`,
+  `create(tenant_key, company, login_url, *, plus_alias: bool = True) -> Account`,
+  `mark_verified(tenant_key)`, `update_email(tenant_key, email)`, `alias_email(company) -> str`
+Adapters `agent/ats/<name>.py` expose a module-level `ADAPTER` object implementing `Adapter`
+(`name`, `can_handle(job)`, `apply(job, ctx) -> ApplyResult`). Adapters call `captcha.solve_if_present` before
+the final submit, use `submit_decision` to decide, and never raise for ordinary page problems.
+
+## File ownership (only edit files you own; create tests under `tests/test_<area>.py`)
+- sources builder: `agent/sources/*`, `agent/filters.py`, `agent/fetch.py`
+- forms builder: `agent/form.py`, `agent/answers.py`, `agent/captcha.py`, `agent/ats/greenhouse.py`, `agent/ats/lever.py`, `agent/ats/ashby.py`
+- accounts builder: `agent/mail.py`, `agent/vault.py`, `agent/ats/workday.py`
+- generic builder: `agent/ats/generic.py`
+- main agent (not a subagent): `agent/__main__.py`, `agent/runner.py`, `agent/scheduler.py`, `agent/notify.py`,
+  `agent/report.py`, `agent/ats/registry.py`, systemd files, `config.yaml`
+If you need a change in a file you don't own, describe it in your final report instead of editing it.
+
+## Safety rules while building and testing
+- NEVER click a final "Submit application" button on a real posting. Test with `dry_run=True` or `submit_mode="fill_only"`.
+- At most 2 real accounts may be created on real sites during testing; they must be saved through `vault.py`.
+- Network note (eduroam): `agent.config` reroutes `*.googleapis.com` DNS to reachable Google front ends.
+  On this network HTTP/1.1 to those hosts hangs and Python HTTP/2 (httpx+h2) stalls on request bodies over a
+  few KB, while `curl --http2` is reliable. Gemini goes through `agent.llm` (curl transport, never call it
+  directly). For Gmail and OAuth: GET requests and small POSTs via `httpx.Client(http2=True)` work; do not
+  use httplib2 / `googleapiclient.discovery` transports. IMAP to imap.gmail.com is blocked. Unit tests must mock `agent.llm` and Gmail; code must degrade gracefully
+  (LLM down -> unknown answers -> job queued, not crashed).
+- Keep comments sparse; match the style of `agent/db.py` and `agent/ats/base.py`.
