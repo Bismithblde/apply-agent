@@ -820,7 +820,7 @@ _RULES: list[tuple[re.Pattern, Resolver, str]] = [(re.compile(rx, re.I), fn, src
     (r"government\s+(?:employ|official|position)|employed by\b.{0,80}\bgovernment|public (?:official|institution)"
      r"|(?:prior|former|previous|past|within).{0,50}employed by\b.{0,80}\bgovernment", _p("preferences.government_employment"), "profile"),
     (r"export control|itar\b|citizen or permanent resident of (?:one or more of )?(?:the )?(?:countries listed|following countries)|sanctioned countr", _sanctioned_countries, "profile"),
-    (r"\b(?:active\s+)?security\s+clearance\b", lambda f, p: ["No", "None", "Never held a clearance", "Do not hold a clearance", "No clearance"], "profile"),
+    (r"\b(?:active\s+)?security\s+clearance\b", lambda f, p: ["No", "None", "Never held a clearance", "Do not hold a clearance", "No clearance"] if (_get(p, "preferences.security_clearance") is not None or _get(p, "work_authorization.security_clearance") is not None) else None, "profile"),
     (r"\b(?:sat|act)\s+score\b", lambda f, p: ["Did not take/Do not recall", "Did not take", "N/A", "None", "Do not recall"], "profile"),
     (r"\b(relatives?|family members?)\b.{0,80}\b(employ|work|current)|related to (anyone|an employee|any employee)"
      r"|\b(employ|work)\w*\b.{0,60}\b(relatives?|family members?)\b", _p("preferences.relatives_at_company"), "profile"),

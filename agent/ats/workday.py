@@ -404,6 +404,49 @@ def _pick_option_index(
     return None
 
 
+def _ai_pick_option(label: str, texts: list[str], info: dict, wanted: str = "") -> int | None:
+    """Use LLM to dynamically select the best matching option from ATS choices when rules/aliases fail."""
+    from .. import llm
+    valid = [(idx, t) for idx, t in enumerate(texts) if _is_reasonable(t) and t.strip().lower() not in ("select one", "select...", "choose...")]
+    if not valid:
+        return None
+    valid_texts = [v[1] for v in valid]
+    prompt = f"""You are filling an employment application for a job candidate.
+Candidate profile facts:
+- Education: {info.get('school', 'Undergraduate Student')}, Major: {info.get('major', 'Computer Science')}
+- Work Authorization: US Citizen ({info.get('us_citizen', 'Yes')}), Legally Authorized to work in US ({info.get('authorized_us', 'Yes')}), Needs Sponsorship ({info.get('needs_sponsorship', 'No')})
+- Willing to Relocate: {info.get('willing_to_relocate', 'Yes')}
+- Preferred Referral Source: {info.get('how_did_you_hear', 'Simplify')}
+- Location: {info.get('location', 'New York, NY')}
+- Preferred Value for this field: {wanted or 'N/A'}
+
+Question / Dropdown Field: "{label}"
+Available choices:
+{json.dumps(valid_texts)}
+
+Select the best, most truthful matching choice from the available choices that corresponds to the preferred value '{wanted}' and the candidate's background.
+Do NOT choose an Employee Referral if candidate does not have one.
+If NO available choice truthfully represents '{wanted}' or the candidate profile, return null for chosen_option.
+Return JSON: {{"chosen_option": "<exact string from choices or null>"}}"""
+
+    schema = {
+        "type": "object",
+        "properties": {"chosen_option": {"type": ["string", "null"]}},
+        "required": ["chosen_option"],
+    }
+    try:
+        reply = llm.generate_json(prompt, schema)
+        if reply and isinstance(reply, dict) and reply.get("chosen_option"):
+            choice = reply["chosen_option"].strip().casefold()
+            for idx, t in valid:
+                if t.strip().casefold() == choice:
+                    log.info("AI matched option %r -> %r for %r", wanted, t, label)
+                    return idx
+    except Exception as e:
+        log.warning("AI option picking failed: %s", e)
+    return None
+
+
 # ---------- adapter ----------
 
 class WorkdayAdapter:
@@ -804,16 +847,19 @@ class _Run:
         return False
 
     def _is_education_date_field(self, f: Field) -> bool:
-        lab = f.label or ""
+        if f.kind in ("radio", "checkbox"):
+            return False
+        lab = (f.label or "").strip()
         fid = f.name or ""
+        is_standalone_range = bool(re.fullmatch(r"(?:from|to)(?:\s*\([^)]*\))?[*:\s]*", lab, re.I))
         is_edu = bool(re.search(r"education|school|degree|college|university", lab, re.I) or
                       re.search(r"education|school|degree|college|university", fid, re.I))
         is_date_lab = bool(re.search(
-            r"\b(from|to\b|to\s*\(|attended|start\s*date|end\s*date|graduation\s*date|first\s*year|year\s*of)\b",
+            r"\b(attended|start\s*date|end\s*date|graduation\s*date|first\s*year|year\s*of)\b",
             lab, re.I
         ))
         is_date_fid = bool(re.search(r"startDate|endDate|from|to|attended|date|year", fid, re.I))
-        return (is_edu and (is_date_lab or is_date_fid)) or bool(re.search(r"\b(from|to|attended|first\s*year|year\s*of\s*graduation)\b", lab, re.I))
+        return (is_edu and (is_date_lab or is_date_fid or is_standalone_range)) or is_standalone_range
 
     def _education_year_answer(self, f: Field) -> Answer | None:
         if not self._is_education_date_field(f):
@@ -887,11 +933,13 @@ class _Run:
     def fill_step(self, name: str, *, repair: list[str] | None = None, extra_context: str = "") -> list[Field]:
         """Extract, answer and fill the current step. With `repair` (the inline errors), every field is
         re-answered for context but only errored or empty required fields are re-filled."""
+        log.info("workday fill_step: %r (repair=%r)", name, bool(repair))
         from .. import answers as answers_mod
         from .. import form
         preset: dict[str, Answer] = {}
         if re.search(r"experience", name, re.I) and repair is None:
             self.upload_resume()
+            self._ensure_education_panel()
         root = ROOT if _visible(self.page, ROOT) else None
         try:
             self.page.evaluate(_SKIP_JS, root)
@@ -961,16 +1009,22 @@ class _Run:
                 ans.append(year_answer)
             lab = f.label or ""
             is_eeo = bool(re.search(r"\b(?:race|ethnic|gender|veteran|disabilit|self.?identif)\b", lab, re.I))
-            is_proficiency = not is_eeo and bool(
-                re.search(r"\b(?:overall|proficiency)\b", lab, re.I)
+            is_gpa = bool(re.search(r"\b(?:gpa|result|grade|score)\b", lab, re.I) and not re.search(r"\blanguage\b", lab, re.I))
+            is_proficiency = not is_eeo and not is_gpa and bool(
+                re.search(r"\b(?:proficiency)\b", lab, re.I) or re.search(r"\boverall\s+proficiency\b", lab, re.I)
                 or (f.options and any(re.search(r"\b(fluent|proficient|basic|intermediate)\b", o, re.I) for o in f.options))
             )
-            is_lang = not is_eeo and bool(
+            is_lang = not is_eeo and not is_gpa and bool(
                 re.search(r"\blanguages?\b", lab, re.I)
                 or (f.name and "language" in f.name.lower())
             )
             english = "english" in str((self.ctx.profile.get("personal") or {}).get("languages") or "").casefold()
-            if is_proficiency and english:
+            if is_gpa:
+                gpa = (self.ctx.profile.get("education") or {}).get("gpa")
+                if gpa:
+                    ans = [a for a in ans if a.key != f.key]
+                    ans.append(Answer(f.key, str(gpa), "profile", "GPA from profile"))
+            elif is_proficiency and english:
                 ans = [a for a in ans if a.key != f.key]
                 ans.append(Answer(f.key, "Fluent", "profile", "fluent English from profile"))
             elif is_lang and english:
@@ -1064,18 +1118,15 @@ class _Run:
                 }]
 
     def _profile_widget_answer(self, f: Field) -> Answer | None:
+        from .. import answers as answers_mod
+        company_ans = answers_mod._company_confirmed_answer(f, self.job, self.ctx.profile, _match_option)
+        if company_ans is not None:
+            return company_ans
         preferences = self.ctx.profile.get("preferences") or {}
         personal = self.ctx.profile.get("personal") or {}
         lab = f.label or ""
         if f.kind in ("checkbox", "radio", "select", "combobox") and re.search(
                 r"\b(?:consent|agree|accept|certify|attest|acknowledge|terms|privacy|arbitration)\b", lab, re.I):
-            normalize = lambda text: re.sub(r"[\s*✱]+$", "", " ".join(str(text).casefold().split()))
-            for company, entries in (self.ctx.profile.get("company_answers") or {}).items():
-                if normalize(company) != normalize(self.job.company) or not isinstance(entries, dict):
-                    continue
-                for question, value in entries.items():
-                    if normalize(question) == normalize(lab):
-                        return Answer(f.key, value, "bank", "explicit consent answer in profile")
             return Answer(f.key, None, "unknown", "consent needs an explicit answer for this question")
         if f.kind in ("checkbox", "radio", "select", "combobox"):
             for pattern, key in (
@@ -1083,7 +1134,7 @@ class _Run:
                 (r"gender|\bsex\b", "gender"),
                 (r"\brace\b|ethnic", "race_ethnicity"),
                 (r"veteran", "veteran_status"),
-                (r"disabilit|impairment", "disability_status"),
+                (r"disabilit|impairment|check one of the boxes below", "disability_status"),
             ):
                 if re.search(pattern, lab + ' ' + (f.name or ''), re.I):
                     value = (self.ctx.profile.get("eeo") or {}).get(key)
@@ -1712,6 +1763,8 @@ class _Run:
             re.search(r"\b(school|university|institution|college)\b", label, re.I) or
             re.search(r"school|university|institution|college", fid, re.I)
         )
+        is_major = bool(re.search(r"\b(?:field of study|major|area of study)\b", label + " " + fid, re.I))
+        is_skills = bool(re.search(r"\bskills?\b", label + " " + fid, re.I))
 
         try:
             self._mark_existing_menus()
@@ -1734,7 +1787,7 @@ class _Run:
             pass
 
         target_inp = inp or el
-        if value and (multi or is_school or (inp and inp.is_visible())):
+        if value and (multi or is_school or is_major or (inp and inp.is_visible())):
             try:
                 target_inp.fill("")
                 target_inp.press_sequentially(value, delay=20)
@@ -1768,21 +1821,28 @@ class _Run:
                 opts_count = 0
 
             if opts_count == 0:
+                log.info("choose_option for %r (wanted=%r, step=%d): opts_count=0", label, value, step)
                 if picked:
                     break
-                self.page.wait_for_timeout(500)
-                opts = self._dropdown_options(el, box)
-                try:
-                    opts_count = opts.count() if opts else 0
-                except Exception:
-                    opts_count = 0
+                for _ in range(6):
+                    self.page.wait_for_timeout(500)
+                    opts = self._dropdown_options(el, box)
+                    try:
+                        opts_count = opts.count() if opts else 0
+                    except Exception:
+                        opts_count = 0
+                    if opts_count > 0:
+                        break
                 if opts_count == 0:
+                    log.info("choose_option for %r: opts_count still 0 after retry", label)
                     break
 
             try:
                 texts = [" ".join(t.split()) for t in opts.all_inner_texts()]
             except Exception:
                 texts = []
+
+            log.info("choose_option for %r (wanted=%r): found %d options: %s", label, value, len(texts), texts[:6])
 
             if not texts:
                 break
@@ -1817,6 +1877,22 @@ class _Run:
                     if t.strip().lower() in ("all", "search by category", "partial list (first 500 entries)", "search by location"):
                         i = idx
                         break
+            if i is None and (is_school or is_major or is_skills or (is_referral and value.strip().casefold() in ("simplify", "job board", ""))):
+                edu = (self.ctx.profile.get("education") or {}) if hasattr(self, "ctx") else {}
+                pers = (self.ctx.profile.get("personal") or {}) if hasattr(self, "ctx") else {}
+                pref = (self.ctx.profile.get("preferences") or {}) if hasattr(self, "ctx") else {}
+                auth = (self.ctx.profile.get("work_authorization") or {}) if hasattr(self, "ctx") else {}
+                info = {
+                    "school": edu.get("school"),
+                    "major": edu.get("major"),
+                    "how_did_you_hear": pref.get("how_did_you_hear"),
+                    "location": pers.get("location"),
+                    "us_citizen": auth.get("us_citizen", "Yes"),
+                    "authorized_us": auth.get("authorized_us", "Yes"),
+                    "needs_sponsorship": auth.get("needs_sponsorship_now", "No"),
+                    "willing_to_relocate": pref.get("willing_to_relocate", "Yes"),
+                }
+                i = _ai_pick_option(label, texts, info, value)
             if i is None:
                 log.info("workday option %r not matched in %s", value, texts[:15])
                 break
@@ -1882,6 +1958,7 @@ class _Run:
             if f:
                 f.current_value = chosen_text
 
+        log.info("choose_option result for %r: picked=%r, chosen_text=%r", label, picked, chosen_text)
         return picked
 
     def fill_date(self, el: Locator, value: str) -> bool:
@@ -1972,6 +2049,69 @@ class _Run:
             self.settle()
         except Exception as e:
             log.info("resume upload not confirmed: %s", e)
+
+    def _ensure_education_panel(self) -> None:
+        """If candidate profile contains education and the page has no education fields, click Add Education."""
+        if not (self.ctx.profile.get("education") or {}).get("school"):
+            return
+        try:
+            log.info("running _ensure_education_panel on page %s", self.page.url)
+            has_edu = self.page.evaluate("""() => {
+                const groups = document.querySelectorAll(
+                    '[data-automation-id^="education-"], [role=group][aria-labelledby*="Education"], [role=group][aria-labelledby*="education" i]');
+                for (const g of groups) {
+                    if (g.querySelector('input, select, textarea, [data-automation-id*="promptOption"], [data-automation-id*="input"]')) {
+                        return true;
+                    }
+                }
+                return false;
+            }""")
+            log.info("_ensure_education_panel: has_edu=%r", has_edu)
+            if has_edu:
+                return
+            clicked, debug_info = self.page.evaluate("""() => {
+                const headings = [...document.querySelectorAll('h1,h2,h3,h4,h5,h6,[role="heading"],legend')].map(h => (h.innerText||'').trim());
+                const buttons = [...document.querySelectorAll('button')].map(b => ((b.innerText||'') + ' ' + (b.getAttribute('aria-label')||'') + ' ' + (b.getAttribute('data-automation-id')||'')).trim());
+                const eduHeading = [...document.querySelectorAll('h1,h2,h3,h4,h5,h6,[role="heading"],legend')].find(el => {
+                    const txt = (el.innerText || '').trim();
+                    return /^education$/i.test(txt) || (/\\beducation\\b/i.test(txt) && !/experience|disclosure/i.test(txt));
+                });
+                if (eduHeading) {
+                    let parent = eduHeading.parentElement;
+                    while (parent && parent !== document.body && !parent.querySelector('button')) {
+                        parent = parent.parentElement;
+                    }
+                    if (parent) {
+                        const btn = [...parent.querySelectorAll('button')].find(b => {
+                            const t = (b.innerText || '').trim().toLowerCase();
+                            const a = (b.getAttribute('aria-label') || '').toLowerCase();
+                            const aid = (b.getAttribute('data-automation-id') || '').toLowerCase();
+                            return t === 'add' || t === 'add education' || t === 'add another'
+                                || a.includes('education') || aid.includes('education') || aid.includes('add');
+                        });
+                        if (btn) {
+                            btn.click();
+                            return [true, {headings, buttons: buttons.slice(0, 15)}];
+                        }
+                    }
+                }
+                for (const b of document.querySelectorAll('button')) {
+                    const aria = (b.getAttribute('aria-label') || '').toLowerCase();
+                    const aid = (b.getAttribute('data-automation-id') || '').toLowerCase();
+                    if (aria.includes('add education') || aid.includes('add-education') || aid === 'add-education-button') {
+                        b.click();
+                        return [true, {headings, buttons: buttons.slice(0, 15)}];
+                    }
+                }
+                return [false, {headings, buttons: buttons.slice(0, 15)}];
+            }""")
+            log.info("_ensure_education_panel: clicked=%r debug=%s", clicked, debug_info)
+            if clicked:
+                log.info("clicked Add Education button on experience step")
+                self.page.wait_for_timeout(1000)
+                self.settle()
+        except Exception as e:
+            log.info("could not add education panel: %s", e)
 
     def fill_self_identify(self) -> dict[str, Answer]:
         out: dict[str, Answer] = {}
@@ -2199,7 +2339,7 @@ class _Run:
                     actual = self._control_values(el)
                 matched = self._value_matches(f, expected.value, actual)
             else:
-                if not candidates and not f.required:
+                if not candidates:
                     continue
                 matched = len(candidates) == 1 and self._value_matches(f, expected.value, [candidates[0]['value']])
 
@@ -2215,11 +2355,11 @@ class _Run:
                     digits = re.findall(r"\+\d+", exp_str)
                     code = digits[0] if digits else exp_str
                     matched = any(code.casefold() in r['value'].casefold() or exp_str.casefold() in r['value'].casefold() for r in rows if "phone" in r['label'].lower())
-                elif flab in ("first name", "last name", "middle name", "preferred name"):
-                    matched = any(exp_str.casefold() in r['value'].casefold() for r in rows if "name" in r['label'].lower())
+                elif any(w in flab for w in ("name", "first name", "last name", "middle name", "preferred name")):
+                    matched = any(exp_str.casefold() in r['value'].casefold() for r in rows if "name" in r['label'].lower() or "name" in r['context'].lower())
                 elif any(w in flab for w in ("country", "state", "province", "city", "postal", "zip", "address")):
-                    matched = any(exp_str.casefold() in r['value'].casefold() for r in rows if "address" in r['label'].lower() or "contact" in r['context'].lower() or "information" in r['context'].lower())
-                if not matched and exp_str:
+                    matched = any(exp_str.casefold() in r['value'].casefold() for r in rows if "address" in r['label'].lower() or "contact" in r['context'].lower() or "information" in r['context'].lower() or "country" in r['label'].lower())
+                if not matched and exp_str and rows:
                     review_body = " ".join(r['value'] for r in rows)
                     matched = exp_str.casefold() in review_body.casefold()
             if not matched:
@@ -2233,12 +2373,16 @@ class _Run:
                     self.fields[field.key] = field
                     self.answers[field.key] = Answer(field.key, None, 'unknown', 'review contradicts profile')
                     issues.append(field.label)
-            elif label == 'education' or 'education' in label or row.get('context', '').lower() == 'education':
+            elif label == 'education' or re.search(r'\b(?:school|university)\b', label):
                 edu_school = (self.ctx.profile.get('education') or {}).get('school')
                 if edu_school and (not _is_reasonable(row['value']) or row['value'].lower() == 'no response' or normalize(edu_school) not in value):
                     self.fields[field.key] = field
                     self.answers[field.key] = Answer(field.key, None, 'unknown', 'review contradicts profile')
                     issues.append(field.label)
+            elif row.get('context', '').lower() == 'education' and row['value'].lower() == 'no response':
+                self.fields[field.key] = field
+                self.answers[field.key] = Answer(field.key, None, 'unknown', 'review contradicts profile')
+                issues.append(field.label)
             elif (self._is_date_field(field) and re.search(
                     r'\b(?:desired|available|earliest|ideal|preferred)\b', field.label, re.I)):
                 if self._is_date_field(field):
@@ -2252,6 +2396,12 @@ class _Run:
 
     def review(self) -> ApplyResult:
         self.furthest = step_name(self.page) or "Review"
+        self.settle()
+        if is_review(self.page) and not self._review_rows():
+            for _ in range(6):
+                self.page.wait_for_timeout(250)
+                if self._review_rows():
+                    break
         if is_review(self.page) and self.page.locator(f'{ROOT} input, {ROOT} select, {ROOT} [role="checkbox"]').count():
             self.fill_step(self.furthest, repair=[])
         try:

@@ -68,6 +68,7 @@ preferences:
   duration_months: "3"
   over_18: "Yes"
   how_did_you_hear: Simplify
+  security_clearance: "No"
   previously_employed_here: "No"
   non_compete: "No"
   government_employment: "No"   # ever employed by a government entity / public official
@@ -140,3 +141,10 @@ company_answers:
     "Citizenship Status": "(a) U.S. citizen or national of the United States"
     "What location(s) are you interested in working at?":
       - "Huntington Beach"
+  CoStar Group:
+    "How Did You Hear About Us?": "School Career Website"
+    "Yes, I have read and consent to the terms and conditions": true
+    "Have you previously worked for CoStar Group or its acquired companies?": "No"
+    "Are you currently authorized to work for CoStar in the United States?": "Yes"
+    "Will you now or in the future require sponsorship for an employment visa or immigration related benefit?": "No"
+    "If you live outside the region this role is in, are you willing to relocate?": "Yes"
