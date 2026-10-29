@@ -130,6 +130,19 @@ def cmd_apply(a) -> int:
     print(f"\nsubmitted {stats.submitted}, queued {stats.queued}, failed {stats.failed}, dry-run ok {stats.dry_ok}")
     path, summary = report.build()
     print(f"report: {path}")
+    if stats.queued > 0 and sys.stdin.isatty() and not a.dry_run:
+        try:
+            prompt = input(f"\n[!] Batch complete with {stats.queued} jobs needing review. Run interactive interview now? [Y/n]: ")
+            if prompt.strip().lower() in ("y", "yes", ""):
+                from .interview import run_interview
+                cfg, prof = load_config(), load_profile()
+                unlocked = run_interview(cfg, prof)
+                if unlocked:
+                    re_apply = input(f"Re-apply to {len(unlocked)} unlocked job(s) now? [Y/n]: ")
+                    if re_apply.strip().lower() in ("y", "yes", ""):
+                        apply_batch(cfg, prof, job_ids=unlocked)
+        except (EOFError, KeyboardInterrupt):
+            pass
     return 0
 
 
@@ -512,6 +525,27 @@ def cmd_auth(a) -> None:
     print("Gmail authorized." if mail.available() else "Authorization finished but Gmail is not reachable.")
 
 
+def cmd_interview(a) -> int:
+    from .interview import run_interview
+    config = load_config()
+    profile = load_profile()
+    unlocked = run_interview(
+        config=config,
+        profile=profile,
+        job_ids=a.job,
+        auto_reapply=a.reapply,
+    )
+    if unlocked and not a.reapply and sys.stdin.isatty():
+        try:
+            prompt = input(f"\nRe-apply to the {len(unlocked)} unlocked job(s) now? [Y/n]: ")
+            if prompt.strip().lower() in ("y", "yes", ""):
+                from .runner import apply_batch
+                apply_batch(config, profile, job_ids=unlocked)
+        except (EOFError, KeyboardInterrupt):
+            pass
+    return 0
+
+
 def cmd_doctor(a) -> None:
     from . import doctor
     sys.exit(doctor.main())
@@ -586,6 +620,11 @@ def main(argv: list[str] | None = None) -> int:
     aup = sub.add_parser("auth", help="one-time logins")
     aup.add_argument("service", choices=["gmail"])
     aup.set_defaults(fn=cmd_auth)
+
+    ivp = sub.add_parser("interview", help="interview user on unanswered questions to update RAG profile")
+    ivp.add_argument("--job", nargs="+", help="specific job id(s) to interview for")
+    ivp.add_argument("--reapply", action="store_true", help="automatically re-apply to unlocked jobs")
+    ivp.set_defaults(fn=cmd_interview)
 
     a = p.parse_args(argv)
     _setup_logging(a.verbose)

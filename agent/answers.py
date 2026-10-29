@@ -644,6 +644,31 @@ def _norm_q(text: str) -> str:
     return re.sub(r"[\s*✱]+$", "", s).strip()
 
 
+def _custom_confirmed_answer(field: Field, profile: dict,
+                             option_matcher: Callable[[list[str], str], int | None] | None = None) -> Answer | None:
+    label = re.sub(r"\s+", " ", field.label or field.name).strip()
+    custom_answers = profile.get("custom_answers") or {}
+    if isinstance(custom_answers, dict):
+        for question, value in custom_answers.items():
+            nq, nl = _norm_q(question), _norm_q(label)
+            if nq == nl or (len(nq) > 15 and (nq in nl or nl in nq)):
+                if field.kind == "checkbox" and field.options and isinstance(value, list):
+                    selected = [matching_option(v, field.options) for v in value]
+                    if not selected or any(v is None for v in selected):
+                        selected = None
+                else:
+                    if field.options:
+                        opt = matching_option(value, field.options)
+                        if opt is None:
+                            return Answer(field.key, None, "unknown", "custom option unavailable")
+                        selected = opt
+                    else:
+                        selected = _coerce(field, value, option_matcher)
+                if selected is not None:
+                    return Answer(field.key, selected, "bank", "custom answer confirmed in profile")
+    return None
+
+
 def _company_confirmed_answer(field: Field, job: Job, profile: dict,
                               option_matcher: Callable[[list[str], str], int | None] | None = None) -> Answer | None:
     label = re.sub(r"\s+", " ", field.label or field.name).strip()
@@ -1223,6 +1248,14 @@ def _evidence_corpus(profile: dict) -> list[_Evidence]:
                     for i, chunk in enumerate(_chunks(text)))
         if count >= 100:
             break
+    try:
+        from . import db
+        for r in db.get_answers_bank():
+            comp_prefix = f"{r['company']}: " if r["company"] else ""
+            rows.extend(("bank", f"answers_bank.{r['question']}", chunk)
+                        for chunk in _chunks(f"Answer Bank: {comp_prefix}{r['question']}: {r['answer']}"))
+    except Exception as exc:
+        log.debug("could not load answers_bank into corpus: %s", exc)
     return [_Evidence(f"E{i + 1}", source, ref, text) for i, (source, ref, text) in enumerate(rows)]
 
 
@@ -1631,6 +1664,7 @@ def answer_fields(fields: list[Field], job: Job, profile: dict, *, job_text: str
     examples = _resume_examples(fields, context, job, profile, job_text)
     for f in fields:
         a = (_company_confirmed_answer(f, job, profile, option_matcher)
+             or _custom_confirmed_answer(f, profile, option_matcher)
              or _unconfirmed_details(f, profile)
              or _source_detail(f, context, profile)
              or examples.get(f.key)

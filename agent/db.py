@@ -111,6 +111,17 @@ CREATE TABLE IF NOT EXISTS submit_intent_resolutions (
     created_at REAL NOT NULL,
     PRIMARY KEY (job_id, run_id)
 );
+
+CREATE TABLE IF NOT EXISTS answers_bank (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    question TEXT NOT NULL,
+    answer TEXT NOT NULL,
+    company TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT 'user_interview',
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS answers_bank_q ON answers_bank(question);
+CREATE INDEX IF NOT EXISTS answers_bank_comp ON answers_bank(company);
 """
 
 # Job.status values
@@ -738,6 +749,26 @@ def resolve_submit_intents(job_id: str, outcome: str) -> int:
             (status, job_id),
         )
         return len(intents)
+
+
+def save_answers_bank(question: str, answer: str, company: str = "", source: str = "user_interview") -> int:
+    now = time.time()
+    with connect() as c:
+        cur = c.execute(
+            "INSERT INTO answers_bank (question, answer, company, source, created_at) VALUES (?,?,?,?,?)",
+            (question, answer, company, source, now),
+        )
+        return int(cur.lastrowid)
+
+
+def get_answers_bank(company: str | None = None) -> list[sqlite3.Row]:
+    with connect() as c:
+        if company:
+            return c.execute(
+                "SELECT * FROM answers_bank WHERE company=? OR company='' ORDER BY id",
+                (company,),
+            ).fetchall()
+        return c.execute("SELECT * FROM answers_bank ORDER BY id").fetchall()
 
 
 def night_start(now: float | None = None) -> float:

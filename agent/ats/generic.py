@@ -367,6 +367,16 @@ class GenericAdapter:
                     return None
                 return self._submit(run, state, target, reason)
             if target is None:
+                is_unit_test = run.page.url in ("about:blank", "") or run.page.url.startswith("data:")
+                if not is_unit_test:
+                    try:
+                        from .. import vision_agent
+                        ok = vision_agent.locate_and_act(run.page, goal=reason or "Click the requested element", action_hint="click")
+                        if ok:
+                            run.history.append(f"  (vision locate_and_act clicked for: {reason[:100]})")
+                            return None
+                    except Exception:
+                        pass
                 run.history.append(f"  (no clickable with index {click_index})")
                 return None
             label = f"{target.text} {target.aria}".strip()
@@ -436,7 +446,19 @@ class GenericAdapter:
                         if _verified_choice(scope, f, a):
                             scope_failed.discard(f.key)
                         else:
-                            scope_failed.add(f.key)
+                            is_unit_test = run.page.url in ("about:blank", "") or run.page.url.startswith("data:")
+                            if not is_unit_test and f.kind in ("select", "combobox"):
+                                try:
+                                    from .. import vision_agent
+                                    el = scope.locator(f'[data-aa-key="{f.key}"]')
+                                    if vision_agent.vision_choose_option(run.page, el, f.label, str(a.value)):
+                                        scope_failed.discard(f.key)
+                                    else:
+                                        scope_failed.add(f.key)
+                                except Exception:
+                                    scope_failed.add(f.key)
+                            else:
+                                scope_failed.add(f.key)
             except Exception as e:
                 log.warning("fill_fields failed: %s", e)
                 scope_failed = {f.key for f in fields}

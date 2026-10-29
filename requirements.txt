@@ -8,6 +8,7 @@ h2==4.4.1
 cryptography==50.0.2
 pypdf==6.21.2
 PyYAML==6.0.3
+ruamel.yaml==0.19.1
 python-dotenv==1.2.4
 requests==2.34.2
 pytest==9.1.1

@@ -300,12 +300,30 @@ def _match_option(options: list[str], value: str) -> int | None:
     return None
 
 
+def _major_aliases(major: str) -> list[str]:
+    m = major.strip()
+    aliases = [m]
+    if re.search(r"\bcomputer\s+science\b", m, re.I):
+        aliases.extend([
+            "Computer Science",
+            "Computer science engineering",
+            "Computers Science",
+            "Computer Science and Engineering",
+            "Computer Information Science",
+            "Computer Engineering",
+        ])
+    return aliases
+
+
 def _is_reasonable(text: str) -> bool:
     t = text.strip()
     if not t:
         return False
     low = t.lower()
-    return low not in ("select one", "select", "-- select --", "choose one", "please select", "none")
+    return low not in (
+        "select one", "select", "-- select --", "choose one", "please select", "none",
+        "no items.", "no items", "no options", "no results", "no matches found"
+    )
 
 
 _PERSONAL_MOBILE_TYPES = (
@@ -947,6 +965,7 @@ class _Run:
             pass
         fields = [f for f in form.extract_fields(self.page, root) if not self.is_honeypot(f)]
         fields += self.extract_workday_widgets(root, {f.key for f in fields})
+        log.info("fill_step %r extracted fields: %r", name, [(f.key, f.label, f.name) for f in fields])
         radios = self.extract_workday_radios(root)
         if radios:
             aids = {f.name for f in radios}
@@ -1152,6 +1171,15 @@ class _Run:
             if re.fullmatch(r"(?:country|country\s*/\s*territory)[*✱\s]*", short, re.I):
                 country = personal.get("country")
                 return Answer(f.key, country or None, "profile" if country else "unknown", "country from profile")
+        if re.search(r"\b(?:date\s*signed|signature\s*date|signed\s*on)\b", lab + ' ' + (f.name or ''), re.I) or (
+            re.search(r"self.?identif", self.furthest, re.I) and re.fullmatch(r"date", lab.strip(), re.I)
+        ):
+            today = time.strftime("%m/%d/%Y")
+            return Answer(f.key, today, "profile", "today's signature date")
+        if re.search(r"self.?identif", self.furthest, re.I) and re.fullmatch(r"name", lab.strip(), re.I):
+            pname = (self.ctx.profile.get("personal") or {}).get("full_name", "")
+            if pname:
+                return Answer(f.key, pname, "profile", "full name from profile")
         if _is_referral_source(f):
             source = preferences.get("how_did_you_hear")
             return Answer(f.key, str(source).strip() if source else None,
@@ -1462,6 +1490,14 @@ class _Run:
     def _dropdown_options(self, el: Locator, box: Locator) -> Locator | None:
         prompt = A("promptOption")
         option_sel = prompt + ':visible, [role="option"]:visible:not(:has(' + prompt + '))'
+        try:
+            fresh_cnt = self.page.locator('[role="listbox"]:visible:not([data-aa-existing-menu])').count()
+            menus_cnt = self.page.locator('[role="listbox"]:visible').count()
+            prompt_cnt = self.page.locator(prompt + ':visible').count()
+            log.info("_dropdown_options: fresh=%d, menus=%d, prompts=%d, box=%r",
+                     fresh_cnt, menus_cnt, prompt_cnt, box.count())
+        except Exception as e:
+            log.info("_dropdown_options count error: %s", e)
         for owner in (el, box):
             if not owner.count():
                 continue
@@ -1481,20 +1517,100 @@ class _Run:
         if local_prompts.count():
             return local_prompts
 
+        def _activate_box(box_el: Locator) -> Locator | None:
+            self.page.locator('[data-aa-target-menu]').evaluate_all(
+                "els => els.forEach(el => el.removeAttribute('data-aa-target-menu'))"
+            )
+            try:
+                box_el.evaluate("el => el.setAttribute('data-aa-target-menu', 'active')")
+                opts = self.page.locator('[data-aa-target-menu="active"]').locator(option_sel)
+                if opts.count():
+                    return opts
+            except Exception:
+                pass
+            return None
+
+        curr_key = None
+        try:
+            curr_key = el.get_attribute("data-aa-key") or (box.first.get_attribute("data-aa-key") if box.count() else None)
+        except Exception:
+            curr_key = None
+
+        def _is_foreign(menu_el: Locator) -> bool:
+            if not curr_key:
+                return False
+            try:
+                owner = menu_el.get_attribute("data-aa-dropdown-owner")
+                return bool(owner and owner != curr_key)
+            except Exception:
+                return False
+
         fresh = self.page.locator('[role="listbox"]:visible:not([data-aa-existing-menu])')
         if fresh.count() == 1:
-            return fresh.locator(option_sel)
-        if fresh.count() > 1:
+            opts = _activate_box(fresh.first)
+            if opts:
+                return opts
+        elif fresh.count() > 1:
+            with_opts: list[tuple[int, list[str]]] = []
+            for i in range(fresh.count()):
+                if _is_foreign(fresh.nth(i)):
+                    continue
+                sub = fresh.nth(i).locator(option_sel)
+                try:
+                    texts = [t.strip() for t in sub.all_inner_texts()]
+                    valid_texts = [t for t in texts if _is_reasonable(t)]
+                    if valid_texts:
+                        with_opts.append((i, valid_texts))
+                except Exception:
+                    pass
+            log.info("_dropdown_options: fresh len=%d, with_opts len=%d, valid_counts=%r",
+                     fresh.count(), len(with_opts), [len(v) for _, v in with_opts])
+            chosen_idx = None
+            if len(with_opts) == 1:
+                chosen_idx = with_opts[0][0]
+            elif len(with_opts) > 1:
+                best = max(with_opts, key=lambda pair: len(pair[1]))
+                others_max = max((len(p[1]) for p in with_opts if p is not best), default=0)
+                if len(best[1]) > 0 and (others_max == 0 or len(best[1]) >= 2 * others_max):
+                    log.info("_dropdown_options: picked listbox %d with %d valid options over %d dummy options",
+                             best[0], len(best[1]), others_max)
+                    chosen_idx = best[0]
+            if chosen_idx is not None:
+                opts = _activate_box(fresh.nth(chosen_idx))
+                if opts:
+                    return opts
             return None
         menus = self.page.locator('[role="listbox"]:visible')
+        try:
+            m_dump = menus.evaluate_all("els => els.map(e => ({id: e.id, cls: e.className, top: e.getBoundingClientRect().top, text: e.innerText.slice(0, 40)}))")
+            log.info("_dropdown_options menus dump: %r", m_dump)
+        except Exception as e:
+            log.info("_dropdown_options dump error: %s", e)
         changed_indices = menus.evaluate_all(
             """els => els.flatMap((el, i) => el.hasAttribute('data-aa-existing-text') &&
                 el.innerText.trim() !== el.getAttribute('data-aa-existing-text') ? [i] : [])"""
         )
+        fresh_prompts = self.page.locator(A("promptOption") + ':visible:not([data-aa-existing-menu])')
+        log.info("_dropdown_options debug: el=%r fresh=%d menus=%d changed=%r fresh_prompts=%d",
+                 el, fresh.count(), menus.count(), changed_indices, fresh_prompts.count())
         if len(changed_indices) == 1:
-            changed = menus.nth(changed_indices[0]).locator(option_sel)
-            if changed.count():
-                return changed
+            try:
+                m = menus.nth(changed_indices[0])
+                m_handle = m.element_handle()
+                near = el.evaluate("""(el, m) => {
+                    if (!m) return false;
+                    const er = el.getBoundingClientRect();
+                    const mr = m.getBoundingClientRect();
+                    const overlap = Math.max(0, Math.min(er.right, mr.right) - Math.max(er.left, mr.left));
+                    const gap = Math.min(Math.abs(mr.top - er.bottom), Math.abs(er.top - mr.bottom));
+                    return overlap > 0 && gap < 350;
+                }""", m_handle)
+                if near:
+                    changed = m.locator(option_sel)
+                    if changed.count():
+                        return changed
+            except Exception as e:
+                log.info("changed_indices proximity check error: %s", e)
         key = el.get_attribute("data-aa-key")
         fresh_prompts = self.page.locator(A("promptOption") + ':visible:not([data-aa-existing-menu])')
         if key and not fresh_prompts.count():
@@ -1555,6 +1671,12 @@ class _Run:
 
     def listbox_options(self, el: Locator) -> list[str]:
         try:
+            self.page.keyboard.press("Escape")
+            self.page.wait_for_timeout(200)
+        except Exception:
+            pass
+
+        try:
             self._mark_existing_menus()
             el.click(timeout=5000)
             box = el.locator("xpath=ancestor::*[starts-with(@data-automation-id,'formField-')][1]")
@@ -1572,8 +1694,12 @@ class _Run:
 
     def _close_dropdown(self, el: Locator, box: Locator) -> None:
         self.page.keyboard.press("Escape")
-        # Some Workday multiselects reset their search on Escape but keep the
-        # popup over the following fields until focus and the outside click move.
+        try:
+            self.page.locator('[data-aa-target-menu]').evaluate_all(
+                "els => els.forEach(el => el.removeAttribute('data-aa-target-menu'))"
+            )
+        except Exception:
+            pass
         if el.evaluate("el => el.tagName === 'INPUT'"):
             el.evaluate("el => el.blur()")
         if box.count():
@@ -1724,6 +1850,10 @@ class _Run:
         key = None
         try:
             key = el.get_attribute("data-aa-key")
+            log.info("choose_option start for %r: tag=%r cls=%r key=%r fid=%r",
+                     el.evaluate("e => e.getAttribute('aria-label') || ''"),
+                     el.evaluate("e => e.tagName"), el.evaluate("e => e.className"), key,
+                     box.evaluate("e => e.getAttribute('data-automation-id')") if box.count() else None)
         except Exception:
             pass
 
@@ -1763,8 +1893,28 @@ class _Run:
             re.search(r"\b(school|university|institution|college)\b", label, re.I) or
             re.search(r"school|university|institution|college", fid, re.I)
         )
-        is_major = bool(re.search(r"\b(?:field of study|major|area of study)\b", label + " " + fid, re.I))
+        is_major = bool(re.search(r"field\s*of\s*study|fieldOfStudy|major|area\s*of\s*study", label + " " + fid, re.I))
         is_skills = bool(re.search(r"\bskills?\b", label + " " + fid, re.I))
+
+        if not multi or is_school or is_major:
+            try:
+                selected_pills = box.locator(A("selectedItem"))
+                for s_idx in range(selected_pills.count()):
+                    pill = selected_pills.nth(s_idx)
+                    pill_text = (pill.inner_text() or "").strip()
+                    if pill_text and _match_option([pill_text], value) is None:
+                        del_btn = pill.locator('button, [data-automation-id*="delete" i], [aria-label*="remove" i], [aria-label*="delete" i]')
+                        if del_btn.count():
+                            del_btn.first.click(timeout=2000)
+                            self.page.wait_for_timeout(300)
+            except Exception:
+                pass
+
+        try:
+            self.page.keyboard.press("Escape")
+            self.page.wait_for_timeout(200)
+        except Exception:
+            pass
 
         try:
             self._mark_existing_menus()
@@ -1824,6 +1974,12 @@ class _Run:
                 log.info("choose_option for %r (wanted=%r, step=%d): opts_count=0", label, value, step)
                 if picked:
                     break
+                if value and (multi or is_school or is_major or is_skills):
+                    try:
+                        target_inp.press("Enter")
+                        self.page.wait_for_timeout(400)
+                    except Exception:
+                        pass
                 for _ in range(6):
                     self.page.wait_for_timeout(500)
                     opts = self._dropdown_options(el, box)
@@ -1858,11 +2014,18 @@ class _Run:
             last_texts = texts
 
             i = None
-            if value and (is_referral or re.search(r"field\s*of\s*study|major", label + ' ' + fid, re.I)):
-                aliases = _referral_aliases(value) if is_referral else ()
+            if value and (is_referral or is_major):
+                aliases = _referral_aliases(value) if is_referral else tuple(_major_aliases(value)[1:])
                 scrolled = self._scroll_dropdown_to_match(el, box, value, aliases, exact=is_referral)
                 if scrolled:
                     opts, texts, i = scrolled
+            if i is None and is_major and value:
+                for alias in _major_aliases(value):
+                    idx = _match_option(texts, alias)
+                    if idx is not None:
+                        i = idx
+                        log.info("Major matched via alias %r -> %r", alias, texts[i])
+                        break
             if i is None:
                 is_lang = bool(re.search(r"language", label + " " + fid, re.I))
                 i = _pick_option_index(
@@ -1920,6 +2083,15 @@ class _Run:
 
             self.page.wait_for_timeout(500)
 
+            is_target_match = False
+            if value:
+                if _match_option([chosen_text], value) is not None:
+                    is_target_match = True
+                elif is_major and any(_match_option([chosen_text], a) is not None for a in _major_aliases(value)):
+                    is_target_match = True
+            if is_target_match:
+                break
+
             # If clicking this option navigated into a subcategory, new options will appear
             next_texts = []
             for _ in range(3):
@@ -1929,21 +2101,61 @@ class _Run:
                 if next_texts and next_texts != texts:
                     break
             if next_texts and next_texts != texts:
-                picked = False
-                continue
+                has_selected = False
+                try:
+                    if multi and box.locator(A("selectedItem")).count() > selected_before:
+                        has_selected = True
+                except Exception:
+                    pass
+                valid_next = [t for t in next_texts if _is_reasonable(t)]
+                if not has_selected and valid_next:
+                    picked = False
+                    continue
 
             break
 
         if picked and chosen_text:
             try:
-                selected = box.locator(A("selectedItem"))
-                if selected.count() > selected_before and _match_option(selected.all_inner_texts(), chosen_text) is not None:
-                    picked = True
-                else:
+                targets = [chosen_text, value]
+                if is_major and value:
+                    targets.extend(_major_aliases(value))
+                pills = []
+                state = []
+                for _ in range(5):
+                    selected = box.locator(A("selectedItem"))
+                    pills = []
+                    for p_idx in range(selected.count()):
+                        p_el = selected.nth(p_idx)
+                        txt_el = p_el.locator(A("selectedItemText"))
+                        raw = txt_el.inner_text() if txt_el.count() else p_el.inner_text()
+                        clean_p = re.sub(r"\s*(remove|delete|\u00d7|x)\s*$", "", (raw or "").strip(), flags=re.I).strip()
+                        if clean_p:
+                            pills.append(clean_p)
                     state = self._control_values(el)
-                    picked = _match_option(state, chosen_text) is not None
-            except Exception:
+                    clean_state = [re.sub(r"\s*(remove|delete|\u00d7|x)\s*$", "", s, flags=re.I).strip() for s in state]
+                    if (selected.count() > selected_before and any(_match_option(pills, tgt) is not None for tgt in targets if tgt)) or any(_match_option(clean_state, tgt) is not None for tgt in targets if tgt):
+                        picked = True
+                        break
+                    self.page.wait_for_timeout(300)
+                else:
+                    picked = False
+                log.info("choose_option verification for %r: pills=%r, state=%r, chosen=%r, picked=%r",
+                         label, pills, state, chosen_text, picked)
+            except Exception as e:
+                log.info("choose_option verification exception: %s", e)
                 picked = False
+
+        is_unit_test = self.page.url in ("about:blank", "") or self.page.url.startswith("data:")
+        if not picked and value and not is_unit_test and not (self.page.locator('[role="listbox"]:visible').count() > 1):
+            # Fall back to Computer Use vision agent
+            try:
+                from agent import vision_agent
+                log.info("choose_option DOM attempts failed for %r. Trying vision fallback...", label)
+                if vision_agent.vision_choose_option(self.page, box, label, value):
+                    picked = True
+                    chosen_text = value
+            except Exception as e:
+                log.warning("Vision choose_option fallback failed: %s", e)
 
         if multi or not picked:
             try:
@@ -2002,11 +2214,13 @@ class _Run:
                 return {month: get('Month'), day: get('Day'), year: get('Year')};
             }""")
             expected = {"month": mo, "day": d, "year": y}
-            return bool(info.get("hasYear")) and all(
+            ok = bool(info.get("hasYear")) and all(
                 actual[part] is not None and actual[part].isdigit() and int(actual[part]) == expected[part]
                 for part, present in (("month", has_month), ("day", has_day), ("year", info.get("hasYear")))
                 if present
             )
+            log.info("fill_date spinbuttons: ok=%r, actual=%r, expected=%r", ok, actual, expected)
+            return ok
         else:
             # Preserve a supplied day; native date inputs require ISO format.
             full_date = bool(re.fullmatch(r"(?:\d{4}-\d{1,2}-\d{1,2}|\d{1,2}/\d{1,2}/\d{4})", value.strip()))
