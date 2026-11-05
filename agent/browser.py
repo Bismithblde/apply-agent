@@ -117,6 +117,13 @@ def new_page(ctx: BrowserContext) -> Page:
     return ctx.pages[0] if ctx.pages else ctx.new_page()
 
 
+def refresh_page(page: Page, timeout_ms: int = 20_000) -> None:
+    try:
+        page.reload(wait_until="domcontentloaded", timeout=timeout_ms)
+    except Exception as exc:
+        log.warning("page refresh failed (error_type=%s)", type(exc).__name__)
+
+
 def human_pause(lo: float = 0.3, hi: float = 1.1) -> None:
     time.sleep(random.uniform(lo, hi))
 

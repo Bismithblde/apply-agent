@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 from playwright.sync_api import Locator, Page
 
 from .. import mail, vault
-from ..browser import human_pause
+from ..browser import human_pause, refresh_page
 from ..models import Answer, ApplyResult, ApplyStatus, Field, Job
 from .base import ApplyContext, _missing, blocked_result, submit_decision
 
@@ -37,7 +37,7 @@ _DONE_RE = re.compile(r"application (was |has been )?submitted|thank you for app
 _CLOSED_RE = re.compile(r"no longer (accepting|available)|page you are looking for doesn.t exist|"
                         r"job (posting )?(is )?(closed|expired|not found)", re.I)
 _APPLIED_RE = re.compile(r"already applied|you have applied|previously applied", re.I)
-_OOPS_RE = re.compile(r"something went wrong|please refresh the page", re.I)
+_OOPS_RE = re.compile(r"something went wrong|please refresh(?: the page)?|\bvps error\b", re.I)
 _STEP_PREFIX = re.compile(r"^\s*(current\s+)?step\s+\d+\s+of\s+\d+\s*", re.I)
 
 # Hide Workday widgets (and the honeypot) from the generic extractor; this module fills them itself.
@@ -696,7 +696,7 @@ class _Run:
         acct = vault.get(self.tenant)
         if acct:
             outcome = self.sign_in(acct)
-            if outcome == "bad_creds" and not acct.verified:
+            if outcome == "bad_creds" and not acct.verified and not acct.creation_attempted:
                 self._check_account_creation_allowed()
                 outcome = self.submit_create(acct.email, acct.password)
                 if outcome == "exists":
@@ -750,9 +750,20 @@ class _Run:
     def auth_outcome(self, timeout: float = 25) -> str:
         """signed_in | verify | exists | bad_email | bad_creds | locked | error: <text>"""
         end = time.monotonic() + timeout
+        refreshed = False
         self.page.wait_for_timeout(1500)
         while time.monotonic() < end:
             body = _text(self.page, "body")
+            if _OOPS_RE.search(body):
+                if refreshed:
+                    self.ctx.record_layer("page_recovery", "needs_review", "workday_error_persisted_after_refresh")
+                    return "error: Workday error persisted after one refresh"
+                refreshed = True
+                self.ctx.record_layer("page_recovery", "attempted", "workday_auth_error")
+                log.info("Workday auth error page; refreshing once")
+                refresh_page(self.page)
+                self.settle(5000)
+                continue
             errs = " | ".join(error_texts(self.page))
             if _VERIFY_RE.search(errs) or (_VERIFY_RE.search(body) and detect_state(self.page) != "wizard"):
                 return "verify"
@@ -794,6 +805,7 @@ class _Run:
             except Exception:
                 box.first.click(force=True)
         human_pause()
+        vault.mark_creation_attempted(self.tenant)
         self.click(A("createAccountSubmitButton"), overlay_label="Create Account")
         return self.auth_outcome()
 
@@ -860,10 +872,7 @@ class _Run:
                 reloads += 1
                 log.info("Workday error page; reloading (%d)", reloads)
                 self.page.wait_for_timeout(2000)
-                try:
-                    self.page.reload(wait_until="domcontentloaded", timeout=20000)
-                except Exception as e:
-                    log.warning("Workday reload failed (error_type=%s)", type(e).__name__)
+                refresh_page(self.page)
                 self.settle()
             if _OOPS_RE.search(_text(self.page, ROOT)):
                 raise self.stop(ApplyStatus.NEEDS_REVIEW, "Workday 'Something went wrong' page", "oops")

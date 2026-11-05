@@ -16,7 +16,7 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 from playwright.sync_api import Frame, Page, TimeoutError as PlaywrightTimeoutError
 
 from .. import answers, captcha, db, form, llm, mail, vault
-from ..browser import human_pause
+from ..browser import human_pause, refresh_page
 from ..config import SCREENSHOT_DIR
 from ..models import Answer, ApplyResult, ApplyStatus, Field, Job
 from .base import ApplyContext, blocked_result, submit_decision
@@ -30,7 +30,7 @@ MAX_CLICKABLES = 80
 POPUP_WAIT_MS = 8000
 
 ACTIONS = ["fill_form", "click", "create_account", "sign_in", "need_email_code", "need_email_link",
-           "submit", "done", "give_up"]
+           "refresh_page", "submit", "done", "give_up"]
 
 ACTION_SCHEMA = {
     "type": "object",
@@ -79,7 +79,8 @@ _FUTURE_PERMISSION_RE = re.compile(
 _CURRENT_ROLE_ONLY_RE = re.compile(
     r"\bonly\b.{0,60}\b(?:role|position)\b.{0,60}\b(?:applying for|this role|this position)\b", re.I)
 _SERVER_ERROR_RE = re.compile(
-    r"an unexpected server error occurred|internal server error|500 internal server error", re.I)
+    r"an unexpected server error occurred|internal server error|500 internal server error|\bvps error\b", re.I)
+_REFRESH_PROMPT_RE = re.compile(r"\b(?:refresh|reload|try again)\b", re.I)
 _ACCOUNT_FLOW_RE = re.compile(
     r"create (?:an? )?account|candidate account|sign.?up|register|sign.?in|log.?in|account setup", re.I)
 _VERIFICATION_FLOW_RE = re.compile(
@@ -355,6 +356,7 @@ class Run:
     popup_source: Page | None = None
     popup_baseline: list[Page] = field(default_factory=list)
     popup_started_ts: float = 0.0
+    refresh_signature: tuple | None = None
 
 
 class GenericAdapter:
@@ -410,7 +412,14 @@ class GenericAdapter:
             if run.submit_attempted:
                 return self._result(run, ApplyStatus.NEEDS_REVIEW,
                                     "final application action was clicked but no confirmation appeared; possible submission")
-            if _SERVER_ERROR_RE.search(state.text):
+            server_error = bool(_SERVER_ERROR_RE.search(state.text))
+            if run.refresh_signature == state.signature():
+                return self._result(run, ApplyStatus.NEEDS_REVIEW,
+                                    "server error remained after one page refresh" if server_error else
+                                    "page remained unchanged after one refresh")
+            if run.refresh_signature is not None and run.refresh_signature != state.signature():
+                run.refresh_signature = None
+            if server_error and not _REFRESH_PROMPT_RE.search(state.text):
                 return self._result(run, ApplyStatus.NEEDS_REVIEW,
                                     "application site returned a server error")
             sig = state.signature()
@@ -451,6 +460,10 @@ class GenericAdapter:
             run.history.append(f"step {step}: {action}"
                                + (f" #{reply.get('click_index')}" if action == "click" else "") + f" - {reason[:100]}")
 
+            if server_error and action not in ("refresh_page", "give_up"):
+                return self._result(run, ApplyStatus.NEEDS_REVIEW,
+                                    "server error; only refresh or stop is allowed")
+
             out = self._execute(run, state, action, reply.get("click_index"), reason)
             if out is not None:
                 return out
@@ -461,6 +474,20 @@ class GenericAdapter:
 
     def _execute(self, run: Run, state: State, action: str, click_index, reason: str) -> ApplyResult | None:
         if _adopt_popup(run):
+            return None
+        if action == "refresh_page":
+            if run.submit_attempted:
+                return self._result(run, ApplyStatus.NEEDS_REVIEW,
+                                    "page refresh withheld after a possible final submission")
+            if _SERVER_ERROR_RE.search(state.text) and not _REFRESH_PROMPT_RE.search(state.text):
+                return self._result(run, ApplyStatus.NEEDS_REVIEW,
+                                    "page refresh withheld without a refresh or retry prompt")
+            if run.refresh_signature == state.signature():
+                return self._result(run, ApplyStatus.NEEDS_REVIEW,
+                                    "page already refreshed in this unchanged state")
+            run.refresh_signature = state.signature()
+            refresh_page(run.page)
+            _settle(run.page)
             return None
         if action == "fill_form":
             if not state.fields:
@@ -1196,6 +1223,7 @@ Choose ONE next action. Actions:
 - sign_in: a login form is visible and we may already have an account for this site.
 - need_email_code: the page asks for a code that was emailed.
 - need_email_link: the page says to click a link sent by email.
+- refresh_page: the page shows a transient error or asks to refresh/retry. Reloads once, then the next step gets a new screenshot. Use it only before final submission and inspect the new page before acting.
 - submit: the application form is complete and the final submit button is visible (give its click_index).
 - done: the application was submitted and a confirmation is shown.
 - give_up: the posting is closed, requires payment, the wrong job, or cannot be completed.
@@ -1208,6 +1236,7 @@ Rules:
 - Decline SMS, email updates, WhatsApp and future-opportunity messaging. Never opt into messages.
 - Use "submit" only for a likely final application action. Use "click" for account, consent, and intermediate Next/Continue steps.
 - A click is progress, not proof of submission. Use "done" only after the page shows a new application-received/submitted confirmation.
+- On a server/VPS error, choose refresh_page only when the page says refresh/retry; otherwise give_up. Never click submit or recreate an account to recover an error.
 - If fields are visible and empty, use fill_form before clicking Next/Continue/Submit.
 - If a visible dialog or overlay covers the form, resolve its visible controls first; underlying fields are inactive until it clears.
 - Close cookie banners or popups only if they block the page.

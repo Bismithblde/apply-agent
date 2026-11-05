@@ -32,6 +32,7 @@ class Account:
     company: str
     login_url: str
     verified: bool
+    creation_attempted: bool = True
 
 
 def _fernet() -> Fernet:
@@ -133,7 +134,8 @@ def get(tenant_key: str) -> Account | None:
     if r is None:
         return None
     return Account(tenant_key=r["tenant_key"], email=r["email"], password=_decrypt(r["password_enc"]),
-                   company=r["company"], login_url=r["login_url"], verified=bool(r["verified"]))
+                   company=r["company"], login_url=r["login_url"], verified=bool(r["verified"]),
+                   creation_attempted=r["notes"] != "creation_not_attempted")
 
 
 def create(tenant_key: str, company: str, login_url: str, *, plus_alias: bool = True) -> Account:
@@ -144,8 +146,13 @@ def create(tenant_key: str, company: str, login_url: str, *, plus_alias: bool = 
         pass
     email = alias_email(company) if plus_alias else base_email()
     password = generate_password(_password_length())
-    db.put_account_row(tenant_key, company, login_url, email, _encrypt(password))
-    return Account(tenant_key, email, password, company, login_url, False)
+    db.put_account_row(tenant_key, company, login_url, email, _encrypt(password), notes="creation_not_attempted")
+    return Account(tenant_key, email, password, company, login_url, False, False)
+
+
+def mark_creation_attempted(tenant_key: str) -> None:
+    with db.connect() as c:
+        c.execute("UPDATE accounts SET notes='creation_attempted' WHERE tenant_key=?", (tenant_key,))
 
 
 def mark_verified(tenant_key: str) -> None:

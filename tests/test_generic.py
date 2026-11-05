@@ -9,6 +9,7 @@ import sys
 import time
 import types
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
@@ -1412,13 +1413,51 @@ def test_profile_reuse_consent_defaults_to_current_role_only():
     assert result[0].note == "data use scoped to this application"
 
 
-def test_fatal_server_error_stops_without_calling_vision(site, monkeypatch):
+def test_server_error_without_refresh_prompt_stops_without_vision(site, monkeypatch):
     monkeypatch.setitem(PAGES, "/server_error", """<main><h1>Page Error</h1>
-        <p>Error: An unexpected server error occurred. Please try again later.</p></main>""")
+        <p>Error: An unexpected server error occurred. Contact support.</p></main>""")
     result, fake = run(site, monkeypatch, [], path="/server_error", dry_run=True)
     assert result.status == ApplyStatus.NEEDS_REVIEW
     assert "server error" in result.reason
     assert fake.prompts == []
+
+
+def test_refresh_tool_reloads_then_vision_inspects_new_screenshot(site, monkeypatch):
+    monkeypatch.setitem(PAGES, "/vps_refresh", """<main><h1>VPS Error</h1><p>Please refresh the page.</p>
+        <script>
+        if (sessionStorage.getItem('refreshed')) {
+          document.body.innerHTML = '<main><h1>Application resumed</h1><p>Refresh worked.</p></main>';
+        } else sessionStorage.setItem('refreshed', '1');
+        </script></main>""")
+    result, fake = run(site, monkeypatch, [act("refresh_page"), act("give_up", "inspected recovered page")],
+                       path="/vps_refresh", dry_run=True)
+
+    assert result.status == ApplyStatus.NEEDS_REVIEW
+    assert len([hit for hit in site.hits if hit[1] == "/vps_refresh"]) == 2
+    assert "Please refresh the page" in fake.prompts[0]
+    assert "Application resumed" in fake.prompts[1]
+    assert fake.images[0] and fake.images[0][0]
+    assert fake.images[1] and fake.images[1][0]
+
+
+def test_refresh_tool_stops_when_vps_error_persists(site, monkeypatch):
+    monkeypatch.setitem(PAGES, "/vps_stuck", """<main><h1>VPS Error</h1><p>Please refresh the page.</p></main>""")
+    result, fake = run(site, monkeypatch, [act("refresh_page")], path="/vps_stuck", dry_run=True)
+
+    assert result.status == ApplyStatus.NEEDS_REVIEW
+    assert "remained after one page refresh" in result.reason
+    assert len(fake.prompts) == 1
+    assert result.screenshot and Path(result.screenshot).exists()
+
+
+def test_vps_error_cannot_trigger_submission(site, monkeypatch):
+    monkeypatch.setitem(PAGES, "/vps_refresh", """<main><h1>VPS Error</h1><p>Please refresh the page.</p></main>""")
+    result, _ = run(site, monkeypatch, [act("submit")], path="/vps_refresh")
+
+    assert result.status == ApplyStatus.NEEDS_REVIEW
+    assert "only refresh or stop" in result.reason
+    with db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM submit_intents").fetchone()[0] == 0
 
 
 def test_visible_aria_hidden_dialog_is_actionable_and_hides_blocked_fields(site, monkeypatch, tmp_path):

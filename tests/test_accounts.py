@@ -38,6 +38,18 @@ def test_vault_round_trip(tmp_db):
     assert vault.get(tk) is None
 
 
+def test_vault_creation_attempt_state_survives_email_update(tmp_db):
+    tk = "acme.wd1.myworkdayjobs.com/External"
+    vault.create(tk, "Acme", "https://acme.wd1.myworkdayjobs.com/External")
+    assert not vault.get(tk).creation_attempted
+
+    vault.mark_creation_attempted(tk)
+    vault.update_email(tk, "jane.doe@gmail.com")
+
+    assert vault.get(tk).creation_attempted
+    assert vault.get(tk).email == "jane.doe@gmail.com"
+
+
 def test_vault_plain_email_when_alias_off(tmp_db):
     acct = vault.create("x.wd1.myworkdayjobs.com/Ext", "X Corp", "", plus_alias=False)
     assert acct.email == "jane.doe@gmail.com"
@@ -327,8 +339,13 @@ class _Ctx:
     def __init__(self, page):
         self.page, self.browser, self.config, self.profile = page, None, {}, {}
         self.submit_mode, self.dry_run, self.notes = "fill_only", True, []
+        self.layers, self.screenshots = [], []
+
+    def record_layer(self, *args, **kwargs):
+        self.layers.append((args, kwargs))
 
     def screenshot(self, job, tag):
+        self.screenshots.append(tag)
         return None
 
 
@@ -354,6 +371,116 @@ def test_account_exists_outcome(page):
     with pytest.raises(workday._Stop) as e:
         run.handle_auth_outcome("exists", None)
     assert e.value.result.reason.startswith("account exists, password unknown")
+
+
+def test_workday_account_creation_refreshes_vps_page_without_resubmitting(page, tmp_db, monkeypatch):
+    url = "https://workday.test/apply"
+    visits = []
+
+    def respond(route):
+        visits.append(route.request.url)
+        if len(visits) == 1:
+            body = ('<div data-automation-id="applyFlowPage">' + _progress("Create Account/Sign In") +
+                    '<div data-automation-id="signInContent"><input data-automation-id="email">'
+                    '<input type="password" data-automation-id="password">'
+                    '<input type="password" data-automation-id="verifyPassword">'
+                    '<input type="checkbox" data-automation-id="createAccountCheckbox">'
+                    '<button data-automation-id="createAccountSubmitButton" '
+                    'onclick=\'sessionStorage.setItem("createClicks", "1"); '
+                    'document.body.innerHTML="<main>VPS Error. Please refresh the page.</main>"\'>'
+                    'Create Account</button></div></div>')
+        else:
+            body = FIXTURES["wizard"]
+        route.fulfill(status=200, content_type="text/html", body=f"<html><body>{body}</body></html>")
+
+    page.route("https://workday.test/**", respond)
+    try:
+        page.goto(url)
+        run = workday._Run(_job(), _Ctx(page))
+        run.ctx.config = {"accounts": {"create_in_dry_run": True, "create_in_fill_only": True}}
+        monkeypatch.setattr(run, "settle", lambda *args, **kwargs: None)
+        monkeypatch.setattr(workday, "human_pause", lambda *args, **kwargs: None)
+
+        outcome = run.create_account()
+
+        assert outcome == "signed_in"
+        assert len(visits) == 2
+        assert page.evaluate("sessionStorage.getItem('createClicks')") == "1"
+        assert vault.get(run.tenant).creation_attempted
+    finally:
+        page.unroute("https://workday.test/**", respond)
+
+
+def test_workday_review_signin_refreshes_vps_error_and_rechecks_state(page, tmp_db, monkeypatch):
+    url = "https://workday.test/apply"
+    visits = []
+
+    def respond(route):
+        visits.append(route.request.url)
+        body = ('<div data-automation-id="applyFlowPage">VPS Error. Please refresh the page.</div>'
+                if len(visits) == 1 else FIXTURES["wizard"])
+        route.fulfill(status=200, content_type="text/html", body=f"<html><body>{body}</body></html>")
+
+    page.route("https://workday.test/**", respond)
+    try:
+        page.goto("about:blank")
+        job = _job()
+        run = workday._Run(job, _Ctx(page))
+        acct = vault.create(run.tenant, "KLA", "https://workday.test")
+        vault.mark_creation_attempted(run.tenant)
+        monkeypatch.setattr(run, "settle", lambda *args, **kwargs: None)
+        monkeypatch.setattr(run, "sign_in", lambda _: (page.goto(url), run.auth_outcome(timeout=3))[1])
+        monkeypatch.setattr(vault, "create", lambda *args, **kwargs: pytest.fail("review created another account"))
+
+        run.authenticate()
+
+        assert len(visits) == 2
+        assert workday.detect_state(page) == "wizard"
+        assert run.ctx.layers[0][0] == ("page_recovery", "attempted", "workday_auth_error")
+        assert vault.get(run.tenant).email == acct.email
+    finally:
+        page.unroute("https://workday.test/**", respond)
+
+
+def test_workday_persistent_vps_error_stops_with_review_screenshot(page, tmp_db, monkeypatch):
+    url = "https://workday.test/apply"
+    visits = []
+
+    def respond(route):
+        visits.append(route.request.url)
+        route.fulfill(status=200, content_type="text/html",
+                      body="<div data-automation-id='applyFlowPage'>VPS Error. Please refresh the page.</div>")
+
+    page.route("https://workday.test/**", respond)
+    try:
+        page.goto(url)
+        run = workday._Run(_job(), _Ctx(page))
+        monkeypatch.setattr(run, "settle", lambda *args, **kwargs: None)
+
+        outcome = run.auth_outcome(timeout=3)
+        with pytest.raises(workday._Stop) as exc:
+            run.handle_auth_outcome(outcome, None)
+
+        assert len(visits) == 2
+        assert "persisted after one refresh" in exc.value.result.reason
+        assert exc.value.result.status == workday.ApplyStatus.NEEDS_REVIEW
+        assert run.ctx.screenshots == ["auth_failed"]
+    finally:
+        page.unroute("https://workday.test/**", respond)
+
+
+def test_workday_does_not_recreate_an_attempted_account_after_bad_signin(page, tmp_db, monkeypatch):
+    run = workday._Run(_job(), _Ctx(page))
+    vault.create(run.tenant, "KLA", "https://kla.wd1.myworkdayjobs.com/UR")
+    vault.mark_creation_attempted(run.tenant)
+    monkeypatch.setattr(run, "sign_in", lambda _: "bad_creds")
+    monkeypatch.setattr(run, "submit_create", lambda *args: pytest.fail("account creation was repeated"))
+
+    with pytest.raises(workday._Stop) as exc:
+        run.authenticate()
+
+    assert exc.value.result.status == workday.ApplyStatus.NEEDS_REVIEW
+    assert exc.value.result.reason.startswith("sign-in failed")
 
 
 @pytest.mark.parametrize("text,expected", [
