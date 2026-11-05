@@ -43,7 +43,7 @@ _EXTRACT_JS = r"""
   // React-Select also sets opacity 0 on the input once a value is chosen.
   const visible = (el, minW = 4) => {
     if (!el || !el.isConnected) return false;
-    if (el.closest('[hidden], [aria-hidden="true"]')) return false;
+    if (el.closest('[hidden], [inert]')) return false;
     const s = getComputedStyle(el);
     if (s.display === 'none' || s.visibility === 'hidden' || (s.opacity === '0' && minW > 1)) return false;
     const r = el.getBoundingClientRect();
@@ -277,8 +277,9 @@ _EXTRACT_JS = r"""
       push(box, 'radio', opts, true, {current_value: cur, name: hidden ? hidden.name : ''});
       continue;
     }
-    const isCombo = el.getAttribute('role') === 'combobox';
-    if (!visible(el, isCombo ? 1 : 4) || el.getAttribute('aria-hidden') === 'true') continue;
+    const isCombo = el.getAttribute('role') === 'combobox'
+      || /^(?:list|both|inline)$/i.test(el.getAttribute('aria-autocomplete') || '');
+    if (!visible(el, isCombo ? 1 : 4)) continue;
     if (isCombo) {
       if (tag === 'SELECT') { /* fall through to select */ }
       else {
@@ -312,7 +313,7 @@ _EXTRACT_JS = r"""
 _COMBO_NODES_JS = r"""
 (el) => {
   const visible = e => {
-    if (!e || e.closest('[hidden], [aria-hidden="true"]')) return false;
+    if (!e || e.closest('[hidden], [inert]')) return false;
     const s = getComputedStyle(e), r = e.getBoundingClientRect();
     return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
   };
@@ -567,13 +568,58 @@ def extract_fields(scope, root: str | None = None, *, probe_options: bool = True
 
 
 def _open_combo(loc, timeout: int = 2500) -> None:
-    """Open a combobox's menu. React-Select's placeholder covers its tiny input and intercepts clicks,
-    so fall back to focus + ArrowDown, which every ARIA combobox treats as "open"."""
+    """Open a combobox through its input, keyboard, or a visible dropdown indicator."""
     try:
         loc.click(timeout=timeout)
+        return
     except Exception:
+        pass
+    try:
         loc.focus(timeout=timeout)
         loc.press("ArrowDown", timeout=timeout)
+        if loc.get_attribute("aria-expanded") == "true" or loc.evaluate(_COMBO_OPTIONS_JS):
+            return
+    except Exception:
+        pass
+    handle = None
+    try:
+        handle = loc.evaluate_handle(r"""el => {
+          const visible = e => {
+            if (!e || e.closest('[hidden],[inert]')) return false;
+            const s=getComputedStyle(e), r=e.getBoundingClientRect();
+            return s.display!=='none' && s.visibility==='visible' && r.width>2 && r.height>2
+              && e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true});
+          };
+          for (let root=el.parentElement, depth=0; root && root!==document.body && depth<6;
+               root=root.parentElement, depth++) {
+            const other=[...root.querySelectorAll('input,select,textarea,[role=combobox]')]
+              .some(c=>c!==el && visible(c));
+            if (other) break;
+            const peers=[...root.querySelectorAll('button,[role=button],[tabindex],[aria-label],[title],[onclick],'
+              +'[class*="dropdown" i],[class*="indicator" i],[class*="chevron" i],[class*="caret" i],[class*="arrow" i]')]
+              .filter(e=>e!==el && visible(e) && !/separator/i.test(String(e.className||'')));
+            const ranked=peers.map(e=>{
+              const s=(e.getAttribute('aria-label')||'')+' '+(e.getAttribute('title')||'')+' '+String(e.className||'');
+              const r=e.getBoundingClientRect(), q=el.getBoundingClientRect();
+              const semantic=/dropdown|indicator|chevron|caret|arrow|expand|open/i.test(s) ? 0 : 1;
+              return {e,score:semantic*1000+Math.abs(r.left-q.left)+Math.abs(r.top-q.top)};
+            }).sort((a,b)=>a.score-b.score);
+            if (ranked.length && (ranked.length===1 || ranked[1].score-ranked[0].score>40))
+              return ranked[0].e;
+          }
+          return null;
+        }""")
+        indicator = handle.as_element()
+        if indicator is not None:
+            try:
+                indicator.click(timeout=timeout)
+            except Exception:
+                indicator.evaluate("el => el.click()")
+    except Exception:
+        pass
+    finally:
+        if handle is not None:
+            handle.dispose()
 
 
 def _probe_combo(scope, key: str) -> list[str]:
@@ -791,7 +837,12 @@ def _type_into(loc, text: str, kind: str) -> None:
     if kind == "date":
         loc.fill(text, timeout=5000)
         return
-    loc.click(timeout=5000)
+    try:
+        loc.click(timeout=5000)
+    except Exception:
+        # Some widgets render a value layer over their input. Focusing and filling the
+        # underlying control still emits the browser input/change events for that widget.
+        loc.focus(timeout=3000)
     loc.fill("", timeout=5000)
     if len(text) > 200:
         loc.fill(text[:-1], timeout=5000)

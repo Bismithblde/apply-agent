@@ -55,15 +55,15 @@ Every attempt should make it possible to determine which layer handled the page,
 
 ### Phase 4 — End-to-end submission and evaluation
 
-**Status:** Complete for the local single-submit flow
+**Status:** Complete for local single-step and multi-step Generic fixtures
 **Scope:** Test the complete local application flow from job route through form completion, submit-intent persistence, a local fixture receiving the final POST, and confirmation detection. Build a small sanitized regression set from known failures.
 **Acceptance:** At least one end-to-end local fixture records a real form POST and returns `SUBMITTED`; uncertain outcomes are held for review; no live posting or applicant data is needed for tests. Compare coverage, verified-field accuracy, escalation rate, submission success, and model/tool cost before enabling additional cases.
 
-**Delivered:** A Playwright fixture forces DOM filling to fail, fills the approved answer through screenshot-based computer use, posts to the local server, and confirms `SUBMITTED`. Generic and Workday review paths require evidence for every known application answer and trace verification counts. No live application was submitted.
+**Delivered:** A Playwright fixture forces DOM filling to fail, fills the approved answer through screenshot-based computer use, posts to the local server, and confirms `SUBMITTED`. Generic and Workday review paths require evidence for every known application answer and trace verification counts. Generic treats `Next`/`Continue` as navigation when they lead to another flow step, including on the last numbered step or review page. A control with a clearly terminal destination or explicit application-final label gets a persisted, one-click intent; either way, only a fresh application confirmation marks it `SUBMITTED`. An unchanged or uncertain action stops for review without retry. Local fixtures cover wizard POSTs, terminal destinations, OTP forms, server-backed consent POSTs, confirmation detection, and missing confirmations. No live application was submitted.
 
-**Known limitation:** Generic currently treats a POST-backed `Next`/`Continue` as an uncertain submit and stops before a later POST in the same wizard. This preserves the existing no-retry-after-submit-intent rule; Workday has a dedicated multi-step flow. Supporting safe multi-step POST navigation in Generic needs a distinct persisted step-intent lifecycle and remains follow-up work.
+**Remaining limitation:** A process crash after an intermediate navigation POST has no separate persisted step-intent record. The normal run can continue safely, but a later run restarted from the job URL could repeat that step. Adding durable per-step recovery is follow-up work; final application actions already have a persisted submit intent.
 
-**Verification evidence:** The post-fix focused run passed 191 tests. A full-suite run passed 760 tests and had three failures because assertions expected the earlier mismatch wording; after preserving that wording, all affected Generic, vision, form, and Workday tests passed in the focused rerun. The full suite was not rerun after this wording-only compatibility fix.
+**Verification evidence:** `./.venv/bin/python -m pytest -q tests/test_generic.py tests/test_runner.py` passed: 212 tests. `git diff --check` and Python bytecode compilation passed. Tests use local Playwright fixtures; no live application was submitted.
 
 ## Operating workflow
 

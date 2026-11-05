@@ -147,6 +147,34 @@ def test_combobox_covered_by_placeholder_still_opens(page):
     assert tz.options == ["Eastern", "Pacific"]
 
 
+def test_aria_autocomplete_list_is_filled_as_a_combobox(page):
+    page.set_content('''<label for="country">Country</label>
+      <div style="position:relative;width:220px;height:32px">
+        <input id="country" aria-autocomplete="list" aria-expanded="false" style="width:4px;height:28px">
+        <div id="country-value" class="single-value" style="position:absolute;inset:0;z-index:2">United States</div>
+        <div class="dropdown-icon" style="position:absolute;right:0;top:0;width:24px;height:32px;z-index:3"
+          onclick="document.getElementById('options').hidden=false;document.getElementById('country').setAttribute('aria-expanded','true')">⌄</div>
+        <div id="options" hidden>
+          <div class="select__option" onclick="document.getElementById('country-value').textContent=this.textContent;document.getElementById('options').hidden=true;document.getElementById('country').setAttribute('aria-expanded','false')">Canada</div>
+        </div>
+      </div>''')
+    field = _by_label(form.extract_fields(page, probe_options=False))["Country"]
+    assert field.kind == "combobox"
+    assert form._fill_one(page, field, "Canada")
+    assert page.locator("#country-value").inner_text() == "Canada"
+
+
+def test_text_input_can_be_filled_when_its_visible_value_layer_covers_the_input(page):
+    page.set_content('''<label for="name">Name</label>
+      <div style="position:relative;width:220px;height:36px">
+        <input id="name" style="width:220px;height:36px">
+        <span style="position:absolute;inset:0;z-index:2">Current value</span>
+      </div>''')
+    field = _by_label(form.extract_fields(page, probe_options=False))["Name"]
+    assert form._fill_one(page, field, "Ada Lovelace")
+    assert page.locator("#name").input_value() == "Ada Lovelace"
+
+
 def test_extract_keys_stable_across_passes(page):
     _load(page, "form_basic.html")
     first = {f.label: f.key for f in form.extract_fields(page)}

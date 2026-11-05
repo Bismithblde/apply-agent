@@ -104,7 +104,24 @@ PAGES = {
           <label for="em">Email</label><input id="em" type="email" name="email" required>
           <button type="submit">Submit application</button>
         </form>""",
+    "/application_consent": """<h1>Application</h1>
+        <form method="post" action="/thanks">
+          <label for="fn">First name</label><input id="fn" name="first_name" required>
+          <label for="em">Email</label><input id="em" type="email" name="email" required>
+          <button type="submit">Submit application</button>
+        </form>
+        <div role="dialog" aria-modal="true" style="position:fixed;inset:0;background:white">
+          <form method="post" action="/consent_saved">
+            <h2>Privacy consent</h2><p>Choose how profile data is used before continuing.</p>
+            <button type="submit">Submit</button>
+          </form>
+        </div>""",
+    "/consent_saved": """<h1>Application</h1><form method="post" action="/thanks">
+        <label for="fn">First name</label><input id="fn" name="first_name" required>
+        <label for="em">Email</label><input id="em" type="email" name="email" required>
+        <button type="submit">Submit application</button></form>""",
     "/thanks": "<h1>Thank you for applying!</h1><p>We will be in touch.</p>",
+    "/blank_thanks": "<h1>We will be in touch.</h1><p>Your information was received.</p>",
     "/apply_btn": """<h1>Application</h1>
         <form method="post" action="/thanks">
           <label for="fn">First name</label><input id="fn" name="first_name" required>
@@ -204,6 +221,13 @@ PAGES = {
         <form method="get" action="/apply">
           <label for="c">Verification code</label><input id="c" name="code">
           <button type="submit">Verify</button>
+        </form>""",
+    "/application_otp_final": """<h1>Application verification</h1>
+        <form method="post" action="/thanks">
+          <label for="fn">First name</label><input id="fn" name="first_name" required>
+          <label for="em">Email</label><input id="em" type="email" name="email" required>
+          <label for="code">Verification code</label><input id="code" name="code">
+          <button type="submit">Submit application</button>
         </form>""",
     "/verify_boxes": """<h1>Enter 6-digit email verification code</h1>
         <form method="get" action="/otp_done">
@@ -829,7 +853,7 @@ def test_late_popup_discards_stale_apply_action(site, monkeypatch):
     assert site.page.evaluate("window.applyClicks") is None
     assert run_state.page.url == HOST + "/late_popup"
     assert not posted_thanks(site)
-    assert not run_state.submitted
+    assert not run_state.submit_attempted
 
 
 def test_fieldless_embedded_application_link_is_clickable(site, monkeypatch):
@@ -1100,7 +1124,7 @@ def test_partial_otp_is_not_consumed_and_retry_rechecks_mail(site, monkeypatch, 
         if retry == "resend":
             assert not db.mail_is_seen(msg.id)
         assert deferred_mail.queries[-1].startswith(f"after:{int(run_state.otp_requested_ts)}")
-    assert not run_state.submitted
+    assert not run_state.submit_attempted
     assert not posted_thanks(site)
 
 
@@ -1148,7 +1172,7 @@ def test_verification_mail_cutoff_tracks_request_and_resend(site, monkeypatch, f
     assert fakes.mail.calls[-1]["after_ts"] == now + 40
     assert any(method == "POST" and path == "/request_new_code" for method, path, _ in site.hits)
     assert not posted_thanks(site)
-    assert not run_state.submitted
+    assert not run_state.submit_attempted
 
 
 def test_verification_without_observed_request_does_not_use_older_account_time(site, monkeypatch, fakes):
@@ -1161,7 +1185,7 @@ def test_verification_without_observed_request_does_not_use_older_account_time(s
     run_state = generic.Run(job, ctx, site.page, now + 30, started_ts=now, account_ts=now - 900)
     generic.ADAPTER._verify(run_state, generic._collect(run_state), "code")
     assert fakes.mail.calls[-1]["after_ts"] == now
-    assert not run_state.submitted
+    assert not run_state.submit_attempted
 
 
 def test_verification_missing_code_input_never_reads_mail_or_touches_name(site, monkeypatch, fakes):
@@ -1328,6 +1352,25 @@ def test_sms_declined_without_preferring_opt_in(site, monkeypatch, preference, h
     assert not posted_thanks(site)
 
 
+def test_explicit_application_submit_confirms_when_page_context_is_sparse(site, monkeypatch):
+    from agent import form as real_form
+
+    monkeypatch.setattr(generic, "form", real_form)
+
+    def check_intent_before_post(route):
+        with db.connect() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM submit_intents").fetchone()[0] == 1
+        route.fallback()
+
+    site.ctx.route(HOST + "/thanks", check_intent_before_post)
+    result, _ = run(site, monkeypatch, [act("fill_form"), click("Submit application", action="submit")],
+                    path="/clearcompany_sms")
+    assert result.status == ApplyStatus.SUBMITTED, result.reason
+    assert posted_thanks(site)
+    with db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM submit_intents").fetchone()[0] == 1
+
+
 def test_messaging_defaults_and_direct_yes_click_both_decline(site, monkeypatch):
     from agent import form as real_form
 
@@ -1337,6 +1380,9 @@ def test_messaging_defaults_and_direct_yes_click_both_decline(site, monkeypatch)
         <fieldset><legend>Would you like to receive company news via email?</legend>
           <label><input type="radio" name="emailOptIn" value="yes" checked>Yes</label>
           <label><input type="radio" name="emailOptIn" value="no">No</label></fieldset>
+        <fieldset><legend>We may use SMS during the hiring process. Do you give us permission to text you?</legend>
+          <label><input type="radio" name="smsPermission" value="yes" checked>Yes</label>
+          <label><input type="radio" name="smsPermission" value="no">No</label></fieldset>
         <label><input id="sms" type="checkbox" checked>I consent to receive SMS messages</label>
         <label><input id="whatsapp" type="checkbox" checked>I want to receive messages via WhatsApp</label>
         <fieldset><legend>May we use your information for additional job opportunities and communicate with you?
@@ -1348,9 +1394,61 @@ def test_messaging_defaults_and_direct_yes_click_both_decline(site, monkeypatch)
                     path="/messages", dry_run=True)
     assert result.status == ApplyStatus.DRY_RUN_OK, result.reason
     assert site.page.locator('input[name="emailOptIn"][value="no"]').is_checked()
+    assert site.page.locator('input[name="smsPermission"][value="no"]').is_checked()
     assert site.page.locator('input[name="futureOpportunitiesConsent"][value="no"]').is_checked()
     assert not site.page.locator("#sms").is_checked()
     assert not site.page.locator("#whatsapp").is_checked()
+    assert not posted_thanks(site)
+
+
+def test_profile_reuse_consent_defaults_to_current_role_only():
+    field = Field("reuse", "Use my profile data for ANY ROLES GLOBALLY", "radio", False, options=[
+        "Use my profile data for ANY ROLES GLOBALLY, including roles I have not applied to",
+        "Use my profile data for ONLY THE ROLE I AM APPLYING FOR",
+    ])
+    result = generic._guard_choices([field], [Answer("reuse", None, "unknown")], {})
+    assert result[0].value == "Use my profile data for ONLY THE ROLE I AM APPLYING FOR"
+    assert result[0].source == "profile"
+    assert result[0].note == "data use scoped to this application"
+
+
+def test_fatal_server_error_stops_without_calling_vision(site, monkeypatch):
+    monkeypatch.setitem(PAGES, "/server_error", """<main><h1>Page Error</h1>
+        <p>Error: An unexpected server error occurred. Please try again later.</p></main>""")
+    result, fake = run(site, monkeypatch, [], path="/server_error", dry_run=True)
+    assert result.status == ApplyStatus.NEEDS_REVIEW
+    assert "server error" in result.reason
+    assert fake.prompts == []
+
+
+def test_visible_aria_hidden_dialog_is_actionable_and_hides_blocked_fields(site, monkeypatch, tmp_path):
+    from agent import form as real_form
+
+    monkeypatch.setattr(generic, "form", real_form)
+    monkeypatch.setitem(PAGES, "/visible_dialog", '''
+      <div id="screen" style="position:fixed;inset:0;background:rgba(0,0,0,.3);z-index:100"></div>
+      <div role="dialog" aria-hidden="true" style="position:fixed;inset:10px;z-index:101;background:white">
+        <h2>Resume</h2>
+        <input id="resume-file" type="file" style="display:none"
+          onchange="document.querySelector('[role=dialog]').style.display='none';document.getElementById('screen').style.display='none'">
+        <button onclick="document.getElementById('resume-file').click()">Upload Resume</button>
+      </div>
+      <form method="post" action="/thanks">
+        <label for="fn">First name</label><input id="fn" name="first_name" required>
+        <label for="em">Email</label><input id="em" name="email" type="email" required>
+        <button type="submit">Submit application</button>
+      </form>''')
+    resume = tmp_path / "configured-resume.pdf"
+    resume.write_bytes(b"resume fixture")
+    result, fake = run(site, monkeypatch,
+                       [click("Upload Resume"), act("fill_form"), click("Submit application", action="submit")],
+                       path="/visible_dialog", dry_run=True,
+                       profile_override={"resume_path": str(resume)})
+    assert result.status == ApplyStatus.DRY_RUN_OK, result.reason
+    assert site.page.locator("#resume-file").evaluate("e => e.files[0].name") == resume.name
+    assert not site.page.get_by_role("dialog").is_visible()
+    assert "Upload Resume" in fake.prompts[0]
+    assert not re.search(r"\[\d+\] <button> Submit application", fake.prompts[0])
     assert not posted_thanks(site)
 
 
@@ -1550,6 +1648,7 @@ def test_choice_list_changes_do_not_trigger_false_loop(site, monkeypatch):
     ("/final_continue", "Continue", "submit", True, "full"),
     ("/final_continue", "Continue", "click", False, "fill_only"),
     ("/final_next_aria", "Next", "click", True, "full"),
+    ("/final_next_aria", "Next", "click", False, "full"),
     ("/final_next_conflict", "Next", "click", True, "full"),
     ("/misleading_step", "Next", "click", True, "full"),
     ("/misleading_step", "Next", "submit", False, "fill_only"),
@@ -1557,7 +1656,7 @@ def test_choice_list_changes_do_not_trigger_false_loop(site, monkeypatch):
     ("/final_next", "Next", "submit", False, "full"),
     ("/final_continue", "Continue", "click", False, "full"),
 ])
-def test_ambiguous_advance_uses_final_submit_gate(site, monkeypatch, path, label, action, dry_run, mode):
+def test_terminal_advance_requires_confirmation_and_persists_intent(site, monkeypatch, path, label, action, dry_run, mode):
     if not dry_run and mode == "full":
         def check_intent_before_post(route):
             with db.connect() as conn:
@@ -1573,7 +1672,8 @@ def test_ambiguous_advance_uses_final_submit_gate(site, monkeypatch, path, label
         assert res.status == (ApplyStatus.DRY_RUN_OK if dry_run else ApplyStatus.NEEDS_REVIEW), res.reason
         assert not posted_thanks(site)
     with db.connect() as conn:
-        assert conn.execute("SELECT COUNT(*) FROM submit_intents").fetchone()[0] == int(not dry_run and mode == "full")
+        expected_intent = int(not dry_run and mode == "full")
+        assert conn.execute("SELECT COUNT(*) FROM submit_intents").fetchone()[0] == expected_intent
 
 
 @pytest.mark.parametrize("path,label,action", [
@@ -1597,23 +1697,138 @@ def test_wizard_does_not_advance_with_missing_required_answer(site, monkeypatch)
     assert not any(path == "/wizard2" for _, path, _ in site.hits)
 
 
-def test_wizard_full_mode_records_intent_and_refuses_second_submit(site, monkeypatch):
+def test_wizard_navigation_does_not_consume_final_submit_intent(site, monkeypatch):
+    def check_step_intent(route):
+        with db.connect() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM submit_intents").fetchone()[0] == 0
+        route.fallback()
+
+    def check_final_intent(route):
+        with db.connect() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM submit_intents").fetchone()[0] == 1
+        route.fallback()
+
+    site.ctx.route(HOST + "/wizard2", check_step_intent)
+    site.ctx.route(HOST + "/thanks", check_final_intent)
     script = [act("fill_form"), click("Next", action="submit"), act("fill_form"), click("Submit application", action="submit")]
     res, _ = run(site, monkeypatch, script, path="/wizard1")
-    assert res.status == ApplyStatus.NEEDS_REVIEW, res.reason
-    assert "submit already clicked" in res.reason
+    assert res.status == ApplyStatus.SUBMITTED, res.reason
     assert any(m == "POST" and p == "/wizard2" for m, p, _ in site.hits)
-    assert not posted_thanks(site)
+    assert posted_thanks(site)
     with db.connect() as conn:
         assert conn.execute("SELECT COUNT(*) FROM submit_intents").fetchone()[0] == 1
 
 
-def test_review_page_continue_is_treated_as_submit(site, monkeypatch):
+def test_consent_submit_advances_without_consuming_application_submit(site, monkeypatch):
+    def check_no_submit_intent(route):
+        with db.connect() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM submit_intents").fetchone()[0] == 0
+        route.fallback()
+
+    def check_final_intent(route):
+        with db.connect() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM submit_intents").fetchone()[0] == 1
+        route.fallback()
+
+    site.ctx.route(HOST + "/consent_saved", check_no_submit_intent)
+    site.ctx.route(HOST + "/thanks", check_final_intent)
+    script = [click("Submit", action="submit"), act("fill_form"), click("Submit application", action="submit")]
+    result, _ = run(site, monkeypatch, script, path="/application_consent")
+    assert result.status == ApplyStatus.SUBMITTED, result.reason
+    assert any(method == "POST" and path == "/consent_saved" for method, path, _ in site.hits)
+    assert posted_thanks(site)
+    with db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM submit_intents").fetchone()[0] == 1
+
+
+def test_final_submit_without_confirmation_is_uncertain_and_never_retried(site, monkeypatch):
+    def check_intent_before_post(route):
+        with db.connect() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM submit_intents").fetchone()[0] == 1
+        route.fallback()
+
+    site.ctx.route(HOST + "/blank_thanks", check_intent_before_post)
+    monkeypatch.setitem(PAGES, "/no_confirmation", """<h1>Application</h1>
+        <form method="post" action="/blank_thanks">
+          <label for="fn">First name</label><input id="fn" name="first_name" required>
+          <label for="em">Email</label><input id="em" type="email" name="email" required>
+          <button type="submit">Submit application</button></form>""")
+    result, fake = run(site, monkeypatch,
+                       [act("fill_form"), click("Submit application", action="submit"), act("done")],
+                       path="/no_confirmation")
+    assert result.status == ApplyStatus.NEEDS_REVIEW, result.reason
+    assert "no confirmation" in result.reason or "not observed" in result.reason
+    assert sum(method == "POST" and path == "/blank_thanks" for method, path, _ in site.hits) == 1
+    assert len(fake.prompts) == 2
+    with db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM submit_intents").fetchone()[0] == 1
+
+
+def test_terminal_continue_without_confirmation_is_uncertain_and_never_retried(site, monkeypatch):
+    monkeypatch.setitem(PAGES, "/thanks", "<h1>Information received.</h1>")
+    monkeypatch.setitem(PAGES, "/terminal_continue", """<h1>Application</h1>
+        <form method="post" action="/thanks">
+          <label for="fn">First name</label><input id="fn" name="first_name" required>
+          <label for="em">Email</label><input id="em" type="email" name="email" required>
+          <button type="submit">Continue</button></form>""")
+
+    def check_intent_before_post(route):
+        with db.connect() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM submit_intents").fetchone()[0] == 1
+        route.fallback()
+
+    site.ctx.route(HOST + "/thanks", check_intent_before_post)
+    result, _ = run(site, monkeypatch,
+                    [act("fill_form"), click("Continue", action="submit"), act("done")],
+                    path="/terminal_continue")
+    assert result.status == ApplyStatus.NEEDS_REVIEW, result.reason
+    assert "no confirmation" in result.reason or "not observed" in result.reason
+    assert sum(method == "POST" and path == "/thanks" for method, path, _ in site.hits) == 1
+    with db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM submit_intents").fetchone()[0] == 1
+
+
+def test_final_click_exception_after_dispatch_does_not_retry(site, monkeypatch):
+    click_attempts = []
+
+    def dispatch_then_report_uncertain(run_state, target, *, allow_dom_fallback=True):
+        click_attempts.append(allow_dom_fallback)
+        target.frame.locator(f'[data-aa-click="{target.index}"]').first.evaluate("el => el.click()")
+        return False
+
+    monkeypatch.setattr(generic, "_click", dispatch_then_report_uncertain)
+    result, _ = run(site, monkeypatch, [act("fill_form"), click("Submit application", action="submit")],
+                    path="/apply")
+    assert click_attempts == [False]
+    assert result.status == ApplyStatus.SUBMITTED, result.reason
+    assert sum(method == "POST" and path == "/thanks" for method, path, _ in site.hits) == 1
+    with db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM submit_intents").fetchone()[0] == 1
+
+
+def test_review_page_continue_is_navigation_until_confirmation(site, monkeypatch):
     script = [act("fill_form"), click("Review application"), click("Continue")]
     res, _ = run(site, monkeypatch, script, path="/apply_to_review")
     assert res.status == ApplyStatus.SUBMITTED, res.reason
     assert any(m == "GET" and p == "/review_continue" for m, p, _ in site.hits)
     assert posted_thanks(site)
+    with db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM submit_intents").fetchone()[0] == 1
+
+
+def test_explicit_application_submit_inside_verification_form_persists_intent(site, monkeypatch):
+    def check_intent_before_post(route):
+        with db.connect() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM submit_intents").fetchone()[0] == 1
+        route.fallback()
+
+    site.ctx.route(HOST + "/thanks", check_intent_before_post)
+    result, _ = run(site, monkeypatch, [act("fill_form"), click("Submit application", action="submit")],
+                    path="/application_otp_final")
+    assert result.status == ApplyStatus.SUBMITTED, result.reason
+    assert posted_thanks(site)
+    with db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM submit_intents").fetchone()[0] == 1
 
 
 def test_review_submit_requires_each_known_application_answer_verified(site, monkeypatch):

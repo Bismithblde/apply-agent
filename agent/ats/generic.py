@@ -41,7 +41,7 @@ ACTION_SCHEMA = {
 }
 
 SUCCESS_RE = re.compile(
-    r"thank you for (applying|your application|your interest in)|thanks for applying|application (has been |was )?"
+    r"thank you for (applying|your application)|thanks for applying|application (has been |was )?"
     r"(received|submitted)|(successfully|been) submitted|submitted successfully|we('ve| have) received your application",
     re.I)
 SUBMIT_TEXT_RE = re.compile(r"\bsubmit\b|send application|finish application|complete application", re.I)
@@ -58,7 +58,6 @@ REVIEW_PATH_RE = re.compile(r"/(?:review|review[-_]application|application[-_]re
 REVIEW_TEXT_RE = re.compile(r"\b(?:review (?:your |my |the )?application|application review|review (?:and|&) submit)\b", re.I)
 REVIEW_BACK_RE = re.compile(r"^\s*(?:back|previous|edit)\b", re.I)
 REVIEW_ACTION_RE = re.compile(r"\b(?:next|continue|submit|apply|confirm|save|finish|complete|done|send)\b", re.I)
-REVIEW_SUBMIT_HREF_RE = re.compile(r"(?:^|[/_?&=.#-])(?:submit|apply|send|finish|complete|confirm)(?:$|[/_?&=.#-])", re.I)
 APP_FIELD_RE = re.compile(r"\bname\b|e-?mail|phone|resume|\bcv\b|linkedin", re.I)
 FORBIDDEN_TEXT_RE = re.compile(r"\b(pay|payment|purchase|checkout|buy now|subscribe)\b", re.I)
 RESUME_LABEL_RE = re.compile(r"resume|résumé|\bcv\b|curriculum", re.I)
@@ -70,8 +69,32 @@ _EMPLOYMENT_HISTORY_RE = re.compile(r"ever (?:been )?(?:employed|worked)|previou
 _DECLINE_RE = re.compile(r"no(?:\b.*)?|false|decline(?:\b.*)?|opt out|unsubscribe"
                           r"|i (?:do not|don't) (?:agree|consent|wish|want)(?:\b.*)?", re.I)
 _MESSAGING_CHANNEL_RE = re.compile(r"\bsms\b|text messages?|whats\s*app|e-?mail|news|talent communit", re.I)
-_MESSAGING_INTENT_RE = re.compile(r"send|receiv|contact|opt.?in|subscrib|communicat|updates|consent", re.I)
-_FUTURE_PERMISSION_RE = re.compile(r"future.?opportunit|future.?consideration|other positions|additional job", re.I)
+_MESSAGING_INTENT_RE = re.compile(
+    r"send|receiv|contact|opt.?in|subscrib|communicat|updates|consent|permission", re.I)
+_FUTURE_PERMISSION_RE = re.compile(
+    r"future.?opportunit|future.?consideration|other positions|additional job|other roles|any roles|globally",
+    re.I)
+_CURRENT_ROLE_ONLY_RE = re.compile(
+    r"\bonly\b.{0,60}\b(?:role|position)\b.{0,60}\b(?:applying for|this role|this position)\b", re.I)
+_SERVER_ERROR_RE = re.compile(
+    r"an unexpected server error occurred|internal server error|500 internal server error", re.I)
+_ACCOUNT_FLOW_RE = re.compile(
+    r"create (?:an? )?account|candidate account|sign.?up|register|sign.?in|log.?in|account setup", re.I)
+_VERIFICATION_FLOW_RE = re.compile(
+    r"verification|verify your|confirm your identity|one.?time code|security code|passcode|\botp\b", re.I)
+_CONSENT_FLOW_RE = re.compile(
+    r"privacy|consent|cookie|terms (?:and|&) conditions|profile data|communication preferences|"
+    r"future opportunities|marketing preferences", re.I)
+_APPLICATION_FINAL_LABEL_RE = re.compile(
+    r"\bsubmit\s+(?:(?:my|this|the|your)\s+)?application\b|"
+    r"\b(?:send|finish|complete)\s+(?:(?:my|this|the|your)\s+)?application\b", re.I)
+_GENERIC_FINAL_ACTION_RE = re.compile(r"^\s*(?:apply(?:\s+now)?|send|finish|complete|confirm|done)\s*$", re.I)
+_TERMINAL_PATH_RE = re.compile(
+    r"(?:^|/)(?:thank[-_]?you|thanks|confirmation|application[-_](?:received|submitted|complete|confirmation)|"
+    r"submission[-_](?:complete|received)|success|complete|submit)(?:/|$)", re.I)
+_APPLICANT_FIELD_RE = re.compile(
+    r"first.?name|last.?name|full.?name|e-?mail|phone|resume|curriculum|linkedin|"
+    r"street|address|city|state|province|postal|zip|country|work authorization", re.I)
 _NON_APP_FIELD_RE = re.compile(
     r"\b(?:search|keyword|location|radius|find jobs?|filter|job title)\b"
     r"|match with this job|how well you match|resume match|match.*resume|match.*job|match score"
@@ -127,7 +150,6 @@ rect => {
 }
 """
 
-SUBMIT_TEXTS = ["Submit application", "Submit Application", "Submit", "Send application", "Finish", "Complete"]
 def _verification_filters(url: str, company: str, email: str | None) -> tuple[str | None, str | None]:
     hostname = (urlparse(url).hostname or "").lower()
     host = hostname.split(".")
@@ -192,12 +214,34 @@ _CLICKABLES_JS = r"""
     if (el.closest('form,[role=dialog]') || el.matches('[role=option],[role=combobox]')) return 1;
     return el.matches('a[href]') ? 3 : 2;
   };
+  const blockedByOverlay = (el, r) => {
+    const fixedAncestor = node => {
+      for (let n=node; n && n!==document.body; n=n.parentElement) {
+        const position=getComputedStyle(n).position;
+        if (position==='fixed' || position==='sticky') return n;
+      }
+      return null;
+    };
+    const center=document.elementFromPoint(innerWidth/2,innerHeight/2);
+    const centerLayer=center && fixedAncestor(center);
+    if (centerLayer && !centerLayer.contains(el)) return true;
+    const points = [0.2, 0.5, 0.8].flatMap(x => [0.2, 0.5, 0.8].map(y =>
+      [r.left + r.width * x, r.top + r.height * y]))
+      .filter(([x, y]) => x >= 0 && y >= 0 && x < innerWidth && y < innerHeight);
+    return points.length > 0 && points.every(([x, y]) => {
+      const hit = document.elementFromPoint(x, y);
+      if (!hit || el === hit || el.contains(hit) || hit.contains(el)) return false;
+      const layer=fixedAncestor(hit);
+      return !!layer && !layer.contains(el);
+    });
+  };
   for (const el of [...document.querySelectorAll(sel)].sort((a, b) => priority(a) - priority(b))) {
     if (out.length >= %d) break;
     const r = el.getBoundingClientRect();
     const st = window.getComputedStyle(el);
     if (r.width < 2 || r.height < 2 || st.visibility === 'hidden' || st.display === 'none' || st.opacity === '0') continue;
-    if (el.closest('[hidden],[inert],[aria-hidden=true]') || !el.checkVisibility({checkOpacity: true, checkVisibilityCSS: true})) continue;
+    if (el.closest('[hidden],[inert]') || !el.checkVisibility({checkOpacity: true, checkVisibilityCSS: true})
+        || blockedByOverlay(el, r)) continue;
     if (el.disabled || el.getAttribute('aria-disabled') === 'true') continue;
     const text = (el.innerText || el.value || el.getAttribute('title') || el.getAttribute('alt') || '').replace(/\s+/g, ' ').trim();
     const aria = (el.getAttribute('aria-label') || '').trim();
@@ -286,8 +330,11 @@ class Run:
     page: Page
     deadline: float
     job_text: str = ""
-    submitted: bool = False
+    submit_attempted: bool = False
     confirmation_baseline: Counter[str] = field(default_factory=Counter)
+    confirmation_baseline_ready: bool = False
+    application_flow_started: bool = False
+    application_action_count: int = 0
     history: list[str] = field(default_factory=list)
     filled_fields: dict[str, Field] = field(default_factory=dict)
     filled_answers: dict[str, Answer] = field(default_factory=dict)
@@ -339,6 +386,8 @@ class GenericAdapter:
             run.job_text = form.page_text(page)
         except Exception:
             run.job_text = ""
+        run.confirmation_baseline = _confirmation_counts(_page_text(page))
+        run.confirmation_baseline_ready = True
 
         seen: Counter = Counter()
         bad_replies = 0
@@ -348,8 +397,19 @@ class GenericAdapter:
             if time.time() > run.deadline:
                 return self._out_of_budget(run, f"time budget ({BUDGET_SECONDS}s) exhausted after {step - 1} steps")
             state = _collect(run)
+            if _application_page_context(run, state):
+                run.application_flow_started = True
             if _new_confirmation(run, state.text):
-                return self._success(run, "confirmation text seen")
+                run.ctx.record_layer("submission", "confirmed", "confirmation_detected")
+                return self._success(run, "site confirmation detected after an application action")
+            run.confirmation_baseline = _confirmation_counts(state.text)
+            run.confirmation_baseline_ready = True
+            if run.submit_attempted:
+                return self._result(run, ApplyStatus.NEEDS_REVIEW,
+                                    "final application action was clicked but no confirmation appeared; possible submission")
+            if _SERVER_ERROR_RE.search(state.text):
+                return self._result(run, ApplyStatus.NEEDS_REVIEW,
+                                    "application site returned a server error")
             sig = state.signature()
             seen[sig] += 1
             if sig == last_sig:
@@ -413,7 +473,7 @@ class GenericAdapter:
                                         "account action may submit an application; manual review required")
                 return self._account(run, state, "sign_in" if re.search(r"sign\s*in|log\s*in", target.text or target.aria, re.I)
                                      else "create_account")
-            if target is not None and not run.submitted and _ambiguous_account_target(state, target):
+            if target is not None and not run.submit_attempted and _ambiguous_account_target(state, target):
                 return self._result(run, ApplyStatus.NEEDS_REVIEW,
                                     "account action may submit an application; manual review required")
             if target is not None and _apply_now_label(target) and not _application_page_context(run, state):
@@ -423,18 +483,49 @@ class GenericAdapter:
                 if not _click(run, target):
                     return self._result(run, ApplyStatus.NEEDS_REVIEW,
                                         "verified Apply Now navigation failed")
+                run.application_flow_started = True
+                run.application_action_count += 1
                 return None
-            if action == "submit":
-                return self._submit(run, state, target, reason)
             if target is None:
+                if action == "submit":
+                    return self._result(run, ApplyStatus.NEEDS_REVIEW,
+                                        "submit action had no verified target; manual review required")
                 run.history.append(f"  (no verified clickable with index {click_index}; vision click withheld)")
                 return None
             label = f"{target.text} {target.aria}".strip()
             if FORBIDDEN_TEXT_RE.search(label):
                 run.history.append(f"  (refused to click payment-like element {target.text!r})")
                 return None
+            flow_kind = _target_flow_kind(target, state)
+            if flow_kind == "verification" and not _APPLICATION_FINAL_LABEL_RE.search(label):
+                if _application_page_context(run, state):
+                    return self._submit(run, state, target, reason, final_action=False,
+                                        allow_empty_progress=True)
+                return self._advance_flow(run, state, target, "verification action")
+            if flow_kind == "account":
+                if target.is_submit or _target_has_password_form(target):
+                    if run.ctx.dry_run:
+                        return self._submit(run, state, target, reason, final_action=False,
+                                            allow_empty_progress=True)
+                    return self._result(run, ApplyStatus.NEEDS_REVIEW,
+                                        "account form action is ambiguous; manual review required")
+                return self._advance_flow(run, state, target, "account navigation")
             if _final_like(run, state, target, label):
                 return self._submit(run, state, target, reason)
+            app_context = _application_page_context(run, state)
+            if _advance_like(target):
+                return self._submit(run, state, target, reason, final_action=False,
+                                    allow_empty_progress=True)
+            if target.is_submit or flow_kind:
+                if app_context or flow_kind:
+                    return self._submit(run, state, target, reason, final_action=False,
+                                        allow_empty_progress=bool(flow_kind))
+                if target.is_submit:
+                    return self._result(run, ApplyStatus.NEEDS_REVIEW,
+                                        "form submit control lacks verified application or onboarding context")
+            elif action == "submit":
+                return self._result(run, ApplyStatus.NEEDS_REVIEW,
+                                    "submit action lacks verified final-submit or flow-step context")
             if _resume_upload_button(run, target):
                 ok, detail = _upload_resume(run, target)
                 if not ok:
@@ -452,7 +543,8 @@ class GenericAdapter:
             if target.role == "option" or re.fullmatch(r"yes|no", (target.text or target.aria).strip(), re.I):
                 return self._result(run, ApplyStatus.NEEDS_REVIEW,
                                     "choice has no verified form field; manual review required")
-            _click(run, target)
+            if _click(run, target):
+                _note_application_action(run)
             return None
         if action in ("create_account", "sign_in"):
             return self._account(run, state, action)
@@ -460,16 +552,32 @@ class GenericAdapter:
             return self._verify(run, state, "code" if action == "need_email_code" else "link")
         if action == "done":
             text = _page_text(run.page)
-            if run.submitted:
-                if _new_confirmation(run, text):
-                    return self._success(run, "confirmation text seen")
+            if _new_confirmation(run, text):
+                return self._success(run, "site confirmation detected after an application action")
+            if run.submit_attempted:
                 return self._result(run, ApplyStatus.NEEDS_REVIEW,
-                                    f"submit clicked but no confirmation text ({reason[:120]})")
+                                    f"final application action was clicked but confirmation was not observed ({reason[:120]})")
             if SUCCESS_RE.search(text):
                 return self._result(run, ApplyStatus.NEEDS_REVIEW,
                                     "page shows a confirmation but this run did not submit (applied before?)")
             return self._result(run, ApplyStatus.NEEDS_REVIEW, f"LLM said done without submitting: {reason[:200]}")
         return self._result(run, ApplyStatus.NEEDS_REVIEW, f"LLM gave up: {reason[:250]}")
+
+    def _advance_flow(self, run: Run, state: State, target: Clickable, label: str) -> ApplyResult | None:
+        """Click a non-final step once; a fresh confirmation is the only success signal."""
+        _note_application_action(run)
+        clicked = _click(run, target, allow_dom_fallback=False)
+        _settle(run.page, idle_ms=5000)
+        next_state = _collect(run)
+        if _new_confirmation(run, next_state.text):
+            run.ctx.record_layer("submission", "confirmed", "confirmation_detected")
+            return self._success(run, "site confirmation detected after an application flow action")
+        if next_state.signature() == state.signature():
+            detail = f"{label} outcome is uncertain" if not clicked else f"{label} did not advance the page"
+            return self._result(run, ApplyStatus.NEEDS_REVIEW,
+                                f"{detail}; automatic retry withheld")
+        run.history.append(f"  (advanced {label}; final submission not inferred from navigation)")
+        return None
 
     def _fill(self, run: Run, state: State, only_keys: set[str] | None = None) -> list[str]:
         """Answer and fill every scope's fields; remember them for the submit decision."""
@@ -538,18 +646,21 @@ class GenericAdapter:
             run.history.append(f"  (failed to fill: {', '.join(failed[:8])})")
         return failed
 
-    def _submit(self, run: Run, state: State, target: Clickable | None, reason: str) -> ApplyResult | None:
-        if run.submitted:
+    def _submit(self, run: Run, state: State, target: Clickable | None, reason: str, *,
+                final_action: bool = True, allow_empty_progress: bool = False) -> ApplyResult | None:
+        if _application_page_context(run, state):
+            run.application_flow_started = True
+        if final_action and run.submit_attempted:
             if _new_confirmation(run, _page_text(run.page)):
                 return self._success(run, "confirmation text seen")
             return self._result(run, ApplyStatus.NEEDS_REVIEW,
-                                "submit already clicked this run; confirmation still missing")
-        if (target is not None and _apply_now_label(target)
+                                "final application action was already clicked; confirmation still missing")
+        if (final_action and target is not None and _apply_now_label(target)
                 and not _application_page_context(run, state)):
             return self._result(run, ApplyStatus.NEEDS_REVIEW,
                                 "Apply Now may submit without verified application fields; manual review required")
         review_page = _application_review(state)
-        if review_page:
+        if final_action and review_page:
             label = f"{target.text} {target.aria}" if target is not None else ""
             if target is None or _review_back_action(target) or not (
                     target.is_submit or SUBMIT_TEXT_RE.search(label) or FINAL_WORD_RE.search(label) or _advance_like(target)):
@@ -628,13 +739,20 @@ class GenericAdapter:
             return self._result(run, ApplyStatus.NEEDS_REVIEW,
                                 "review page reached without validated applicant answers")
         review_ready = _review_submit_ready(state, target)
-        if not fields and not review_ready:
+        if not fields and not review_ready and not (not final_action and allow_empty_progress):
             return self._result(run, ApplyStatus.NEEDS_REVIEW, "no application fields or verified review page")
         ok, why = submit_decision(fields, ans, run.ctx.submit_mode, run.ctx.dry_run)
         if not ok:
             if run.ctx.dry_run and why == "dry run" and review_ready:
                 return self._result(run, ApplyStatus.DRY_RUN_OK, "not submitted: dry run")
+            if not final_action and run.ctx.dry_run and why == "dry run":
+                return self._result(run, ApplyStatus.DRY_RUN_OK, "not advanced: dry run")
             return blocked_result(fields, ans, f"not submitted: {why}", run.ctx.dry_run, None, _safe_url(run.page))
+        if not final_action:
+            if target is None:
+                return self._result(run, ApplyStatus.NEEDS_REVIEW,
+                                    "could not advance the current application flow step")
+            return self._advance_flow(run, state, target, "the current flow step")
         if target is not None and FORBIDDEN_TEXT_RE.search(f"{target.text} {target.aria}"):
             return self._result(run, ApplyStatus.NEEDS_REVIEW, f"final button looks like a payment: {target.text!r}")
         outcome = captcha.solve_if_present(run.page, run.ctx.config, run.job.id)
@@ -644,22 +762,37 @@ class GenericAdapter:
         if target is not None and not target.is_submit and SUBMIT_TEXT_RE.search(f"{target.text} {target.aria}") is None \
                 and not re.search(r"apply|send|finish|complete|confirm|done|continue|next", f"{target.text} {target.aria}", re.I):
             target = None
-        run.confirmation_baseline = _confirmation_counts(_page_text(run.page))
+        if target is None:
+            return self._result(run, ApplyStatus.NEEDS_REVIEW,
+                                "final application action has no verified clickable target")
+        try:
+            target.frame.locator(f'[data-aa-click="{target.index}"]').first.scroll_into_view_if_needed(timeout=5000)
+        except Exception:
+            return self._result(run, ApplyStatus.NEEDS_REVIEW,
+                                "final application action could not be brought into view; nothing was clicked")
+        if not run.confirmation_baseline_ready:
+            run.confirmation_baseline = _confirmation_counts(_page_text(run.page))
+            run.confirmation_baseline_ready = True
+        run.application_flow_started = True
         try:
             run.ctx.mark_submit_attempt(run.job.id)
         except Exception as e:
             return self._result(run, ApplyStatus.NEEDS_REVIEW,
                                 f"could not persist submit intent: {type(e).__name__}: {e}"[:300])
-        clicked = _click(run, target) if target is not None else False
-        if not clicked and not review_page:
-            clicked = any(_click_text(scope, SUBMIT_TEXTS) for scope, _ in state.scopes or [(run.page, [])])
+        run.submit_attempted = True
+        _note_application_action(run)
+        clicked = _click(run, target, allow_dom_fallback=False)
         if not clicked:
-            return self._result(run, ApplyStatus.NEEDS_REVIEW, "could not find the submit button")
-        run.submitted = True
+            _settle(run.page, idle_ms=8000)
+            if _new_confirmation(run, _page_text(run.page)):
+                run.ctx.record_layer("submission", "confirmed", "confirmation_detected")
+                return self._success(run, "site confirmation detected after final application action")
+            return self._result(run, ApplyStatus.NEEDS_REVIEW,
+                                "final application click outcome is uncertain; no retry was attempted")
         _settle(run.page, idle_ms=8000)
         if _new_confirmation(run, _page_text(run.page)):
             run.ctx.record_layer("submission", "confirmed", "confirmation_detected")
-            return self._success(run, "confirmation text seen")
+            return self._success(run, "site confirmation detected after final application action")
         return None
 
     def _account(self, run: Run, state: State, action: str) -> ApplyResult | None:
@@ -711,9 +844,10 @@ class GenericAdapter:
         if action == "create_account" and not _allow_register_and_submit(run):
             return self._result(run, ApplyStatus.NEEDS_REVIEW,
                                 "account form filled; action may submit an application, manual review required")
-        if not _click(run, account_button):
+        if not _click(run, account_button, allow_dom_fallback=False):
             return self._result(run, ApplyStatus.NEEDS_REVIEW,
                                 "account action click failed; manual review required")
+        _note_application_action(run)
         run.history.append(f"  (clicked account action: {account_button.text or account_button.aria})")
         _settle(run.page, idle_ms=3000)
         return None
@@ -770,7 +904,8 @@ class GenericAdapter:
                     and _verification_button_safe(target) and any(
                     _VERIFY_BUTTON_RE.fullmatch(label.strip())
                     for label in (target.text, target.aria) if label.strip())):
-                _click(run, target)
+                if _click(run, target, allow_dom_fallback=False):
+                    _note_application_action(run)
                 run.history.append("  (clicked verification code confirmation)")
                 break
         return None
@@ -779,8 +914,9 @@ class GenericAdapter:
         return self._result(run, ApplyStatus.SUBMITTED, reason)
 
     def _out_of_budget(self, run: Run, reason: str) -> ApplyResult:
-        if run.submitted:
-            return self._result(run, ApplyStatus.NEEDS_REVIEW, f"submit clicked but unconfirmed; {reason}")
+        if run.submit_attempted:
+            return self._result(run, ApplyStatus.NEEDS_REVIEW,
+                                f"final application action was attempted but confirmation was not observed; {reason}")
         return self._result(run, ApplyStatus.NEEDS_REVIEW, reason)
 
     def _result(self, run: Run, status: ApplyStatus, reason: str) -> ApplyResult:
@@ -816,10 +952,16 @@ def _confirmation_counts(text: str) -> Counter[str]:
 
 
 def _new_confirmation(run: Run, text: str) -> bool:
-    return run.submitted and any(
+    return (run.confirmation_baseline_ready and run.application_flow_started
+            and run.application_action_count > 0 and any(
         count > run.confirmation_baseline[phrase]
         for phrase, count in _confirmation_counts(text).items()
-    )
+    ))
+
+
+def _note_application_action(run: Run) -> None:
+    if run.application_flow_started:
+        run.application_action_count += 1
 
 
 def _collect(run: Run) -> State:
@@ -950,7 +1092,7 @@ def _frame_definitely_hidden(frame: Frame) -> bool:
     while current.parent_frame is not None:
         try:
             if not current.frame_element().evaluate("""el =>
-                !el.closest('[hidden],[inert],[aria-hidden=true]') &&
+                !el.closest('[hidden],[inert]') &&
                 el.checkVisibility({checkOpacity: true, checkVisibilityCSS: true})"""):
                 return True
             current = current.parent_frame
@@ -976,10 +1118,30 @@ def _active_fields(scope: Page | Frame, fields: list[Field]) -> list[Field]:
           // File inputs are commonly hidden behind a visible upload control.
           if (f.kind !== 'file' && !proxy && !el.checkVisibility({checkVisibilityCSS: true})) return false;
           for (let node = proxy || (f.kind === 'file' ? el.parentElement : el); node; node = node.parentElement) {
-            if (node.hidden || node.hasAttribute('inert') || node.getAttribute('aria-hidden') === 'true') return false;
+            if (node.hidden || node.hasAttribute('inert')) return false;
             const style = getComputedStyle(node);
             if (style.display === 'none' || style.visibility !== 'visible' || style.contentVisibility === 'hidden') return false;
             if (style.opacity === '0' && (node !== el || f.kind !== 'combobox')) return false;
+          }
+          if (f.kind === 'file' && el.closest('[aria-hidden="true"]')) return false;
+          if (f.kind !== 'file') {
+            const fixedAncestor = node => {
+              for (let a=node; a && a!==document.body; a=a.parentElement) {
+                const p=getComputedStyle(a).position;
+                if (p==='fixed' || p==='sticky') return a;
+              }
+              return null;
+            };
+            const isOutsideLayer = hit => {
+              const layer=fixedAncestor(hit);
+              return !!layer && !layer.contains(el);
+            };
+            const center=document.elementFromPoint(innerWidth/2,innerHeight/2);
+            if (center && isOutsideLayer(center)) return false;
+            const r=el.getBoundingClientRect();
+            const points=[0.2,0.5,0.8].flatMap(x=>[0.2,0.5,0.8].map(y=>[r.left+r.width*x,r.top+r.height*y]))
+              .filter(([x,y])=>x>=0&&y>=0&&x<innerWidth&&y<innerHeight);
+            if (points.length && points.every(([x,y])=>isOutsideLayer(document.elementFromPoint(x,y)))) return false;
           }
           return true;
         }).map(f => f.key)""", [{"key": f.key, "kind": f.kind} for f in fields]))
@@ -1020,8 +1182,10 @@ Rules:
 - Never pay or enter payment details. Never upload anything except the resume (handled automatically).
 - Never invent applicant facts or choose dropdown/radio answers yourself; use fill_form for form controls.
 - Decline SMS, email updates, WhatsApp and future-opportunity messaging. Never opt into messages.
-- Use "submit" (never "click") for the final submit / send application button. Fill the form first.
+- Use "submit" only for a likely final application action. Use "click" for account, consent, and intermediate Next/Continue steps.
+- A click is progress, not proof of submission. Use "done" only after the page shows a new application-received/submitted confirmation.
 - If fields are visible and empty, use fill_form before clicking Next/Continue/Submit.
+- If a visible dialog or overlay covers the form, resolve its visible controls first; underlying fields are inactive until it clears.
 - Close cookie banners or popups only if they block the page.
 - If the same action did not change the page, try something different or give_up.
 
@@ -1042,7 +1206,7 @@ Reply with JSON: {{"action": ..., "click_index": <int, for click/submit>, "reaso
 
 
 def _is_initial_posting(run: Run, state: State) -> bool:
-    if run.application_field_keys or run.filled_fields:
+    if run.application_field_keys:
         return False
     has_posting_markers = bool(re.search(
         r"job description|about (?:the |this )?(?:job|role|position)|responsibilities|qualifications|about (?:us|the company)|what you(?:'ll| will) do|who you are|position summary",
@@ -1066,10 +1230,7 @@ def _has_app_form(run: Run, state: State) -> bool:
 
 def _review_submit_ready(state: State, target: Clickable | None) -> bool:
     """Recognize a completed review step that has no editable fields."""
-    path = urlparse(state.url).path.rstrip("/").lower().rsplit("/", 1)[-1]
-    if path not in ("review", "review-application", "application-review"):
-        return False
-    if not re.search(r"review (your |my |the )?application|application review", state.text, re.I):
+    if not _application_review(state):
         return False
     if not re.search(r"\b(first name|last name|full name|e-?mail|phone|resume)\s*:", state.text, re.I):
         return False
@@ -1099,15 +1260,6 @@ def _review_back_action(target: Clickable) -> bool:
     label = f"{target.text} {target.aria}".strip()
     return bool(REVIEW_BACK_RE.match(target.text or target.aria)
                 and not REVIEW_ACTION_RE.search(label))
-
-
-def _review_action_button(state: State, target: Clickable) -> bool:
-    if not _application_review(state) or _review_back_action(target):
-        return False
-    if target.tag == "a" and target.href and not target.href.startswith(("#", "javascript")):
-        label = f"{target.text} {target.aria}"
-        return bool(REVIEW_ACTION_RE.search(label) or REVIEW_SUBMIT_HREF_RE.search(target.href))
-    return True
 
 
 def _validated_app_answers(run: Run) -> bool:
@@ -1199,6 +1351,63 @@ def _account_button_label(target: Clickable) -> bool:
     return bool(labels) and all(_ACCOUNT_BUTTON_RE.fullmatch(s) for s in labels)
 
 
+def _target_flow_kind(target: Clickable | None, state: State | None = None) -> str | None:
+    """Identify account, verification, or consent containers around a control without reading values."""
+    if target is None:
+        return None
+    try:
+        info = target.frame.locator(f'[data-aa-click="{target.index}"]').first.evaluate("""el => {
+          const form=el.form || el.closest('form');
+          const dialog=el.closest('[role="dialog"],[aria-modal="true"]');
+          const roots=[...new Set([form,dialog].filter(Boolean))];
+          const controls=[...new Set(roots.flatMap(root => [...root.querySelectorAll('input,select,textarea')]))];
+          const fields=controls.filter(x => {
+            const r=x.getBoundingClientRect(), s=getComputedStyle(x);
+            return x.type !== 'hidden' && r.width>0 && r.height>0 && s.display!=='none' && s.visibility!=='hidden';
+          }).map(x => ({type:(x.type||x.tagName).toLowerCase(), identity:[x.name,x.id,x.placeholder,
+            x.getAttribute('aria-label'),x.getAttribute('autocomplete'),
+            [...(x.labels||[])].map(label => label.innerText).join(' ')].filter(Boolean).join(' ')}));
+          return {text:roots.map(root => root.innerText || '').join(' ').slice(0,1200), fields};
+        }""")
+    except Exception:
+        return None
+    text = str(info.get("text", ""))
+    identities = [f"{field.get('type', '')} {field.get('identity', '')}" for field in info.get("fields", [])]
+    page_context = state.title if state else ""
+    combined = " ".join([text, *identities, page_context])
+    if any(re.search(r"password|passcode", value, re.I) for value in identities) or _ACCOUNT_FLOW_RE.search(combined):
+        return "account"
+    if _VERIFICATION_FLOW_RE.search(combined) and any(
+            re.search(r"code|otp|passcode|verification", value, re.I) for value in identities):
+        return "verification"
+    has_applicant_field = any(_APPLICANT_FIELD_RE.search(value) for value in identities)
+    if _CONSENT_FLOW_RE.search(text) and not has_applicant_field:
+        return "consent"
+    return None
+
+
+def _target_terminal_action(target: Clickable) -> bool:
+    """Recognize a form/link destination that clearly denotes a completed submission."""
+    try:
+        info = target.frame.locator(f'[data-aa-click="{target.index}"]').first.evaluate("""el => {
+          const form=el.form || el.closest('form');
+          const href=el.getAttribute('href');
+          const action=el.getAttribute('formaction') || (form && form.action) || href || '';
+          const method=(el.getAttribute('formmethod') || (form && form.method) ||
+            (href ? 'get' : '')).toLowerCase();
+          const submitControl=el.tagName==='BUTTON' ? el.type==='submit'
+            : el.tagName==='INPUT' && ['submit','image'].includes(el.type);
+          return {action, method, terminalControl:!!el.hasAttribute('formaction') || submitControl ||
+            (el.tagName==='A' && !!href)};
+        }""")
+        if not info or not info.get("action") or not info.get("terminalControl"):
+            return False
+        path = urlparse(urljoin(target.frame.url, info["action"])).path
+        return bool(info.get("method") in ("get", "post") and _TERMINAL_PATH_RE.search(path))
+    except Exception:
+        return False
+
+
 def _target_has_password_form(target: Clickable) -> bool:
     try:
         return bool(target.frame.locator(f'[data-aa-click="{target.index}"]').first.evaluate(
@@ -1241,23 +1450,27 @@ def _verified_account_form(target: Clickable, page_url: str) -> bool:
 
 
 def _final_like(run: Run, state: State, target: Clickable, label: str) -> bool:
-    """Whether clicking `target` could send the application (then it must go through submit_decision)."""
+    """Identify explicit final controls; ordinary navigation stays a flow action."""
     if _posting_apply_navigation(run, state, target):
         return False
-    if _advance_like(target):
-        return True
-    is_link = target.tag == "a" and bool(target.href) and not target.href.startswith(("#", "javascript"))
-    app_form = _application_page_context(run, state)
-    if target.is_submit:
-        return True
-    if _review_action_button(state, target):
-        return True
-    if SUBMIT_TEXT_RE.search(label):
-        # "Submit your resume" links on a posting page only navigate; submit buttons are always gated.
-        return app_form or not is_link
-    if NAV_TEXT_RE.search(target.text or target.aria) or is_link:
+    flow_kind = _target_flow_kind(target, state)
+    explicit_application_final = bool(_APPLICATION_FINAL_LABEL_RE.search(label))
+    if flow_kind in ("account", "consent") or (flow_kind == "verification" and not explicit_application_final):
         return False
-    return (app_form or _application_review(state)) and bool(FINAL_WORD_RE.search(label))
+    if explicit_application_final:
+        return not _is_initial_posting(run, state)
+    app_form = _application_page_context(run, state)
+    if (_target_terminal_action(target) and app_form and not _is_initial_posting(run, state)):
+        return True
+    if _advance_like(target):
+        return False
+    if NAV_TEXT_RE.search(target.text or target.aria) and not _GENERIC_FINAL_ACTION_RE.fullmatch(label):
+        return False
+    if _is_initial_posting(run, state):
+        return False
+    if _application_review(state) and _review_submit_ready(state, target):
+        return True
+    return bool(app_form and _GENERIC_FINAL_ACTION_RE.fullmatch(label))
 
 
 def _apply_now_label(target: Clickable) -> bool:
@@ -1462,7 +1675,7 @@ def _adopt_popup(run: Run) -> bool:
         return False
 
 
-def _click(run: Run, target: Clickable) -> bool:
+def _click(run: Run, target: Clickable, *, allow_dom_fallback: bool = True) -> bool:
     browser = run.ctx.browser
     before = list(browser.pages) if browser is not None else []
     source, source_url = run.page, _safe_url(run.page)
@@ -1475,7 +1688,10 @@ def _click(run: Run, target: Clickable) -> bool:
         loc.scroll_into_view_if_needed(timeout=5000)
         requested_ts = time.time()
         loc.click(timeout=10000)
-    except Exception:
+    except Exception as click_error:
+        if not allow_dom_fallback:
+            run.history.append(f"  (final click outcome uncertain: {type(click_error).__name__}; retry withheld)")
+            return False
         try:
             requested_ts = time.time()
             loc.evaluate("el => el.click()")
@@ -1506,13 +1722,6 @@ def _click(run: Run, target: Clickable) -> bool:
             except Exception:
                 break
     return True
-
-
-def _click_text(scope: Page | Frame, texts: list[str]) -> bool:
-    try:
-        return bool(form.click_text(scope, texts, roles=("button",)))
-    except Exception:
-        return False
 
 
 def _settle(page: Page, idle_ms: int = 5000) -> None:
@@ -1563,12 +1772,17 @@ def _guard_choices(fields: list[Field], ans: list[Answer], profile: dict) -> lis
             reversed_choice = re.search(r"opt.?out|unsubscrib|(?:do not|don't|not like to) (?:wish|want|receive|send)",
                                         question, re.I)
             value = False if f.kind == "checkbox" and not f.options and not reversed_choice else None
+            current_role_only = None
             if not reversed_choice:
                 declines = [o for o in f.options if _DECLINE_RE.fullmatch(o.strip())]
-                value = next((o for o in declines if o.strip().lower() == "no"),
-                             declines[0] if len(declines) == 1 else value)
+                scoped = [o for o in f.options if _CURRENT_ROLE_ONLY_RE.search(o)]
+                current_role_only = scoped[0] if len(scoped) == 1 else None
+                value = (current_role_only or next((o for o in declines if o.strip().lower() == "no"),
+                                                   declines[0] if len(declines) == 1 else value))
             a = Answer(f.key, value, "profile" if value is not None else "unknown",
-                       "messages declined per user instruction" if value is not None else "no verified messaging opt-out")
+                       "data use scoped to this application" if value is not None and value == current_role_only
+                       else "messages declined per user instruction" if value is not None
+                       else "no verified messaging opt-out")
         elif f.kind in ("select", "combobox", "radio", "checkbox"):
             if a.source == "generated":
                 a = Answer(f.key, None, "unknown", "choice needs applicant evidence")
