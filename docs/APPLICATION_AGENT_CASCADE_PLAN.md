@@ -69,6 +69,10 @@ Every attempt should make it possible to determine which layer handled the page,
 
 **Verification evidence:** The combined DB-flow, CLI-resolution, runner, and Generic suite passed 245 tests. After final runner accounting and authentication-journal refinements, the DB/CLI/runner rerun passed 88 tests and the focused Generic account/OTP/wizard/crash rerun passed 64 tests. The broad suite was not repeated after those final refinements. Crash fixtures cover death after POST acceptance, after checkpoint persistence, and after durable confirmation before runner recording; receipt enrichment prevents duplicate submission counts. Tests use local fixtures; no live application was submitted.
 
+**Workday tag and retry repair (2026-11-05):** Multiselect controls split `||` answers into individual tags, wait for suggestions, select exact matches, and use Enter only when a tag input has no visible options. The selected tags are re-read before recording success. “Where” relocation comboboxes use the saved scope; text fields keep the complete answer. `review` pauses after each job so the current application can be inspected before continuing, and `q` leaves later review jobs unopened. Automatic crash recovery does not reopen an interrupted posting after an intermediate step because Workday step POSTs are not journaled and replay could repeat a saved step.
+
+**Verification:** `tests/test_accounts.py` passed 235 tests, `tests/test_answers_rag.py` passed 67, and `tests/test_review.py` passed 5. All use local fixtures; no live application was run.
+
 ## Terminal workflow and application history
 
 The standard-library curses menu (`python -m agent tui`, or no arguments in an interactive terminal)

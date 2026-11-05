@@ -103,12 +103,13 @@ a run notification when a run submits, queues, or fails jobs, and alerts on batc
 8 AM. ntfy delivery requires `NTFY_TOPIC` in `.env` and a subscription in the ntfy phone app; desktop delivery
 requires `notify-send`.
 
-`review` opens `needs_review` jobs in separate visible tabs and runs the matching ATS adapter to prefill what it
+`review` opens `needs_review` jobs in visible tabs and runs the matching ATS adapter to prefill what it
 can. It always uses dry-run and `fill_only`, disables account creation even if enabled in `config.yaml`, and
-does not submit or change job status. Tabs stay open while the command waits for Enter; adapter or page failures
-are reported per job so later jobs can still open. Review holds the same browser-profile lock as `apply` until
-you finish. If an apply run stops after recording a final-submit intent, the job stays blocked from future
-applications, including `apply --force`, until you confirm what happened and run
+does not submit or change job status. After each job, press Enter to open the next one or `q` to stop, so you
+can inspect or finish the current application before moving on. Adapter or page failures are reported per job.
+Review holds the same browser-profile lock as `apply` until you finish. If an apply run stops after recording
+a final-submit intent, the job stays blocked from future applications, including `apply --force`, until you
+confirm what happened and run
 `python -m agent resolve <job_id> --outcome submitted` or
 `python -m agent resolve <job_id> --outcome not_submitted`. Use `submitted` only after confirming the application
 was sent; use `not_submitted` only after confirming it was not.

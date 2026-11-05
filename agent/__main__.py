@@ -207,7 +207,7 @@ def cmd_review(a) -> None:
             profile = load_profile()
             with open_browser(review_config, visible=True) as browser:
                 print(f"Opening {len(rows)} review job(s); each tab will be filled when its ATS adapter supports it.")
-                for row in rows:
+                for row_index, row in enumerate(rows):
                     job_id = row["id"]
                     job = db.get_job(job_id)
                     last = db.latest_application(job_id)
@@ -232,22 +232,30 @@ def cmd_review(a) -> None:
                             except Exception as e:
                                 print(f"  result: no adapter for ATS {job.ats}; page failed ({type(e).__name__}: "
                                       f"{_brief_error(e)})")
-                            continue
-                        context = ApplyContext(
-                            page=page,
-                            browser=browser,
-                            config=review_config,
-                            profile=profile,
-                            submit_mode="fill_only",
-                            dry_run=True,
-                            run_id=None,
-                        )
-                        result = adapter.apply(job, context)
-                        print(f"  adapter: {adapter.name}; result: {result.status.value}: {result.reason}")
-                        print(f"  filled fields: {result.fields_total}; unanswered required: "
-                              f"{len(result.unanswered_required)}")
+                        else:
+                            context = ApplyContext(
+                                page=page,
+                                browser=browser,
+                                config=review_config,
+                                profile=profile,
+                                submit_mode="fill_only",
+                                dry_run=True,
+                                run_id=None,
+                            )
+                            result = adapter.apply(job, context)
+                            print(f"  adapter: {adapter.name}; result: {result.status.value}: {result.reason}")
+                            print(f"  filled fields: {result.fields_total}; unanswered required: "
+                                  f"{len(result.unanswered_required)}")
                     except Exception as e:
                         print(f"  result: adapter/page failure ({type(e).__name__}: {_brief_error(e)})")
+
+                    if row_index + 1 < len(rows):
+                        try:
+                            action = input("\nFinish or inspect this application, then press Enter for the next queued job, or q to stop: ")
+                        except EOFError:
+                            break
+                        if action.strip().lower() in {"q", "quit"}:
+                            break
 
                 try:
                     input("\nFinish the open tabs manually, then press Enter to close them. "

@@ -576,7 +576,9 @@ def _relocation(f: Field, p: dict) -> Any:
     if re.search(r"\b(where|which city|what city)\b", label, re.I):
         scope = _get(p, "preferences.relocation_scope")
         if _yes_no(willing) == "yes" and scope:
-            return f"Yes, I am open to relocating {str(scope).lower()}." if f.kind in ("text", "textarea") else willing
+            if f.kind in ("text", "textarea"):
+                return f"Yes, I am open to relocating {str(scope).lower()}."
+            return scope if f.kind == "combobox" and not f.options else willing
         return None
     if not re.search(r"\b(willing|open|able|prepared|would|will|living in the country)\b", label, re.I):
         return None

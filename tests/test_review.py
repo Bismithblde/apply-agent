@@ -159,8 +159,9 @@ def test_review_uses_locked_safe_adapter_tabs_and_keeps_queue_unchanged(
     assert status_mutations == []
     assert account_creations == []
     assert adapter_errors == []
-    assert len(prompts) == 1 and prompts[0][1] == 3
-    assert "python -m agent mark <job_id> --status submitted" in prompts[0][0]
+    assert [n for _, n in prompts] == [1, 2, 3]
+    assert all("next queued job" in prompt for prompt, _ in prompts[:2])
+    assert "python -m agent mark <job_id> --status submitted" in prompts[-1][0]
 
 
 def test_review_continues_after_tab_and_adapter_failures(review_env, monkeypatch, capsys):
@@ -181,8 +182,10 @@ def test_review_continues_after_tab_and_adapter_failures(review_env, monkeypatch
     monkeypatch.setattr(registry, "adapter_for", lambda job, auto_ats: Adapter())
     _install_browser(monkeypatch, browser)
 
+    prompt_page_counts = []
+
     def wait_for_manual_finish(_prompt):
-        assert len(browser.pages) == 2
+        prompt_page_counts.append(len(browser.pages))
         return ""
 
     monkeypatch.setattr(builtins, "input", wait_for_manual_finish)
@@ -194,7 +197,37 @@ def test_review_continues_after_tab_and_adapter_failures(review_env, monkeypatch
     assert "result: needs_review: ready" in output
     assert adapter_calls == ["two", "three"]
     assert len(browser.pages) == 2
+    assert prompt_page_counts == [1, 2]
     assert status_mutations == []
+
+
+def test_review_can_stop_after_current_application(review_env, monkeypatch):
+    _, jobs, _, _, _ = review_env
+    browser = FakeBrowser()
+    adapter_calls = []
+
+    class Adapter:
+        name = "mock-greenhouse"
+
+        def apply(self, job, ctx):
+            adapter_calls.append(job.id)
+            return ApplyResult(ApplyStatus.NEEDS_REVIEW, "current job needs attention", fields_total=1)
+
+    monkeypatch.setattr(registry, "adapter_for", lambda job, auto_ats: Adapter())
+    _install_browser(monkeypatch, browser)
+    prompts = []
+
+    def stop_after_current(prompt):
+        prompts.append(prompt)
+        return "q" if len(prompts) == 1 else ""
+
+    monkeypatch.setattr(builtins, "input", stop_after_current)
+    cli.cmd_review(SimpleNamespace(limit=len(jobs)))
+
+    assert adapter_calls == ["one"]
+    assert len(browser.pages) == 1
+    assert len(prompts) == 2
+    assert "next queued job" in prompts[0]
 
 
 def test_review_does_not_open_browser_when_apply_lock_is_busy(review_env, monkeypatch, capsys):

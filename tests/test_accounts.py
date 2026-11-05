@@ -811,6 +811,82 @@ def test_searchable_major_does_not_select_first_option_on_enter(page):
     assert page.locator('#cs').get_attribute('data-clicked') == 'yes'
 
 
+def test_workday_multiselect_splits_delimited_tags_and_selects_each_suggestion(page):
+    page.set_content('''<div data-automation-id="applyFlowPage">
+      <div data-automation-id="formField-skills"><label>Skills*</label>
+        <div data-automation-id="multiselectInputContainer">
+          <input id="skills" data-aa-key="skills" data-uxi-widget-type="selectinput">
+        </div><div id="suggestions" role="listbox" style="display:none"></div>
+      </div></div><script>
+      const input = document.querySelector('#skills');
+      const menu = document.querySelector('#suggestions');
+      input.addEventListener('input', () => {
+        const query = input.value;
+        setTimeout(() => {
+          if (query !== input.value || !query) return;
+          menu.innerHTML = `<div role="option">${query}Script</div><div role="option">${query}</div>`;
+          menu.style.display = 'block';
+          menu.querySelectorAll('[role="option"]').forEach(option => option.onclick = () => {
+            const chip = document.createElement('span');
+            chip.dataset.automationId = 'selectedItem';
+            chip.innerHTML = `<span data-automation-id="selectedItemText">${option.textContent}</span>`;
+            document.querySelector('[data-automation-id="formField-skills"]').append(chip);
+            input.value = '';
+            menu.style.display = 'none';
+          });
+        }, 150);
+      });
+    </script>''')
+    run = workday._Run(_job(), _Ctx(page))
+    field = workday.Field('skills', 'Skills', 'combobox', True, name='formField-skills')
+    answer = workday.Answer('skills', 'Java || Python ||', 'profile')
+
+    assert run.fill_workday_widget(field, answer)
+    assert page.locator('[data-automation-id="selectedItemText"]').all_inner_texts() == ['Java', 'Python']
+    assert run.answers['skills'].value == ['Java', 'Python']
+    assert run._value_matches(field, answer.value, ['Java', 'Python'])
+
+
+def test_workday_multiselect_commits_free_entry_only_when_no_suggestion_exists(page):
+    page.set_content('''<div data-automation-id="formField-skills"><label>Skills*</label>
+      <div data-automation-id="multiselectInputContainer">
+        <input id="skills" data-aa-key="skills" data-uxi-widget-type="selectinput">
+      </div></div>''')
+    page.evaluate('''() => {
+      const input = document.querySelector('#skills');
+      window.enterCount = 0;
+      input.addEventListener('keydown', event => {
+        window.enterCount += event.key === 'Enter' ? 1 : 0;
+        if (event.key !== 'Enter' || !input.value) return;
+        event.preventDefault();
+        const chip = document.createElement('span');
+        chip.dataset.automationId = 'selectedItem';
+        chip.innerHTML = `<span data-automation-id="selectedItemText">${input.value}</span>`;
+        document.querySelector('[data-automation-id="formField-skills"]').append(chip);
+        input.value = '';
+      });
+    }''')
+    run = workday._Run(_job(), _Ctx(page))
+    field = workday.Field('skills', 'Skills', 'combobox', True, name='formField-skills')
+    assert page.evaluate('window.enterCount') == 0
+
+    filled = run.fill_workday_widget(field, workday.Answer('skills', 'Rust', 'profile'))
+    assert filled, f"enter events={page.evaluate('window.enterCount')}, input length={len(page.locator('#skills').input_value())}"
+    assert page.evaluate('window.enterCount') == 1
+    assert page.locator('[data-automation-id="selectedItemText"]').inner_text() == 'Rust'
+
+
+def test_workday_where_relocation_combo_uses_saved_scope(page):
+    from agent import answers
+    field = workday.Field('relocation', 'Are you interested in relocating? If so, where?', 'combobox', True)
+    profile = {'preferences': {'willing_to_relocate': 'Yes', 'relocation_scope': 'Anywhere'}}
+
+    answer = answers._deterministic(field, profile)
+
+    assert answer.value == 'Anywhere'
+    assert answer.source == 'profile'
+
+
 def test_workday_major_scrolls_lazy_options_to_exact_match(page):
     page.set_content('''<div data-automation-id="formField-fieldOfStudy">
       <label>Field of Study*</label><div data-automation-id="multiselectInputContainer">

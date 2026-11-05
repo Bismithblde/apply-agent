@@ -1586,6 +1586,10 @@ class _Run:
                 n.labels?.[0]?.innerText || n.closest('label')?.innerText || n.getAttribute('aria-label') || n.innerText || n.value));
             if (el.tagName === 'SELECT') return [...el.selectedOptions].map(o => clean(o.text));
             const box = el.closest('[data-automation-id^="formField-"]') || el.parentElement;
+            const selected = box ? [...box.querySelectorAll('[data-automation-id="selectedItem"]')]
+                .map(n => clean(n.querySelector('[data-automation-id="selectedItemText"]')?.innerText || n.innerText))
+                .filter(Boolean) : [];
+            if (selected.length) return selected;
             const pills = box ? [...box.querySelectorAll(
                 '[data-automation-id="selectedItem"], [data-automation-id*="pill" i], ' +
                 '[data-automation-id="compositeSubformValue"], [data-automation-id="selectedItemText"], ' +
@@ -1914,9 +1918,22 @@ class _Run:
                 self.page.wait_for_timeout(120)
         return None
 
+    def _is_multiselect_input(self, el: Locator) -> bool:
+        try:
+            return bool(el.evaluate("""el => {
+                const box = el.closest('[data-automation-id^="formField-"]');
+                return !!el.closest('[data-automation-id="multiselectInputContainer"], [aria-multiselectable="true"]')
+                    || !!box?.querySelector('[data-automation-id="selectedItem"]');
+            }"""))
+        except Exception:
+            return False
+
     def fill_workday_widget(self, f: Field, a: Answer) -> bool:
         el = self.page.locator(f'[data-aa-key="{f.key}"]').first
         values = a.value if isinstance(a.value, list) else [a.value]
+        is_multiselect = self._is_multiselect_input(el)
+        if is_multiselect and not isinstance(a.value, list) and isinstance(a.value, str) and "||" in a.value:
+            values = [part.strip() for part in a.value.split("||") if part.strip()]
         log.info("fill_workday_widget called for %r (key=%r, kind=%r, fid=%r, source=%s, values=%d)",
                  f.label, f.key, f.kind, f.name, a.source, len(values))
         try:
@@ -2007,7 +2024,7 @@ class _Run:
                 match = (_legal_option_index if _is_legal_agreement(f) else
                          _exact_option if _is_referral_source(f) or _is_phone_device(f) else _match_option)
                 c_vals = self._control_values(el)
-                matched_idx = match(c_vals, v)
+                matched_idx = _exact_option(c_vals, v) if is_multiselect else match(c_vals, v)
                 if matched_idx is not None:
                     matched_val = c_vals[matched_idx]
                     log.info("fill_workday_widget: existing selection matched for %r (key=%r)", f.label, f.key)
@@ -2016,6 +2033,13 @@ class _Run:
                     continue
                 cands = [v]
                 ok = any(self.choose_option(el, c, multi=f.kind == "combobox", field=f, required=f.required) for c in cands) and ok
+            if is_multiselect:
+                actual = self._control_values(el)
+                if not ok or not all(_exact_option(actual, str(value)) is not None for value in values):
+                    return False
+                self.answers[f.key] = Answer(f.key, [str(value) for value in values], a.source,
+                                             "selected tags verified")
+                f.current_value = " | ".join(str(value) for value in values)
             return ok
         except Exception as e:
             log.warning("workday widget fill failed for %r (error_type=%s)", f.label, type(e).__name__)
@@ -2024,6 +2048,7 @@ class _Run:
     def choose_option(self, el: Locator, value: str, *, multi: bool = False,
                       field: Field | None = None, required: bool | None = None) -> bool:
         box = el.locator("xpath=ancestor::*[starts-with(@data-automation-id,'formField-')][1]")
+        is_multiselect = self._is_multiselect_input(el)
         try:
             selected_before = box.locator(A("selectedItem")).count() if multi else 0
         except Exception:
@@ -2077,6 +2102,7 @@ class _Run:
         is_major = bool(re.search(r"field\s*of\s*study|fieldOfStudy|major|area\s*of\s*study", label + " " + fid, re.I))
         is_skills = bool(re.search(r"\bskills?\b", label + " " + fid, re.I))
         is_degree = bool(re.search(r"\bdegree\b", label + " " + fid, re.I) and not is_major)
+        is_tag_entry = is_multiselect and not (is_school or is_major or is_degree or is_referral or is_phone_device)
 
         if not multi or is_school or is_major or is_degree:
             try:
@@ -2160,7 +2186,7 @@ class _Run:
                 opts_count = 0
 
             if opts_count == 0:
-                if opts_count == 0 and search_val:
+                if opts_count == 0 and search_val and not is_multiselect:
                     try:
                         popup_inp = self.page.locator('[role="dialog"] input:visible, [role="listbox"] input:visible, input[data-automation-id="searchBox"]:visible, input[placeholder*="Search" i]:visible')
                         if popup_inp.count() and popup_inp.first.is_visible():
@@ -2175,12 +2201,6 @@ class _Run:
                     log.info("choose_option for %r (step=%d): opts_count=0", label, step)
                     if picked:
                         break
-                    if value and (multi or is_school or is_major or is_skills or is_degree):
-                        try:
-                            target_inp.press("Enter")
-                            self.page.wait_for_timeout(400)
-                        except Exception:
-                            pass
                 for _ in range(6):
                     self.page.wait_for_timeout(500)
                     opts = self._dropdown_options(el, box)
@@ -2192,6 +2212,22 @@ class _Run:
                         break
                 if opts_count == 0:
                     log.info("choose_option for %r: opts_count still 0 after retry", label)
+                    expanded = (el.get_attribute("aria-expanded") or "").lower() == "true"
+                    if is_tag_entry and value and not expanded:
+                        choices = self.page.locator('[role="option"]:visible, ' + A("promptOption") + ':visible')
+                        before = self._control_values(el)
+                        if not choices.count():
+                            try:
+                                target_inp.press("Enter")
+                                for _ in range(5):
+                                    self.page.wait_for_timeout(200)
+                                    current = self._control_values(el)
+                                    if len(current) > len(before) and _exact_option(current, value) is not None:
+                                        picked = True
+                                        chosen_text = value
+                                        break
+                            except Exception:
+                                pass
                     break
 
             try:
@@ -2215,9 +2251,14 @@ class _Run:
             last_texts = texts
 
             i = None
-            if value and (is_referral or is_major):
+            if is_multiselect and value:
+                i = _exact_option(texts, value)
+            if i is None and value and (is_referral or is_major or is_tag_entry):
                 aliases = _referral_aliases(value) if is_referral else tuple(_major_aliases(value)[1:])
-                scrolled = self._scroll_dropdown_to_match(el, box, value, aliases, exact=is_referral)
+                if is_tag_entry:
+                    aliases = ()
+                scrolled = self._scroll_dropdown_to_match(el, box, value, aliases,
+                                                         exact=is_referral or is_tag_entry)
                 if scrolled:
                     opts, texts, i = scrolled
             if i is None and is_major and value:
@@ -2239,18 +2280,18 @@ class _Run:
                         i = idx
                         log.info("Degree matched via candidate (option_index=%d)", i)
                         break
-            if i is None:
+            if i is None and not is_tag_entry:
                 is_lang = bool(re.search(r"language", label + " " + fid, re.I))
                 i = (_legal_option_index(texts, value) if _is_legal_agreement(context_field) else
                      _pick_option_index(texts, value, is_phone_device=is_phone_device,
                                         is_referral=is_referral, is_language=is_lang,
                                         is_required=is_required))
-            if i is None:
+            if i is None and not is_tag_entry:
                 for idx, t in enumerate(texts):
                     if t.strip().lower() in ("all", "search by category", "partial list (first 500 entries)", "search by location"):
                         i = idx
                         break
-            if i is None and (is_degree or is_school or is_major or is_skills or (is_referral and value.strip().casefold() in ("simplify", "job board", ""))):
+            if i is None and not is_tag_entry and (is_degree or is_school or is_major or is_skills or (is_referral and value.strip().casefold() in ("simplify", "job board", ""))):
                 edu = (self.ctx.profile.get("education") or {}) if hasattr(self, "ctx") else {}
                 pers = (self.ctx.profile.get("personal") or {}) if hasattr(self, "ctx") else {}
                 pref = (self.ctx.profile.get("preferences") or {}) if hasattr(self, "ctx") else {}
@@ -2299,7 +2340,8 @@ class _Run:
 
             is_target_match = False
             if value:
-                if _match_option([chosen_text], value) is not None:
+                if (_exact_option([chosen_text], value) if is_tag_entry
+                        else _match_option([chosen_text], value)) is not None:
                     is_target_match = True
                 elif is_major and any(_match_option([chosen_text], a) is not None for a in _major_aliases(value)):
                     is_target_match = True
@@ -2351,7 +2393,8 @@ class _Run:
                             pills.append(clean_p)
                     state = self._control_values(el)
                     clean_state = [re.sub(r"\s*(remove|delete|\u00d7|x)\s*$", "", s, flags=re.I).strip() for s in state]
-                    if (selected.count() > selected_before and any(_match_option(pills, tgt) is not None for tgt in targets if tgt)) or any(_match_option(clean_state, tgt) is not None for tgt in targets if tgt):
+                    matches = _exact_option if is_tag_entry else _match_option
+                    if (selected.count() > selected_before and any(matches(pills, tgt) is not None for tgt in targets if tgt)) or any(matches(clean_state, tgt) is not None for tgt in targets if tgt):
                         picked = True
                         break
                     self.page.wait_for_timeout(300)
@@ -2716,7 +2759,9 @@ class _Run:
         }""", ROOT)
 
     def _value_matches(self, f: Field, expected, actual: list[str]) -> bool:
-        values = expected if isinstance(expected, list) else [expected]
+        values = expected if isinstance(expected, list) else (
+            [part.strip() for part in expected.split("||") if part.strip()]
+            if isinstance(expected, str) and "||" in expected else [expected])
         if f.kind == "checkbox" and not f.options:
             return len(actual) == 1 and _yes_no(actual[0]) == _yes_no(expected) and (
                 not f.required or _yes_no(actual[0]) == "Yes")
