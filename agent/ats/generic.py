@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import hashlib
+import json
 import re
 import time
 from collections import Counter
@@ -13,7 +15,7 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 from playwright.sync_api import Frame, Page, TimeoutError as PlaywrightTimeoutError
 
-from .. import answers, captcha, form, llm, mail, vault
+from .. import answers, captcha, db, form, llm, mail, vault
 from ..browser import human_pause
 from ..config import SCREENSHOT_DIR
 from ..models import Answer, ApplyResult, ApplyStatus, Field, Job
@@ -330,6 +332,7 @@ class Run:
     page: Page
     deadline: float
     job_text: str = ""
+    flow_action_id: int | None = None
     submit_attempted: bool = False
     confirmation_baseline: Counter[str] = field(default_factory=Counter)
     confirmation_baseline_ready: bool = False
@@ -565,6 +568,20 @@ class GenericAdapter:
 
     def _advance_flow(self, run: Run, state: State, target: Clickable, label: str) -> ApplyResult | None:
         """Click a non-final step once; a fresh confirmation is the only success signal."""
+        fresh = _collect(run)
+        current = _find_clickable(fresh, target.index)
+        if current is None or (current.frame, current.tag, current.text, current.aria) != (
+                target.frame, target.tag, target.text, target.aria):
+            return self._result(run, ApplyStatus.NEEDS_REVIEW, "flow control changed before click; action withheld")
+        state, target = fresh, current
+        if not run.ctx.dry_run:
+            try:
+                run.flow_action_id = db.begin_flow_action(run.job.id, run.ctx.run_id,
+                                                         _flow_fingerprint(state))
+                run.ctx.record_layer("flow_journal", "prepared", "intent_persisted_before_click")
+            except Exception as exc:
+                return self._result(run, ApplyStatus.NEEDS_REVIEW,
+                                    f"could not persist flow action: {type(exc).__name__}; click withheld")
         _note_application_action(run)
         clicked = _click(run, target, allow_dom_fallback=False)
         _settle(run.page, idle_ms=5000)
@@ -572,6 +589,15 @@ class GenericAdapter:
         if _new_confirmation(run, next_state.text):
             run.ctx.record_layer("submission", "confirmed", "confirmation_detected")
             return self._success(run, "site confirmation detected after an application flow action")
+        if run.flow_action_id is not None:
+            try:
+                db.finish_flow_action(run.flow_action_id,
+                                      "uncertain" if next_state.signature() == state.signature() else "advanced",
+                                      _flow_fingerprint(next_state))
+                run.ctx.record_layer("flow_journal", "checkpoint", "action_outcome_persisted")
+            except Exception:
+                return self._result(run, ApplyStatus.NEEDS_REVIEW,
+                                    "could not persist flow checkpoint; automatic retry withheld")
         if next_state.signature() == state.signature():
             detail = f"{label} outcome is uncertain" if not clicked else f"{label} did not advance the page"
             return self._result(run, ApplyStatus.NEEDS_REVIEW,
@@ -844,13 +870,7 @@ class GenericAdapter:
         if action == "create_account" and not _allow_register_and_submit(run):
             return self._result(run, ApplyStatus.NEEDS_REVIEW,
                                 "account form filled; action may submit an application, manual review required")
-        if not _click(run, account_button, allow_dom_fallback=False):
-            return self._result(run, ApplyStatus.NEEDS_REVIEW,
-                                "account action click failed; manual review required")
-        _note_application_action(run)
-        run.history.append(f"  (clicked account action: {account_button.text or account_button.aria})")
-        _settle(run.page, idle_ms=3000)
-        return None
+        return self._advance_flow(run, state, account_button, "account action")
 
     def _verify(self, run: Run, state: State, want: str) -> ApplyResult | None:
         if want != "code":
@@ -904,6 +924,8 @@ class GenericAdapter:
                     and _verification_button_safe(target) and any(
                     _VERIFY_BUTTON_RE.fullmatch(label.strip())
                     for label in (target.text, target.aria) if label.strip())):
+                if not run.ctx.dry_run:
+                    return self._advance_flow(run, state, target, "verification code confirmation")
                 if _click(run, target, allow_dom_fallback=False):
                     _note_application_action(run)
                 run.history.append("  (clicked verification code confirmation)")
@@ -911,6 +933,8 @@ class GenericAdapter:
         return None
 
     def _success(self, run: Run, reason: str) -> ApplyResult:
+        if run.flow_action_id is not None:
+            db.finish_flow_action(run.flow_action_id, "confirmed")
         return self._result(run, ApplyStatus.SUBMITTED, reason)
 
     def _out_of_budget(self, run: Run, reason: str) -> ApplyResult:
@@ -1994,3 +2018,10 @@ def _screenshot(page: Page, job: Job, tag: str) -> str | None:
 
 
 ADAPTER = GenericAdapter()
+
+
+def _flow_fingerprint(state: State) -> str:
+    """Persist only a digest; never journal field values, page text, or session URLs."""
+    structure = (state.url, [(f.label, f.kind) for f in state.fields],
+                 [(c.tag, c.role, c.text, c.aria) for c in state.clickables])
+    return hashlib.sha256(json.dumps(structure, sort_keys=True).encode()).hexdigest()

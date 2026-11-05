@@ -3,6 +3,7 @@ from multiple threads/processes (WAL mode)."""
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -111,6 +112,24 @@ CREATE TABLE IF NOT EXISTS submit_intent_resolutions (
     outcome TEXT NOT NULL CHECK(outcome IN ('submitted', 'not_submitted')),
     created_at REAL NOT NULL,
     PRIMARY KEY (job_id, run_id)
+);
+
+CREATE TABLE IF NOT EXISTS flow_actions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    run_id INTEGER NOT NULL,
+    state TEXT NOT NULL DEFAULT 'prepared'
+        CHECK(state IN ('prepared','advanced','uncertain','confirmed')),
+    before_fingerprint TEXT NOT NULL,
+    after_fingerprint TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS flow_actions_job_run ON flow_actions(job_id, run_id);
+CREATE TABLE IF NOT EXISTS flow_action_resolutions (
+    action_id INTEGER PRIMARY KEY,
+    outcome TEXT NOT NULL CHECK(outcome IN ('submitted','not_submitted')),
+    created_at REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS answers_bank (
@@ -222,6 +241,10 @@ def next_jobs(limit: int, ats_allowed: list[str] | None = None, max_attempts: in
     if ats_allowed is not None:
         sql += f" AND ats IN ({','.join('?' * len(ats_allowed))})"
         args += ats_allowed
+    sql += (" AND NOT EXISTS (SELECT 1 FROM flow_actions f WHERE f.job_id=jobs.id "
+            "AND NOT EXISTS (SELECT 1 FROM flow_action_resolutions x WHERE x.action_id=f.id) "
+            "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.job_id=f.job_id "
+            "AND a.run_id=f.run_id AND a.status='submitted'))")
     sql += " ORDER BY date_posted DESC, first_seen DESC LIMIT ?"
     args.append(limit)
     with connect() as c:
@@ -248,6 +271,9 @@ def set_job_status(job_id: str, status: str, bump_attempt: bool = False) -> None
 def mark_job_in_progress(job_id: str, run_id: int, previous_status: str | None = None) -> bool:
     """Claim a job only if its status still matches the status observed by the caller."""
     with connect() as c:
+        c.execute("BEGIN IMMEDIATE")
+        if _unresolved_flow_action(c, job_id):
+            return False
         active = c.execute("SELECT 1 FROM runs WHERE id=? AND kind='apply' AND ended_at IS NULL",
                            (run_id,)).fetchone()
         if active is None:
@@ -341,6 +367,98 @@ def _unresolved_submit_intent(c: sqlite3.Connection, job_id: str) -> bool:
     ).fetchone() is not None
 
 
+def _unresolved_flow_action(c: sqlite3.Connection, job_id: str) -> bool:
+    return c.execute(
+        "SELECT 1 FROM flow_actions f WHERE f.job_id=? "
+        "AND NOT EXISTS (SELECT 1 FROM flow_action_resolutions x WHERE x.action_id=f.id) "
+        "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.job_id=f.job_id "
+        "AND a.run_id=f.run_id AND a.status='submitted') LIMIT 1", (job_id,),
+    ).fetchone() is not None
+
+
+def has_uncertain_flow_action(job_id: str) -> bool:
+    """Any unresolved checkpoint blocks a restart from the job URL."""
+    with connect() as c:
+        return _unresolved_flow_action(c, job_id)
+
+
+def _flow_receipt(c: sqlite3.Connection, job_id: str, run_id: int) -> None:
+    c.execute(
+        "INSERT INTO applications (job_id,run_id,status,reason,created_at,submitted_at) "
+        "SELECT ?,?,'submitted','application confirmed by flow journal',?,? "
+        "WHERE NOT EXISTS (SELECT 1 FROM applications WHERE job_id=? AND run_id=? AND status='submitted')",
+        (job_id, run_id, time.time(), time.time(), job_id, run_id),
+    )
+    c.execute("UPDATE flow_actions SET state='confirmed',updated_at=? WHERE job_id=? AND run_id=?",
+              (time.time(), job_id, run_id))
+
+
+def _flow_fingerprint(value: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError("a nonempty structural fingerprint is required")
+    # Never persist caller-provided page content, URLs, or applicant values.
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def begin_flow_action(job_id: str, run_id: int, before_fingerprint: str) -> int:
+    fingerprint = _flow_fingerprint(before_fingerprint)
+    with connect() as c:
+        c.execute("BEGIN IMMEDIATE")
+        active = c.execute(
+            "SELECT 1 FROM jobs j JOIN runs r ON r.id=j.active_run_id "
+            "WHERE j.id=? AND j.status='in_progress' AND r.id=? "
+            "AND r.kind='apply' AND r.ended_at IS NULL", (job_id, run_id),
+        ).fetchone()
+        if not active:
+            raise RuntimeError("flow action requires an active claimed real apply run")
+        blockers = c.execute(
+            "SELECT 1 FROM flow_actions f WHERE f.job_id=? "
+            "AND NOT EXISTS (SELECT 1 FROM flow_action_resolutions x WHERE x.action_id=f.id) "
+            "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.job_id=f.job_id "
+            "AND a.run_id=f.run_id AND a.status='submitted') "
+            "AND (f.run_id<>? OR f.state<>'advanced') LIMIT 1", (job_id, run_id),
+        ).fetchone()
+        if blockers or _unresolved_submit_intent(c, job_id) or c.execute(
+            "SELECT 1 FROM applications WHERE job_id=? AND run_id=? AND status='submitted'",
+            (job_id, run_id),
+        ).fetchone():
+            raise RuntimeError("unresolved prior action or confirmed submission blocks another flow action")
+        now = time.time()
+        cur = c.execute(
+            "INSERT INTO flow_actions (job_id,run_id,before_fingerprint,created_at,updated_at) VALUES (?,?,?,?,?)",
+            (job_id, run_id, fingerprint, now, now),
+        )
+        return int(cur.lastrowid)
+
+
+def finish_flow_action(action_id: int, state: str, after_fingerprint: str = '') -> None:
+    if state not in {"advanced", "uncertain", "confirmed"}:
+        raise ValueError("state must be advanced, uncertain, or confirmed")
+    fingerprint = _flow_fingerprint(after_fingerprint) if after_fingerprint else ""
+    with connect() as c:
+        c.execute("BEGIN IMMEDIATE")
+        action = c.execute("SELECT * FROM flow_actions WHERE id=?", (action_id,)).fetchone()
+        if action is None:
+            raise LookupError("flow action does not exist")
+        if c.execute("SELECT 1 FROM flow_action_resolutions WHERE action_id=?", (action_id,)).fetchone():
+            raise RuntimeError("flow action was explicitly resolved")
+        active = c.execute(
+            "SELECT 1 FROM jobs j JOIN runs r ON r.id=j.active_run_id WHERE j.id=? "
+            "AND j.status='in_progress' AND r.id=? AND r.kind='apply' AND r.ended_at IS NULL",
+            (action["job_id"], action["run_id"]),
+        ).fetchone()
+        if not active:
+            raise RuntimeError("flow action no longer belongs to an active claimed apply run")
+        if action["state"] == "confirmed" and state != "confirmed":
+            raise RuntimeError("confirmed flow action cannot be downgraded")
+        if action["state"] != "prepared" and state not in {action["state"], "confirmed"}:
+            raise RuntimeError("flow action outcome cannot be rewritten")
+        c.execute("UPDATE flow_actions SET state=?,after_fingerprint=?,updated_at=? WHERE id=?",
+                  (state, fingerprint, time.time(), action_id))
+        if state == "confirmed":
+            _flow_receipt(c, action["job_id"], action["run_id"])
+
+
 def preflight_and_claim_job(job_id: str, run_id: int, expected_status: str, config: dict,
                             *, claim: bool = True, allowed_statuses: set[str] | None = None,
                             allow_newly_submitted: bool = False,
@@ -370,7 +488,10 @@ def preflight_and_claim_job(job_id: str, run_id: int, expected_status: str, conf
         if prior_status == IN_PROGRESS or (allowed_statuses is not None and prior_status not in allowed_statuses):
             return "status_changed", "status is no longer eligible for the automatic queue", prior_status
 
-        if _unresolved_submit_intent(c, job_id):
+        if _unresolved_flow_action(c, job_id):
+            reason = "unresolved prior flow action; confirm its outcome before retrying"
+            filter_reason = None
+        elif _unresolved_submit_intent(c, job_id):
             reason = "unresolved prior submit intent; confirm its outcome before retrying"
             filter_reason = None
         else:
@@ -431,9 +552,10 @@ def preflight_and_claim_job(job_id: str, run_id: int, expected_status: str, conf
 
 
 def reset_stuck_jobs(max_attempts: int = 2, current_run_id: int | None = None) -> int:
-    """Recover orphaned attempts, using only that attempt's submit intent."""
+    """Recover orphaned attempts using durable submission and flow journals."""
     now = time.time()
     with connect() as c:
+        c.execute("BEGIN IMMEDIATE")
         stuck = c.execute(
             "SELECT id, attempts, active_run_id, active_run_previous_status, last_attempt "
             "FROM jobs WHERE status=?",
@@ -455,6 +577,12 @@ def reset_stuck_jobs(max_attempts: int = 2, current_run_id: int | None = None) -
                 run = c.execute(query, args).fetchone()
                 attempt_run_id = run[0] if run else None
 
+            confirmed_flows = c.execute(
+                "SELECT DISTINCT run_id FROM flow_actions WHERE job_id=? AND state='confirmed'",
+                (job["id"],),
+            ).fetchall()
+            for flow in confirmed_flows:
+                _flow_receipt(c, job["id"], flow["run_id"])
             current_intent = bool(attempt_run_id is not None and c.execute(
                 "SELECT 1 FROM submit_intents s WHERE s.job_id=? AND s.run_id=? "
                 "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.job_id=s.job_id "
@@ -472,9 +600,9 @@ def reset_stuck_jobs(max_attempts: int = 2, current_run_id: int | None = None) -
                 (job["id"],),
             ).fetchone())
 
-            if submitted_this_attempt:
+            if submitted_this_attempt or confirmed_flows:
                 status = "submitted"
-            elif current_intent:
+            elif current_intent or _unresolved_flow_action(c, job["id"]):
                 status = "needs_review"
             else:
                 previous_status = job["active_run_previous_status"]
@@ -536,6 +664,24 @@ def status_counts() -> dict[str, int]:
 def record_application(job: Job, result: ApplyResult, run_id: int | None) -> int:
     now = time.time()
     with connect() as c:
+        c.execute("BEGIN IMMEDIATE")
+        synthetic = None
+        if result.status == ApplyStatus.SUBMITTED and run_id is not None:
+            synthetic = c.execute(
+                "SELECT id FROM applications WHERE job_id=? AND run_id=? AND status='submitted' "
+                "AND reason='application confirmed by flow journal' ORDER BY id LIMIT 1",
+                (job.id, run_id),
+            ).fetchone()
+        if synthetic is not None:
+            c.execute(
+                "UPDATE applications SET reason=?,screenshot=?,final_url=?,answers_json=?,generated_json=?,"
+                "unanswered_json=?,layer_trace_json=? WHERE id=?",
+                (result.reason, result.screenshot, result.final_url,
+                 json.dumps([asdict(a) for a in result.answers], default=str),
+                 json.dumps(result.generated_answers), json.dumps(result.unanswered_required),
+                 json.dumps([asdict(e) for e in result.layer_trace]), synthetic["id"]),
+            )
+            return int(synthetic["id"])
         cur = c.execute(
             "INSERT INTO applications (job_id, run_id, status, reason, screenshot, final_url, answers_json,"
             " generated_json, unanswered_json, layer_trace_json, created_at, submitted_at) "
@@ -546,6 +692,9 @@ def record_application(job: Job, result: ApplyResult, run_id: int | None) -> int
              json.dumps([asdict(e) for e in result.layer_trace]), now,
              now if result.status == ApplyStatus.SUBMITTED else None),
         )
+        if result.status == ApplyStatus.SUBMITTED and run_id is not None:
+            c.execute("UPDATE flow_actions SET state='confirmed',updated_at=? WHERE job_id=? AND run_id=?",
+                      (now, job.id, run_id))
         return int(cur.lastrowid)
 
 
@@ -682,6 +831,14 @@ def record_submit_intent(job_id: str, run_id: int, config: dict) -> None:
         ).fetchone()
         if claimed is None:
             raise RuntimeError(f"job {job_id!r} is not active in apply run {run_id}")
+        if c.execute(
+            "SELECT 1 FROM flow_actions f WHERE f.job_id=? "
+            "AND NOT EXISTS (SELECT 1 FROM flow_action_resolutions x WHERE x.action_id=f.id) "
+            "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.job_id=f.job_id "
+            "AND a.run_id=f.run_id AND a.status='submitted') "
+            "AND (f.run_id<>? OR f.state<>'advanced') LIMIT 1", (job_id, run_id),
+        ).fetchone():
+            raise RuntimeError("unresolved prior flow action blocks final submission")
         scope_reason = _filter_evidence_reason(c, claimed, config)
         if scope_reason:
             raise ScopeEvidenceRejected(f"source filter: {scope_reason}")
@@ -712,16 +869,18 @@ def has_uncertain_submit_intent(job_id: str) -> bool:
 
 
 def resolve_submit_intents(job_id: str, outcome: str) -> int:
-    """Record a user-confirmed outcome while retaining every original intent for cap accounting."""
+    """Atomically resolve both journals, preserving original actions and submission receipts."""
     if outcome not in ("submitted", "not_submitted"):
         raise ValueError("outcome must be 'submitted' or 'not_submitted'")
     now = time.time()
     with connect() as c:
         c.execute("BEGIN IMMEDIATE")
-        job = c.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+        job = c.execute("SELECT status, active_run_id FROM jobs WHERE id=?", (job_id,)).fetchone()
         if job is None:
             raise LookupError(f"job {job_id!r} does not exist")
-        if job["status"] == IN_PROGRESS:
+        if job["status"] == IN_PROGRESS or (job["active_run_id"] is not None and c.execute(
+            "SELECT 1 FROM runs WHERE id=? AND ended_at IS NULL", (job["active_run_id"],),
+        ).fetchone()):
             raise RuntimeError(f"job {job_id!r} is active; resolve its outcome after recovery")
         intents = c.execute(
             "SELECT s.run_id, s.created_at FROM submit_intents s WHERE s.job_id=? "
@@ -731,8 +890,19 @@ def resolve_submit_intents(job_id: str, outcome: str) -> int:
             "WHERE x.job_id=s.job_id AND x.run_id=s.run_id)",
             (job_id,),
         ).fetchall()
-        if not intents:
+        flows = c.execute(
+            "SELECT f.* FROM flow_actions f WHERE f.job_id=? "
+            "AND NOT EXISTS (SELECT 1 FROM flow_action_resolutions x WHERE x.action_id=f.id) "
+            "AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.job_id=f.job_id "
+            "AND a.run_id=f.run_id AND a.status='submitted')", (job_id,),
+        ).fetchall()
+        if not intents and not flows:
             raise LookupError(f"no unresolved submit intents exist for job {job_id!r}")
+        for flow in flows:
+            c.execute("INSERT INTO flow_action_resolutions (action_id,outcome,created_at) VALUES (?,?,?)",
+                      (flow["id"], outcome, now))
+            if outcome == "submitted":
+                _flow_receipt(c, job_id, flow["run_id"])
         for intent in intents:
             c.execute(
                 "INSERT INTO submit_intent_resolutions (job_id, run_id, outcome, created_at) "
@@ -740,7 +910,10 @@ def resolve_submit_intents(job_id: str, outcome: str) -> int:
                 "outcome=excluded.outcome, created_at=excluded.created_at",
                 (job_id, intent["run_id"], outcome, now),
             )
-            if outcome == "submitted":
+            if outcome == "submitted" and not c.execute(
+                "SELECT 1 FROM applications WHERE job_id=? AND run_id=? AND status='submitted'",
+                (job_id, intent["run_id"]),
+            ).fetchone():
                 c.execute(
                     "INSERT INTO applications (job_id, run_id, status, reason, screenshot, final_url, answers_json, "
                     "generated_json, unanswered_json, created_at, submitted_at) "
@@ -760,7 +933,7 @@ def resolve_submit_intents(job_id: str, outcome: str) -> int:
             "UPDATE jobs SET status=?, active_run_id=NULL, active_run_previous_status=NULL WHERE id=?",
             (status, job_id),
         )
-        return len(intents)
+        return len(intents) + len(flows)
 
 
 def save_answers_bank(question: str, answer: str, company: str = "", source: str = "user_interview") -> int:

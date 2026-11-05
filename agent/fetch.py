@@ -148,7 +148,7 @@ def _hold_for_review(jobs: list[tuple[Job, str]], verified_keys: set[str],
                     log.warning("could not hold %s: the apply runner already claimed it; runner preflight is required",
                                 job.id)
                 continue
-            if _has_unresolved_submit_intent(c, job_id):
+            if _has_unresolved_submit_intent(c, job_id) or db._unresolved_flow_action(c, job_id):
                 log.warning("did not replace the review reason for %s because its submit intent is unresolved", job.id)
                 continue
             active, added = _record_filter_review(c, job_id, reason, transitioned)
@@ -181,7 +181,7 @@ def _mark_verified(job: Job, fingerprint: str) -> bool:
         _set_kv(c, f"filter_evidence:{job_id}", json.dumps(evidence, sort_keys=True))
         marker_key = f"filter_review_reason:{job_id}"
         marker = c.execute("SELECT value FROM kv WHERE key=?", (marker_key,)).fetchone()
-        if row["status"] != "needs_review" or marker is None or _has_unresolved_submit_intent(c, job_id):
+        if row["status"] != "needs_review" or marker is None or _has_unresolved_submit_intent(c, job_id) or db._unresolved_flow_action(c, job_id):
             return True
         previous = c.execute("SELECT id, status, reason FROM applications WHERE job_id=? ORDER BY id DESC LIMIT 1",
                              (job_id,)).fetchone()

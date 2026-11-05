@@ -2001,3 +2001,52 @@ def test_dry_run_blocks_even_verified_existing_account_login(site, monkeypatch, 
     assert not posted_thanks(site)
     with db.connect() as conn:
         assert conn.execute("SELECT COUNT(*) FROM submit_intents").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("crash_at", ["after_post", "after_checkpoint"])
+def test_wizard_crash_journal_prevents_restart_replay(site, monkeypatch, crash_at):
+    collect = generic._collect
+    advance = generic.GenericAdapter._advance_flow
+    if crash_at == "after_post":
+        def crash_collect(run_state):
+            if run_state.page.url == HOST + "/wizard2":
+                raise SystemExit("synthetic worker death after server accepted POST")
+            return collect(run_state)
+        monkeypatch.setattr(generic, "_collect", crash_collect)
+    else:
+        def crash_advance(adapter, *args, **kwargs):
+            advance(adapter, *args, **kwargs)
+            raise SystemExit("synthetic worker death after checkpoint")
+        monkeypatch.setattr(generic.GenericAdapter, "_advance_flow", crash_advance)
+    with pytest.raises(SystemExit):
+        run(site, monkeypatch, [act("fill_form"), click("Next")], path="/wizard1")
+    assert sum(method == "POST" and path == "/wizard2" for method, path, _ in site.hits) == 1
+    db.reset_stuck_jobs()
+    assert db.get_job_status("test:1") == "needs_review"
+    assert db.next_jobs(10) == []
+    assert db.has_uncertain_flow_action("test:1")
+
+
+def test_flow_journal_failure_withholds_navigation(site, monkeypatch):
+    def fail_journal(*args, **kwargs):
+        raise RuntimeError("synthetic unavailable journal")
+    monkeypatch.setattr(db, "begin_flow_action", fail_journal)
+    result, _ = run(site, monkeypatch, [act("fill_form"), click("Next")], path="/wizard1")
+    assert result.status == ApplyStatus.NEEDS_REVIEW
+    assert "click withheld" in result.reason
+    assert not any(method == "POST" for method, _, _ in site.hits)
+
+
+def test_flow_confirmation_survives_crash_before_runner_records_result(site, monkeypatch):
+    monkeypatch.setitem(PAGES, "/wizard2", PAGES["/thanks"])
+    success = generic.GenericAdapter._success
+    def crash_after_receipt(adapter, *args, **kwargs):
+        success(adapter, *args, **kwargs)
+        raise SystemExit("synthetic death after durable confirmation")
+    monkeypatch.setattr(generic.GenericAdapter, "_success", crash_after_receipt)
+    with pytest.raises(SystemExit):
+        run(site, monkeypatch, [act("fill_form"), click("Next")], path="/wizard1")
+    db.reset_stuck_jobs()
+    assert db.get_job_status("test:1") == "submitted"
+    assert not db.has_uncertain_flow_action("test:1")
+    assert sum(method == "POST" and path == "/wizard2" for method, path, _ in site.hits) == 1

@@ -59,6 +59,8 @@ def _mutation_block_reason(job_id: str, state) -> str | None:
     if state["status"] == db.IN_PROGRESS or state["active_run_id"] is not None:
         return ("job is active or has a stale active-run marker; run `python -m agent apply` once to recover it, "
                 "then retry")
+    if db.has_uncertain_flow_action(job_id):
+        return "interrupted application flow; verify its outcome, then use `python -m agent resolve <job_id> --outcome submitted|not_submitted`"
     if db.has_uncertain_submit_intent(job_id):
         return ("unresolved submit intent; confirm its outcome with `python -m agent resolve <job_id> "
                 "--outcome submitted|not_submitted`")
@@ -75,6 +77,8 @@ def _mark_job_status(job_id: str, status: str) -> str | None:
         if state["status"] == db.IN_PROGRESS or state["active_run_id"] is not None:
             return ("job is active or has a stale active-run marker; run `python -m agent apply` once to recover it, "
                     "then retry")
+        if db._unresolved_flow_action(c, job_id):
+            return "interrupted application flow; verify its outcome, then use `python -m agent resolve <job_id> --outcome submitted|not_submitted`"
         if db._unresolved_submit_intent(c, job_id):
             return ("unresolved submit intent; confirm its outcome with `python -m agent resolve <job_id> "
                     "--outcome submitted|not_submitted`")
@@ -468,7 +472,7 @@ def cmd_resolve(a) -> int:
                 print(f"resolve deferred {a.job_id!r}: job has an active-run marker; run `python -m agent apply` "
                       "once to recover it, then retry", file=sys.stderr)
                 return 1
-            if not db.has_uncertain_submit_intent(a.job_id):
+            if not (db.has_uncertain_submit_intent(a.job_id) or db.has_uncertain_flow_action(a.job_id)):
                 print(f"resolve failed {a.job_id!r}: no unresolved submit intent exists; nothing changed",
                       file=sys.stderr)
                 return 1
@@ -501,7 +505,7 @@ def cmd_resolve(a) -> int:
     except Exception as exc:
         print(f"resolve failed {a.job_id!r}: database operation failed ({type(exc).__name__})", file=sys.stderr)
         return 1
-    print(f"resolved {resolved} submit intent(s) for {a.job_id!r} as {a.outcome}")
+    print(f"resolved {resolved} action intent(s) for {a.job_id!r} as {a.outcome}")
     return 0
 
 
@@ -603,7 +607,7 @@ def main(argv: list[str] | None = None) -> int:
 
     rsp = sub.add_parser(
         "resolve",
-        help="record a user-confirmed outcome for an unresolved submit intent",
+        help="record a user-confirmed outcome for unresolved application actions",
         description="Record a user-confirmed outcome for an unresolved final-submit attempt.",
     )
     rsp.add_argument("job_id")

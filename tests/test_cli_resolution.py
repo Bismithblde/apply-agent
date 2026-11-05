@@ -276,3 +276,21 @@ def test_pick_cli_select_and_apply(cli_db, monkeypatch, capsys):
     assert len(called_with) == 1
     assert called_with[0]["job_ids"] == [job.id]
     assert called_with[0]["dry_run"] is True
+
+
+@pytest.mark.parametrize("outcome,status", [("submitted", "submitted"), ("not_submitted", "new")])
+def test_resolve_cli_handles_interrupted_flow(cli_db, outcome, status):
+    job = _job("job:flow-resolve")
+    db.upsert_jobs([job])
+    run_id = db.start_run("apply")
+    assert db.mark_job_in_progress(job.id, run_id)
+    action = db.begin_flow_action(job.id, run_id, "synthetic page structure")
+    db.finish_flow_action(action, "advanced", "synthetic next structure")
+    db.reset_stuck_jobs()
+    assert db.get_job_status(job.id) == "needs_review"
+    assert cli.main(["requeue", "--status", "needs_review"]) != 0
+    assert db.get_job_status(job.id) == "needs_review"
+    assert cli.main(["resolve", job.id, "--outcome", outcome]) == 0
+    assert db.get_job_status(job.id) == status
+    assert not db.has_uncertain_flow_action(job.id)
+    assert db.submissions_since(0) == int(outcome == "submitted")

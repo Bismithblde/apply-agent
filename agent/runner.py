@@ -53,16 +53,35 @@ def _attempts(job_id: str) -> int:
 
 
 def _guard_uncertain_submit(job: Job, result: ApplyResult, dry_run: bool, run_id: int) -> ApplyResult:
-    if dry_run or result.status != ApplyStatus.FAILED:
+    if dry_run:
+        return result
+    with db.connect() as c:
+        confirmed = c.execute(
+            "SELECT 1 FROM flow_actions WHERE job_id=? AND run_id=? AND state='confirmed' LIMIT 1",
+            (job.id, run_id),
+        ).fetchone()
+    if confirmed and result.status != ApplyStatus.SUBMITTED:
+        return replace(result, status=ApplyStatus.SUBMITTED,
+                       reason="application confirmation persisted in flow journal")
+    if result.status != ApplyStatus.FAILED:
         return result
     if db.submit_intent_exists(job.id, run_id):
         return replace(result, status=ApplyStatus.NEEDS_REVIEW,
                        reason=f"possible submission in run {run_id}; verify manually: {result.reason}"[:500])
+    if db.has_uncertain_flow_action(job.id):
+        return replace(result, status=ApplyStatus.NEEDS_REVIEW,
+                       reason=f"interrupted application flow; automatic replay blocked: {result.reason}"[:500])
     return result
 
 
 def _consumed_submit_slot(job: Job, run_id: int, dry_run: bool) -> bool:
-    return not dry_run and db.submit_intent_exists(job.id, run_id)
+    if dry_run:
+        return False
+    if db.submit_intent_exists(job.id, run_id):
+        return True
+    with db.connect() as c:
+        return c.execute("SELECT 1 FROM flow_actions WHERE job_id=? AND run_id=? AND state='confirmed' LIMIT 1",
+                         (job.id, run_id)).fetchone() is not None
 
 
 def _run_one(job: Job, ctx_browser, config: dict, profile: dict, submit_mode: str, dry_run: bool,
@@ -184,7 +203,9 @@ def _worker(wid: int, jobs: "queue.Queue[Job]", stats: BatchStats, config: dict,
                         with stats.lock:
                             if not _consumed_submit_slot(job, stats.run_id, dry_run):
                                 cap[0] += 1
-                            if crash.status == ApplyStatus.NEEDS_REVIEW:
+                            if crash.status == ApplyStatus.SUBMITTED:
+                                stats.submitted += 1
+                            elif crash.status == ApplyStatus.NEEDS_REVIEW:
                                 stats.queued += 1
                             else:
                                 stats.failed += 1
