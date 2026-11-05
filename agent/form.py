@@ -19,6 +19,15 @@ SUCCESS_PHRASES = [
     "application submitted", "successfully submitted", "your application is complete", "thank you for your application",
 ]
 CODE_PHRASES = ["security code", "verification code", "enter the code", "sent a code", "code sent to", "verify your email"]
+_MESSAGING_CHANNEL_RE = re.compile(r"\bsms\b|text messages?|whats\s*app|e-?mail|news|talent communit", re.I)
+_MESSAGING_INTENT_RE = re.compile(r"send|receiv|contact|opt.?in|subscrib|communicat|updates|consent", re.I)
+_FUTURE_PERMISSION_RE = re.compile(r"future.?opportunit|future.?consideration|other positions|additional job", re.I)
+
+
+def _messaging_field(f: Field) -> bool:
+    label = f.label or f.name
+    return bool(_MESSAGING_CHANNEL_RE.search(label) and _MESSAGING_INTENT_RE.search(label)
+                or _FUTURE_PERMISSION_RE.search(label))
 
 _EXTRACT_JS = r"""
 (rootSel) => {
@@ -545,7 +554,7 @@ def extract_fields(scope, root: str | None = None, *, probe_options: bool = True
     try:
         raw = scope.evaluate(_EXTRACT_JS, root)
     except Exception as e:
-        log.warning("extract_fields failed: %s", e)
+        log.warning("extract_fields failed (%s)", type(e).__name__)
         return []
     fields = [Field(key=r["key"], label=r["label"][:2000], kind=r["kind"], required=bool(r["required"]),
                     options=[o for o in r["options"] if o][:3000], name=r["name"] or "",
@@ -589,10 +598,41 @@ def _pause(lo: float = 0.05, hi: float = 0.2) -> None:
     time.sleep(random.uniform(lo, hi))
 
 
-def fill_fields(scope, fields: list[Field], answers: list[Answer]) -> list[str]:
+_COMPUTER_USE_TEXT_KINDS = {"text", "textarea", "email", "tel", "url", "number"}
+
+
+def _computer_use_fill(scope, page, f: Field, answer: Answer) -> bool:
+    """Use vision only to locate an existing field and enter its already-approved answer."""
+    if f.kind not in _COMPUTER_USE_TEXT_KINDS | {"select", "combobox"}:
+        return False
+    if answer.source == "unknown" or answer.value in (None, "", []):
+        return False
+    from . import vision_agent
+
+    expected = str(answer.value)
+    locator = scope.locator(f'[data-aa-key="{f.key}"]').first
+    if f.kind in ("select", "combobox"):
+        ok = vision_agent.vision_choose_option(page, locator, f.label, expected)
+    else:
+        ok = vision_agent.locate_and_act(
+            page,
+            goal=f"Enter the provided value into the field labeled {f.label!r}. Do not interact with any other control.",
+            target_value=expected,
+            action_hint="type",
+            locator=locator,
+            context=f"Field kind: {f.kind}. Required: {f.required}. Target label: {f.label[:200]}.",
+            allow_locator_fallback=False,
+        )
+    return bool(ok and _verify(scope, f, expected))
+
+
+def fill_fields(scope, fields: list[Field], answers: list[Answer], *, page=None,
+                layer_context=None) -> list[str]:
     """Fill each answered field, verify it, and return the keys that could not be filled."""
     by_key = {a.key: a for a in answers}
     failed: list[str] = []
+    visual_attempts = 0
+    visual_verified = 0
     for f in fields:
         a = by_key.get(f.key)
         if _missing(a):
@@ -602,12 +642,39 @@ def fill_fields(scope, fields: list[Field], answers: list[Answer]) -> list[str]:
         try:
             ok = _fill_one(scope, f, a.value)
         except Exception as e:
-            log.info("fill %s (%s) failed: %s", f.key, f.label[:60], str(e).splitlines()[0][:200])
+            log.info("fill %s (%s, %s) failed (%s)", f.key, f.label[:60], f.kind, type(e).__name__)
             ok = False
+        if not ok and page is not None and layer_context is not None \
+                and layer_context.config.get("computer_use", {}).get("enabled", False):
+            visual_attempts += 1
+            try:
+                ok = _computer_use_fill(scope, page, f, a)
+            except Exception as e:
+                log.info("computer-use field repair failed (%s)", type(e).__name__)
+                ok = False
+            if ok:
+                visual_verified += 1
         if not ok:
             failed.append(f.key)
         _pause()
-    return sorted(set(failed) | set(_dropdown_failures(scope, fields, answers)))
+    failed = sorted(set(failed) | set(_dropdown_failures(scope, fields, answers)))
+    record_layer = getattr(layer_context, "record_layer", None)
+    if callable(record_layer):
+        sources = {source: sum(1 for a in answers if a.source == source)
+                   for source in ("profile", "bank", "generated", "unknown")}
+        verified = len(fields) - len(set(failed))
+        record_layer(
+            "answer_fill", "verified" if not failed else "escalate",
+            f"profile={sources['profile']};bank={sources['bank']};generated={sources['generated']};unknown={sources['unknown']}",
+            fields_total=len(fields), fields_verified=verified,
+        )
+        if visual_attempts:
+            record_layer(
+                "computer_use", "verified" if visual_attempts == visual_verified else "escalate",
+                f"field_repairs={visual_attempts};verified={visual_verified}",
+                fields_total=visual_attempts, fields_verified=visual_verified,
+            )
+    return failed
 
 
 def _fill_one(scope, f: Field, value: Any) -> bool:
@@ -714,7 +781,7 @@ def _fill_one(scope, f: Field, value: Any) -> bool:
         else:
             return False
     except Exception as e:
-        log.debug("pre-fill check for %s failed: %s", f.key, e)
+        log.debug("pre-fill check for %s (%s) failed (%s)", f.key, f.kind, type(e).__name__)
     _type_into(loc, text, f.kind)
     return _verify(scope, f, text)
 
@@ -779,7 +846,7 @@ def _fill_combo(scope, loc, f: Field, value: str) -> bool:
             matched = True
             break
     if not matched:
-        log.info("dropdown %s (%s) did not commit requested value %r", f.key, f.label[:60], value)
+        log.info("dropdown %s (%s, %s) did not commit requested value", f.key, f.label[:60], f.kind)
     return matched
 
 
@@ -873,6 +940,24 @@ def _verify(scope, f: Field, expected: str) -> bool:
     return _norm(val) == _norm(expected)
 
 
+def verify_answer_value(scope, f: Field, answer: Answer) -> bool:
+    """Re-read a control at the submit boundary and compare it with its approved answer."""
+    if _missing(answer):
+        return False
+    if f.kind in ("radio", "checkbox") and (f.kind == "radio" or f.options):
+        states = scope.evaluate(_READ_JS, [f.key, f.kind]).get("states") or []
+        selected = {text for text, checked in states if checked}
+        wanted = answer.value if isinstance(answer.value, list) else [str(answer.value)]
+        return len(selected) == len(wanted) and all(
+            any(option_matches(str(value), shown) for shown in selected) for value in wanted
+        )
+    if f.kind == "checkbox":
+        checked = bool(scope.evaluate(_READ_JS, [f.key, "checkbox"]).get("checked"))
+        wanted = answer.value is True or str(answer.value).strip().lower() in ("true", "yes", "1", "checked")
+        return checked == wanted
+    return _verify(scope, f, str(answer.value))
+
+
 def _dropdown_failures(scope, fields: list[Field], answers: list[Answer]) -> list[str]:
     """Recheck dropdowns and date components, including years rendered as text inputs."""
     by_key = {answer.key: answer for answer in answers}
@@ -952,7 +1037,7 @@ def click_text(scope, texts: list[str], roles=("button", "link")) -> bool:
 # ---------- adapter helpers ----------
 
 def fill_form(scope, job: Job, profile: dict, *, job_text: str = "", extra_context: str = "",
-              passes: int = 2) -> tuple[list[Field], list[Answer], list[str]]:
+              passes: int = 2, layer_context=None) -> tuple[list[Field], list[Answer], list[str]]:
     """Extract, answer, and fill; re-extract to catch conditional fields (at most `passes` rounds).
     Returns (current fields, answers for them, keys that failed to fill)."""
     from .answers import answer_fields
@@ -984,7 +1069,9 @@ def fill_form(scope, job: Job, profile: dict, *, job_text: str = "", extra_conte
                 answers[a.key] = a
         todo = new + retry
         failed -= {f.key for f in retry}
-        failed |= set(fill_fields(scope, todo, [answers[f.key] for f in todo if f.key in answers]))
+        failed |= set(fill_fields(scope, todo, [answers[f.key] for f in todo if f.key in answers],
+                                  page=layer_context.page if layer_context is not None else None,
+                                  layer_context=layer_context))
         known.update({f.key: f for f in fields})
         log.info("fill pass %d: %d fields, %d new, %d failed", i + 1, len(fields), len(new), len(failed))
     keys = {f.key for f in fields}
@@ -1059,6 +1146,51 @@ def _result(status: ApplyStatus, reason: str, fields: list[Field], answers: list
     )
 
 
+def _click_code_confirmation(scope, code_input) -> bool:
+    """Only activate a button associated with the code entry, never another application submit."""
+    names = ["Verify", "Verify code", "Verify email", "Confirm code", "Confirm verification",
+             "Confirm email", "Submit code", "Complete verification", "Confirm", "Submit"]
+    for name in names:
+        try:
+            buttons = scope.get_by_role("button", name=re.compile(rf"^{re.escape(name)}$", re.I))
+            for button in buttons.all()[:10]:
+                if not button.is_visible():
+                    continue
+                associated = button.evaluate("""(button, input) => {
+                    if (!input || button.ownerDocument !== input.ownerDocument) return false;
+                    const form = button.closest('form');
+                    if (form && !form.contains(input)) return false;
+                    if (button.hasAttribute('form') &&
+                        button.form !== input.closest('form')) return false;
+                    let parent = input.parentElement;
+                    let section = null;
+                    while (parent && parent.tagName !== 'BODY') {
+                        if (parent.contains(button) && parent.querySelectorAll('input').length <= 12) {
+                            section = parent;
+                            break;
+                        }
+                        parent = parent.parentElement;
+                    }
+                    if (!section || !/security code|verification code|one.time code|otp/i.test(section.innerText))
+                        return false;
+                    const codeOnly = container => [...container.querySelectorAll('input:not([type=hidden])')].every(el =>
+                        el === input || el.maxLength === 1 ||
+                        /code|otp|digit|character/i.test((el.name || '') + ' ' + (el.id || '') + ' ' +
+                            (el.getAttribute('autocomplete') || '') + ' ' + (el.getAttribute('aria-label') || '')));
+                    if (form && !codeOnly(form) && (button.type || '').toLowerCase() === 'submit')
+                        return false;
+                    if (button.textContent.trim().toLowerCase() !== 'submit') return true;
+                    return !!form && codeOnly(form) &&
+                        /security code|verification code|one.time code|otp/i.test(form.innerText);
+                }""", code_input.element_handle())
+                if associated:
+                    button.click(timeout=5000)
+                    return True
+        except Exception:
+            continue
+    return False
+
+
 def finish_application(job: Job, ctx, scope, fields: list[Field], answers: list[Answer], failed: list[str], *,
                        submit_texts: list[str], success_url: str | None = None) -> ApplyResult:
     """Decide, solve captcha, click submit, and confirm. Never clicks submit in dry-run/fill_only."""
@@ -1068,6 +1200,31 @@ def finish_application(job: Job, ctx, scope, fields: list[Field], answers: list[
     dropdown_failed = _dropdown_failures(scope, fields, answers)
     failed = sorted(set(failed) | set(dropdown_failed))
     labels = {f.key: f.label or f.key for f in fields}
+    by_key = {answer.key: answer for answer in answers}
+    stale_answers = []
+    mismatched_answers = 0
+    checked_answers = 0
+    for f in fields:
+        answer = by_key.get(f.key)
+        if answer is None or _missing(answer):
+            continue
+        try:
+            verified = verify_answer_value(scope, f, answer)
+        except Exception:
+            verified = False
+        checked_answers += 1
+        if not verified:
+            mismatched_answers += 1
+            failed = sorted(set(failed) | {f.key})
+            stale_answers.append(f.label or f.key)
+    ctx.record_layer("submit_verification", "verified" if not stale_answers else "needs_review",
+                     f"answers_checked={checked_answers};mismatches={mismatched_answers}",
+                     fields_total=checked_answers, fields_verified=checked_answers - mismatched_answers)
+    if stale_answers:
+        shot = ctx.screenshot(job, "field_mismatch")
+        return _result(ApplyStatus.NEEDS_REVIEW,
+                       "current field values do not match their approved answers: "
+                       + "; ".join(stale_answers[:5]), fields, answers, shot, page.url)
     failed_req = [labels[k] for k in failed if k in dropdown_failed or any(f.key == k and f.required for f in fields)]
     ok, reason = submit_decision(fields, answers, ctx.submit_mode, ctx.dry_run)
     if failed_req:
@@ -1096,6 +1253,8 @@ def finish_application(job: Job, ctx, scope, fields: list[Field], answers: list[
     state = wait_for_outcome(page, scope, before, success_url)
     shot = ctx.screenshot(job, state)
     if state == "submitted":
+        ctx.record_layer("submission", "confirmed", "confirmation_detected",
+                         fields_total=len(fields), fields_verified=len(fields) - len(failed))
         return _result(ApplyStatus.SUBMITTED, "submitted", fields, answers, shot, page.url)
     if state == "code":
         ver = mail.wait_for_verification((submit_ts or time.time()) - 15, timeout=90, want="code")
@@ -1130,26 +1289,31 @@ def finish_application(job: Job, ctx, scope, fields: list[Field], answers: list[
                     pass
 
             try:
+                if not boxes or (len(boxes) > 1 and len(boxes) != len(code)):
+                    return _result(ApplyStatus.NEEDS_REVIEW, "verification code inputs unavailable or mismatched",
+                                   fields, answers, shot, page.url)
                 if len(boxes) > 1 and len(boxes) == len(code):
                     for i, char in enumerate(code):
                         boxes[i].fill(char)
-                elif boxes:
+                else:
                     try:
                         boxes[0].fill(code)
                     except Exception:
-                        for i, char in enumerate(code[:len(boxes)]):
-                            boxes[i].fill(char)
+                        return _result(ApplyStatus.NEEDS_REVIEW, "could not enter verification code",
+                                       fields, answers, shot, page.url)
 
-                btn_texts = ["submit application", "submit", "verify", "confirm", "continue", "submit your application", "complete application"]
-                if not click_text(page, btn_texts, roles=("button",)):
-                    if scope is not page:
-                        click_text(scope, btn_texts, roles=("button",))
+                confirmed = _click_code_confirmation(page, boxes[0])
+                if not confirmed and scope is not page:
+                    confirmed = _click_code_confirmation(scope, boxes[0])
+                if not confirmed:
+                    return _result(ApplyStatus.NEEDS_REVIEW, "verification control not found",
+                                   fields, answers, shot, page.url)
                 state = wait_for_outcome(page, scope, before, success_url)
                 shot = ctx.screenshot(job, state)
                 if state == "submitted":
                     return _result(ApplyStatus.SUBMITTED, "submitted", fields, answers, shot, page.url)
             except Exception as e:
-                log.warning("entering verification code failed: %s", e)
+                log.warning("entering verification code failed (%s)", type(e).__name__)
         return _result(ApplyStatus.NEEDS_REVIEW, "email security code requested after submit", fields, answers,
                        shot, page.url)
     if state == "captcha":

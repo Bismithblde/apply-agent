@@ -18,6 +18,10 @@ browser:
   # Persistent profile so logins/cookies (e.g. Ashby, Greenhouse MyGreenhouse) survive between runs.
   user_data_dir: browser-profile
 
+computer_use:
+  # Use screenshot-grounded interaction only after the DOM fill path fails and an approved answer exists.
+  enabled: true
+
 schedule:
   fetch_every: 30m          # how often sources are polled
   apply_every: 45m          # how often the apply queue is drained

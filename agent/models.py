@@ -100,6 +100,16 @@ class ApplyStatus(str, Enum):
 
 
 @dataclass
+class LayerEvent:
+    """Redacted evidence about one application-agent layer attempt."""
+    layer: str
+    outcome: str
+    detail: str = ""
+    fields_total: int = 0
+    fields_verified: int = 0
+
+
+@dataclass
 class ApplyResult:
     status: ApplyStatus
     reason: str
@@ -109,3 +119,4 @@ class ApplyResult:
     unanswered_required: list[str] = field(default_factory=list)
     generated_answers: list[str] = field(default_factory=list)
     answers: list[Answer] = field(default_factory=list)
+    layer_trace: list[LayerEvent] = field(default_factory=list)

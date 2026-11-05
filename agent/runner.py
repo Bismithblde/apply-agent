@@ -72,29 +72,38 @@ def _run_one(job: Job, ctx_browser, config: dict, profile: dict, submit_mode: st
     ctx = ApplyContext(page=page, browser=ctx_browser, config=config, profile=profile,
                        submit_mode=submit_mode, dry_run=dry_run, run_id=run_id)
     if adapter is None:
+        ctx.record_layer("ats_router", "needs_review", f"no_adapter:{job.ats}")
         reason = f"no adapter enabled for ats={job.ats}"
         try:
             page.goto(job.url, wait_until="domcontentloaded", timeout=15000)
         except Exception as e:
-            reason += f"; page load failed: {type(e).__name__}: {str(e)[:180]}"
-            log.info("could not load unsupported ATS page %s: %s", job.url, e)
+            reason += f"; page load failed: {type(e).__name__}"
+            log.info("could not load unsupported ATS page %s: %s", job.url, type(e).__name__)
         return ApplyResult(ApplyStatus.NEEDS_REVIEW, reason, screenshot=ctx.screenshot(job, "no_adapter"),
-                           final_url=getattr(page, "url", None))
+                           final_url=getattr(page, "url", None), layer_trace=ctx.layer_trace.copy())
     log.info("applying [%s] %s - %s (%s)", adapter.name, job.company, job.title, job.url)
+    ctx.record_layer("ats_router", "selected", adapter.name)
     try:
         result = adapter.apply(job, ctx)
     except Exception as e:
-        msg = f"{type(e).__name__}: {e}"
-        if any(s in msg for s in _BROWSER_DEAD):
+        if any(s in str(e) for s in _BROWSER_DEAD):
+            try:
+                setattr(e, "_apply_layer_trace", ctx.layer_trace.copy())
+            except Exception:
+                pass
             raise
-        log.exception("adapter crashed on %s", job.url)
-        result = ApplyResult(ApplyStatus.FAILED, f"adapter crash: {msg[:300]}",
+        log.error("adapter crashed on %s: %s", job.url, type(e).__name__)
+        result = ApplyResult(ApplyStatus.FAILED, f"adapter crash: {type(e).__name__}",
                              screenshot=ctx.screenshot(job, "crash"))
     if ctx.scope_block_reason:
-        return ApplyResult(ApplyStatus.NEEDS_REVIEW, f"final submit blocked: {ctx.scope_block_reason}"[:500],
+        result = ApplyResult(ApplyStatus.NEEDS_REVIEW, f"final submit blocked: {ctx.scope_block_reason}"[:500],
                            screenshot=result.screenshot, final_url=result.final_url,
                            fields_total=result.fields_total, unanswered_required=result.unanswered_required,
-                           generated_answers=result.generated_answers, answers=result.answers)
+                           generated_answers=result.generated_answers, answers=result.answers,
+                           layer_trace=result.layer_trace)
+    result.layer_trace = ctx.layer_trace.copy() + result.layer_trace
+    if not result.screenshot:
+        result = replace(result, screenshot=ctx.screenshot(job, result.status.value))
     return result
 
 
@@ -155,8 +164,20 @@ def _worker(wid: int, jobs: "queue.Queue[Job]", stats: BatchStats, config: dict,
                     try:
                         result = _run_one(job, browser, config, profile, submit_mode, dry_run, stats.run_id)
                     except Exception as e:
-                        why = f"job timeout ({job_timeout}s)" if timed_out.is_set() else f"browser died: {e}"
-                        crash = _guard_uncertain_submit(job, ApplyResult(ApplyStatus.FAILED, why[:300]),
+                        why = f"job timeout ({job_timeout}s)" if timed_out.is_set() else f"browser died: {type(e).__name__}"
+                        screenshot = None
+                        try:
+                            pages = browser.pages
+                            if pages:
+                                screenshot = ApplyContext(
+                                    page=pages[0], browser=browser, config=config, profile=profile,
+                                    submit_mode=submit_mode, dry_run=dry_run, run_id=stats.run_id,
+                                ).screenshot(job, "browser_error")
+                        except Exception:
+                            pass  # A dead browser cannot produce a screenshot.
+                        crash = _guard_uncertain_submit(job, ApplyResult(
+                            ApplyStatus.FAILED, why[:300], screenshot=screenshot,
+                            layer_trace=getattr(e, "_apply_layer_trace", [])),
                                                         dry_run, stats.run_id)
                         db.record_application(job, crash, stats.run_id)
                         db.set_job_status(job.id, _job_status_for(crash, job, dry_run, prev))
@@ -196,7 +217,7 @@ def _worker(wid: int, jobs: "queue.Queue[Job]", stats: BatchStats, config: dict,
                     if not jobs.empty():
                         time.sleep(gap)
         except Exception as e:
-            log.error("worker %d browser error: %s", wid, e)
+            log.error("worker %d browser error: %s", wid, type(e).__name__)
             time.sleep(5)
 
 

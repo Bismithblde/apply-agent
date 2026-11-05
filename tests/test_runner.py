@@ -9,7 +9,7 @@ import pytest
 
 from agent import db, report, runner, scheduler
 from agent.ats.base import Answer, ApplyContext, Field, blocked_result, submit_decision
-from agent.models import ApplyResult, ApplyStatus, Job, normalize_url
+from agent.models import ApplyResult, ApplyStatus, Job, LayerEvent, normalize_url
 from agent.filters import policy_fingerprint
 
 
@@ -84,6 +84,23 @@ def _jobs(n, ats="greenhouse"):
     return [Job(id=f"t:{i}", company=f"Co{i}", title=f"Software Engineer Intern {i}", url=f"https://x.com/{i}",
                 locations=["NYC"], category="Software", date_posted=1000 - i, source="test", ats=ats)
             for i in range(n)]
+
+
+def test_upsert_preserves_distinct_direct_ats_requisitions(tmp_db):
+    jobs = [Job(id=f"greenhouse:acme:{i}", company="Acme", title="Software Engineer Intern",
+                url=f"https://job-boards.greenhouse.io/acme/jobs/{i}", locations=["New York, NY"],
+                category="Software", date_posted=100, source="ats_boards", ats="greenhouse")
+            for i in (101, 102)]
+    assert db.upsert_jobs(jobs) == 2
+    assert db.upsert_jobs(jobs) == 0
+    with db.connect() as c:
+        assert {row[0] for row in c.execute("SELECT id FROM jobs")} == {j.id for j in jobs}
+
+
+def test_upsert_still_dedupes_aggregator_title_collision(tmp_db):
+    first, second = _jobs(2)
+    second.company, second.title = first.company, first.title
+    assert db.upsert_jobs([first, second]) == 1
 
 
 def _run(monkeypatch, results, delay=0.0, **kw):
@@ -166,6 +183,37 @@ def test_browser_crashes_exhaust_attempts(tmp_db, monkeypatch):
     assert db.get_job_status("t:0") == "failed"
 
 
+def test_browser_crash_preserves_layer_trace(tmp_db, monkeypatch):
+    job = _jobs(1)[0]
+    db.upsert_jobs([job])
+    config = {"auto_ats": ["greenhouse"], "seconds_between_applications": 0,
+              "max_submissions_per_run": 1, "max_submissions_per_night": 5,
+              "filters": _FILTERS, "schedule": {"concurrency": 1, "job_timeout": "10s"}}
+    _attest_job(job, config)
+
+    class TraceCrashAdapter:
+        name = "trace-crash"
+
+        def apply(self, job, ctx):
+            ctx.record_layer("computer_use", "attempted", "simulated")
+            raise RuntimeError("Browser has been closed")
+
+    monkeypatch.setattr(runner, "adapter_for", lambda job, auto: TraceCrashAdapter())
+    monkeypatch.setattr(runner, "open_browser", fake_browser)
+    monkeypatch.setattr(runner, "new_page", lambda b: FakePage())
+    monkeypatch.setattr(runner.time, "sleep", lambda seconds: None)
+
+    runner.apply_batch(config, {}, limit=1)
+
+    row = db.latest_application(job.id)
+    trace = json.loads(row["layer_trace_json"])
+    assert trace[0]["layer"] == "ats_router"
+    assert trace[-1] == {
+        "layer": "computer_use", "outcome": "attempted", "detail": "simulated",
+        "fields_total": 0, "fields_verified": 0,
+    }
+
+
 def test_job_watchdog_kills_hung_browser(tmp_db, monkeypatch):
     jobs = _jobs(2)
     db.upsert_jobs(jobs)
@@ -216,6 +264,21 @@ def test_stuck_job_with_submitted_record_stays_submitted(tmp_db):
     db.set_job_status(job.id, db.IN_PROGRESS)
     db.reset_stuck_jobs(2)
     assert db.get_job_status(job.id) == "submitted"
+
+
+def test_application_persists_layer_trace(tmp_db):
+    job = _jobs(1)[0]
+    db.upsert_jobs([job])
+    event = LayerEvent("computer_use", "verified", "field_repairs=1;verified=1", 1, 1)
+    app_id = db.record_application(
+        job, ApplyResult(ApplyStatus.NEEDS_REVIEW, "manual review", layer_trace=[event]), 1,
+    )
+    with db.connect() as c:
+        row = c.execute("SELECT layer_trace_json FROM applications WHERE id=?", (app_id,)).fetchone()
+    assert json.loads(row["layer_trace_json"]) == [{
+        "layer": "computer_use", "outcome": "verified", "detail": "field_repairs=1;verified=1",
+        "fields_total": 1, "fields_verified": 1,
+    }]
 
 
 def test_reset_stuck_job_uses_current_run_intent_and_keeps_journal(tmp_db):
@@ -727,6 +790,14 @@ def test_adapter_crash_is_recorded_not_raised(tmp_db, monkeypatch):
     assert "adapter crash" in db.latest_application("t:0")["reason"]
 
 
+def test_adapter_exception_does_not_expose_applicant_data(tmp_db, monkeypatch, caplog):
+    db.upsert_jobs(_jobs(1))
+    secret = "applicant-private-test-sentinel"
+    _run(monkeypatch, {"t:0": ValueError(f"unexpected response included {secret}")})
+    assert secret not in db.latest_application("t:0")["reason"]
+    assert secret not in caplog.text
+
+
 def test_report_lists_sections(tmp_db, monkeypatch):
     db.upsert_jobs(_jobs(2))
     _run(monkeypatch, {"t:0": ApplyResult(ApplyStatus.SUBMITTED, "ok"),
@@ -777,7 +848,8 @@ def test_hung_apply_subprocess_is_killed(tmp_path):
     marker = tmp_path / "grandchild.pid"
     script = f"import subprocess,time; p=subprocess.Popen(['sleep','60']); open(r'{marker}','w').write(str(p.pid)); time.sleep(60)"
     t0 = time.time()
-    scheduler._run_apply_subprocess(1, cmd=[scheduler.sys.executable, "-c", script])
+    with pytest.raises(TimeoutError, match="apply batch exceeded"):
+        scheduler._run_apply_subprocess(1, cmd=[scheduler.sys.executable, "-c", script])
     assert time.time() - t0 < 15
     pid = int(marker.read_text())
     time.sleep(0.2)
@@ -797,3 +869,49 @@ def test_apply_once_records_last_apply_even_on_error(tmp_db, monkeypatch):
     with pytest.raises(RuntimeError):
         scheduler.apply_once({})
     assert not scheduler._due("last_apply", "30m")
+
+
+def test_apply_failure_is_reported_as_failure(tmp_db, monkeypatch):
+    notifications = []
+    monkeypatch.setattr(scheduler, "notify", lambda *a, **kw: notifications.append((a, kw)))
+    monkeypatch.setattr(scheduler.report, "build", lambda: pytest.fail("failed batch must not report success"))
+
+    def bad_exit(timeout, cmd=None):
+        raise scheduler.subprocess.CalledProcessError(2, ["python", "-m", "agent", "apply"])
+
+    monkeypatch.setattr(scheduler, "_run_apply_subprocess", bad_exit)
+    with pytest.raises(scheduler.subprocess.CalledProcessError):
+        scheduler.apply_once({})
+    assert notifications[0][0][0] == "apply-agent run failed"
+    assert notifications[0][1]["urgent"] is True
+    assert not scheduler._due("last_apply", "30m")
+
+
+def test_failed_only_batch_sends_notification(tmp_db, monkeypatch):
+    notifications = []
+    monkeypatch.setattr(scheduler, "_run_apply_subprocess", lambda timeout: None)
+    monkeypatch.setattr(scheduler, "_last_apply_run", lambda since: {
+        "id": 42, "submitted": 0, "queued": 0, "failed": 3,
+    })
+    monkeypatch.setattr(scheduler.report, "build", lambda: ("report.md", "3 failed"))
+    monkeypatch.setattr(scheduler, "notify", lambda *a, **kw: notifications.append((a, kw)))
+    scheduler.apply_once({})
+    assert notifications[0][0][0] == "apply-agent run finished"
+    assert "3 failed" in notifications[0][0][1]
+
+
+def test_nonzero_apply_exit_is_not_silent(tmp_path):
+    with pytest.raises(scheduler.subprocess.CalledProcessError) as err:
+        scheduler._run_apply_subprocess(10, cmd=[scheduler.sys.executable, "-c", "raise SystemExit(3)"])
+    assert err.value.returncode == 3
+
+
+def test_adapter_result_without_screenshot_gets_capture(monkeypatch):
+    job = _jobs(1)[0]
+    monkeypatch.setattr(runner, "adapter_for", lambda job, ats: ScriptedAdapter({
+        job.id: ApplyResult(ApplyStatus.NEEDS_REVIEW, "unanswered required"),
+    }))
+    monkeypatch.setattr(runner, "new_page", lambda browser: FakePage())
+    monkeypatch.setattr(ApplyContext, "screenshot", lambda self, job, tag: f"{job.id}-{tag}.png")
+    result = runner._run_one(job, FakeBrowser(), {}, {}, "fill_only", True, 1)
+    assert result.screenshot == f"{job.id}-needs_review.png"

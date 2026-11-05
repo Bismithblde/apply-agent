@@ -8,5 +8,6 @@ __pycache__/
 *.pyd
 browser-profile*/
 secrets/
+profile.yaml
 .pytest_cache/
 *.log

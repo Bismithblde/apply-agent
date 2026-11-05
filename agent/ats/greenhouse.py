@@ -90,7 +90,7 @@ class GreenhouseAdapter:
                                screenshot=shot, final_url=page.url)
         scope.locator(_FORM_SEL).first.scroll_into_view_if_needed(timeout=5000)
         job_text = page_text(page)
-        fields, answers, failed = fill_form(scope, job, ctx.profile, job_text=job_text)
+        fields, answers, failed = fill_form(scope, job, ctx.profile, job_text=job_text, layer_context=ctx)
         if not fields:
             return ApplyResult(ApplyStatus.NEEDS_REVIEW, "no fields found", screenshot=ctx.screenshot(job, "empty"),
                                final_url=page.url)

@@ -265,7 +265,7 @@ def cmd_pick(a) -> int:
     try:
         prior_apps.sync_email_confirmations(max_results=50)
     except Exception as exc:
-        log.debug("prior application sync skipped: %s", exc)
+        logging.getLogger(__name__).debug("prior application sync skipped (%s)", type(exc).__name__)
 
     last_apply_val = db.kv_get("last_apply")
     since_ts = float(last_apply_val) if last_apply_val and not a.all else None

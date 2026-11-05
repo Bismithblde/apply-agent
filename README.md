@@ -7,6 +7,10 @@ site accounts in an encrypted vault. Everything it does is logged, with a screen
 
 ## Setup (about 10 minutes)
 
+Complete your local `profile.yaml` with accurate information before the first run. On a new clone,
+`./setup.sh` creates it from `profile.example.yaml`. The personal profile is ignored by Git.
+Keep applicant details and application answers out of commits, especially in public repositories.
+
 ```bash
 ./setup.sh
 ```
@@ -59,7 +63,7 @@ systemctl --user stop apply-agent                # stop
 You can keep using the laptop while the service runs. When `xvfb-run` is installed, its browser uses a private
 headed display and does not take focus; without Xvfb it runs headless. The process runs at low CPU priority.
 Keep the laptop plugged in with the lid open; idle sleep is blocked while the service runs. The scheduler sends
-a run notification only when a run submitted or queued jobs, and sends its daily report notification once after
+a run notification when a run submits, queues, or fails jobs, and alerts on batch crashes or timeouts. It sends its daily report once after
 8 AM. ntfy delivery requires `NTFY_TOPIC` in `.env` and a subscription in the ntfy phone app; desktop delivery
 requires `notify-send`.
 

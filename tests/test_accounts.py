@@ -1,4 +1,5 @@
 import base64
+import logging
 import time
 
 import pytest
@@ -383,6 +384,61 @@ def test_pick_option_index_direct_match():
     assert workday._pick_option_index(texts, "option a") == 1
 
 
+@pytest.mark.parametrize('answer', ['Yes', True, 'Agree', 'I Agree', 'I Accept'])
+def test_workday_unqualified_affirmative_never_selects_qualified_agreement(answer):
+    choices = ['Select One', 'Yes, I accept binding arbitration',
+               'I agree to waive my right to a jury trial', 'No, I decline']
+    assert workday._pick_option_index(choices, answer, is_required=True) is None
+    assert workday._legal_option_index(choices, answer) is None
+    assert workday._pick_option_index(choices, 'Yes, I accept binding arbitration') == 1
+    assert workday._legal_option_index(choices, 'Yes, I accept binding arbitration') == 1
+    assert workday._pick_option_index(['Select One', 'Yes', 'No'], answer) == 1
+
+
+@pytest.mark.parametrize('label,info,wanted', [
+    ('Are you a US citizen?', {}, 'Yes'),
+    ('Are you a US citizen?', {'authorized_us': True}, 'Yes'),
+    ('Are you legally authorized to work in the United States?', {'us_citizen': True}, 'Yes'),
+    ('Will you require visa sponsorship?', {'authorized_us': True}, 'No'),
+    ('Are you willing to relocate?', {}, 'Yes'),
+    ('What is your degree?', {'school': 'Example University'}, "Bachelor's"),
+    ('School', {'degree': "Bachelor's"}, 'Example University'),
+    ('Field of Study', {'degree': "Bachelor's"}, 'Computer Science'),
+    ('Skills', {}, 'Python'),
+    ('How did you hear about us?', {'school': 'Example University'}, 'Simplify'),
+    ('Will you require sponsorship?', {'needs_sponsorship': 'unknown'}, 'No'),
+    ('Are you a US citizen?', {'us_citizen': False}, 'Yes'),
+    ('Will you require visa sponsorship?', {'needs_sponsorship': False}, 'Yes'),
+    ('Are you a US citizen?', {'us_citizen': True}, ''),
+])
+def test_ai_pick_option_requires_matching_applicant_evidence(monkeypatch, label, info, wanted):
+    def should_not_call_llm(*args, **kwargs):
+        pytest.fail('AI must not be invoked for unsupported applicant facts')
+
+    monkeypatch.setattr(llm, 'generate_json', should_not_call_llm)
+    assert workday._ai_pick_option(label, ['Select One', 'Yes', 'No', 'Other'], info, wanted) is None
+
+
+def test_ai_pick_option_uses_only_confirmed_facts(monkeypatch):
+    prompts = []
+
+    def fake_generate_json(prompt, schema):
+        prompts.append(prompt)
+        return {'chosen_option': 'Other Job Board'}
+
+    monkeypatch.setattr(llm, 'generate_json', fake_generate_json)
+    info = {'how_did_you_hear': 'Simplify', 'us_citizen': None, 'authorized_us': None,
+            'needs_sponsorship': None, 'school': 'unknown'}
+    assert workday._ai_pick_option('How did you hear about us?',
+                                   ['Select One', 'Career Fair', 'Other Job Board'], info, 'Simplify') == 2
+    assert len(prompts) == 1
+    assert '"how_did_you_hear": "Simplify"' in prompts[0]
+    assert '"us_citizen"' not in prompts[0]
+    assert '"authorized_us"' not in prompts[0]
+    assert '"needs_sponsorship"' not in prompts[0]
+    assert '"school"' not in prompts[0]
+
+
 def test_unmatched_required_options_are_not_guessed():
     for texts in (["Select One", "Accounting", "Other"], ["Select One", "Morning", "Evening"]):
         assert workday._pick_option_index(texts, "Computer Science", is_required=True) is None
@@ -461,6 +517,77 @@ def test_choose_option_referral_and_phone(page):
     assert run.choose_option(phone_btn, "Mobile")
     assert phone_btn.inner_text() == "Mobile"
     assert run.answers["aa-phone"].value == "Mobile"
+
+
+def test_workday_logs_hide_answer_values(page, caplog):
+    secret = "PrivateAnswerToken9375"
+    run = workday._Run(_job(), _Ctx(page))
+    with caplog.at_level(logging.INFO, logger=workday.__name__):
+        page.set_content('<input id="private" data-aa-key="aa-private" type="text">')
+        plain = workday.Field('aa-private', 'Applicant ID', 'text', True)
+        assert run.fill_workday_widget(plain, workday.Answer(plain.key, secret, 'profile', f'note: {secret}'))
+        assert page.locator('#private').input_value() == secret
+
+        page.set_content(f'<button data-aa-key="aa-existing">{secret}</button>')
+        existing = workday.Field('aa-existing', 'Prior selection', 'select', True)
+        assert run.fill_workday_widget(existing, workday.Answer(existing.key, secret, 'bank'))
+        assert run.answers[existing.key].value == secret
+
+        page.set_content(f'''<div data-automation-id="formField-choice">
+            <button id="choice" data-aa-key="aa-choice" aria-haspopup="listbox"
+                    onclick="document.getElementById('options').style.display='block'">Select One</button>
+            <div id="options" role="listbox" style="display:none">
+              <div role="option" onclick="document.getElementById('choice').textContent=this.textContent;
+                   this.parentElement.style.display='none'">{secret}</div>
+            </div></div>''')
+        choice = workday.Field('aa-choice', 'Choice', 'select', True)
+        assert run.choose_option(page.locator('#choice'), secret, field=choice)
+        assert run.answers[choice.key].value == secret
+
+    assert secret not in caplog.text
+    assert 'source=profile' in caplog.text
+    assert 'existing selection matched' in caplog.text
+    assert 'found 1 options' in caplog.text
+    assert 'picked=True' in caplog.text
+
+
+@pytest.mark.parametrize('requested', ['Python', 'Rust'])
+def test_workday_existing_selection_records_actual_matched_item(page, requested):
+    page.set_content('''<div data-automation-id="formField-skills">
+      <button id="skills" data-aa-key="aa-skills" aria-haspopup="listbox">Edit skills</button>
+      <ul><li>Python</li><li>Rust</li></ul>
+    </div>''')
+    run = workday._Run(_job(), _Ctx(page))
+    field = workday.Field('aa-skills', 'Skills', 'combobox', True)
+
+    assert run._control_values(page.locator('#skills')) == ['Python', 'Rust']
+    assert run.fill_workday_widget(field, workday.Answer(field.key, requested, 'profile'))
+    assert run.answers[field.key].value == requested
+    assert run.answers[field.key].source == 'profile'
+    assert field.current_value == requested
+    assert page.locator('#skills').inner_text() == 'Edit skills'
+
+
+def test_choose_option_ai_caller_passes_only_profile_facts(page, monkeypatch):
+    page.set_content('''<div data-automation-id="formField-degree">
+      <label>Degree*</label><button id="degree" data-aa-key="aa-degree" aria-haspopup="listbox"
+        onclick="document.querySelector('[role=listbox]').style.display='block'">Select One</button>
+      <div role="listbox" style="display:none"><div role="option">MBA</div>
+        <div role="option">Associate of Arts</div></div>
+    </div>''')
+    captured = []
+
+    def record_ai_call(label, texts, info, wanted):
+        captured.append(info)
+        return None
+
+    monkeypatch.setattr(workday, '_ai_pick_option', record_ai_call)
+    run = workday._Run(_job(), _Ctx(page))
+    field = workday.Field('aa-degree', 'Degree', 'select', True)
+    assert not run.choose_option(page.locator('#degree'), 'Unlisted Qualification', field=field)
+    assert captured
+    for fact in ('us_citizen', 'authorized_us', 'needs_sponsorship', 'willing_to_relocate'):
+        assert captured[0].get(fact) is None
 
 
 def test_choose_option_required_fallback(page):
@@ -1474,6 +1601,84 @@ def test_workday_single_terms_checkbox_requires_explicit_consent_and_real_state(
     assert run.review().unanswered_required == [question]
 
 
+@pytest.mark.parametrize('agreement', [
+    'I accept the terms and conditions',
+    'I acknowledge the privacy policy',
+    'I agree to mandatory binding arbitration',
+    'I certify that my application is accurate',
+])
+@pytest.mark.parametrize('preference', ['consent_all', 'terms_consent'])
+def test_workday_broad_consent_does_not_check_a_legal_agreement(page, monkeypatch, agreement, preference):
+    page.set_content(f'''<div data-automation-id="applyFlowPage">
+      <div data-automation-id="formField-legal"><label for="agreement">{agreement}*</label>
+      <input id="agreement" type="checkbox" required></div></div>''')
+    monkeypatch.setattr(llm, 'generate_json', lambda *a, **k: pytest.fail('must not guess legal consent'))
+    ctx = _Ctx(page)
+    ctx.profile = {'preferences': {preference: True}}
+    run = workday._Run(_job(), ctx)
+    run.fill_step('Voluntary Disclosures')
+    run.fill_step('Voluntary Disclosures', repair=['This agreement is required'])
+    assert not page.locator('#agreement').is_checked()
+    field = next(iter(run.fields.values()))
+    assert run.answers[field.key].source == 'unknown'
+    assert run.review().unanswered_required == [agreement]
+
+
+def test_workday_confirmation_for_one_agreement_cannot_approve_another(page, monkeypatch):
+    terms = 'I have read and agree to the terms'
+    arbitration = 'I consent to binding arbitration'
+    page.set_content(f'''<div data-automation-id="applyFlowPage">
+      <div data-automation-id="formField-terms"><label for="terms">{terms}*</label>
+      <input id="terms" type="checkbox" required></div>
+      <div data-automation-id="formField-arbitration"><label for="arbitration">{arbitration}*</label>
+      <input id="arbitration" type="checkbox" required></div></div>''')
+    monkeypatch.setattr(llm, 'generate_json', lambda *a, **k: pytest.fail('must not guess legal consent'))
+    ctx = _Ctx(page)
+    ctx.profile = {'preferences': {'consent_all': True, 'terms_consent': True},
+                   'company_answers': {_job().company: {terms: True}}}
+    run = workday._Run(_job(), ctx)
+    run.fill_step('My Information')
+    run.fill_step('My Information', repair=['Arbitration agreement required'])
+    assert page.locator('#terms').is_checked()
+    assert not page.locator('#arbitration').is_checked()
+    assert run.review().unanswered_required == [arbitration]
+
+
+@pytest.mark.parametrize('kind', ['native', 'prompt', 'radio'])
+@pytest.mark.parametrize('confirmed', [None, 'Yes', 'Yes, I accept binding arbitration'])
+def test_workday_qualified_legal_option_needs_exact_confirmed_choice(workday_choice, kind, confirmed):
+    question = 'Do you accept mandatory binding arbitration?'
+    choice = 'Yes, I accept binding arbitration'
+    page = workday_choice(question, [choice, 'No, I decline'], kind=kind)
+    ctx = _Ctx(page)
+    ctx.profile = {'preferences': {'consent_all': True, 'terms_consent': True}}
+    if confirmed is not None:
+        ctx.profile['company_answers'] = {_job().company: {question: confirmed}}
+    run = workday._Run(_job(), ctx)
+    run.fill_step('Application Questions')
+    run.fill_step('Application Questions', repair=['Arbitration response required'])
+    field = next(f for f in run.fields.values() if f.kind in ('select', 'radio'))
+    answer = run.answers[field.key]
+    if confirmed == choice:
+        assert answer.source == 'bank'
+        assert answer.value == choice
+        if kind == 'radio':
+            assert page.locator('input:checked').input_value() == choice
+        elif kind == 'native':
+            assert page.locator('#choice').input_value() == choice
+        else:
+            assert page.locator('#choice').inner_text() == choice
+    else:
+        assert answer.source == 'unknown'
+        if kind == 'radio':
+            assert page.locator('input:checked').count() == 0
+        elif kind == 'native':
+            assert page.locator('#choice').input_value() == 'Select One'
+        else:
+            assert page.locator('#choice').inner_text() == 'Select One'
+        assert run.review().unanswered_required == [question]
+
+
 def test_workday_rejected_checkbox_click_is_not_forged_or_counted_as_an_answer(page):
     question = 'I agree to the terms and conditions'
     page.set_content(f'''<div data-automation-id="applyFlowPage"><div data-automation-id="formField-terms">
@@ -1629,3 +1834,19 @@ def test_workday_review_rechecks_after_captcha_before_recording_submit_intent(pa
     assert result.status == workday.ApplyStatus.NEEDS_REVIEW
     assert 'review verification failed' in result.reason
     assert page.locator(workday.NEXT).get_attribute('data-clicked') is None
+
+
+def test_workday_review_blocks_known_answer_missing_from_controls_and_summary(page):
+    page.set_content(f'''<div data-automation-id="applyFlowPage">{_progress('Review')}
+      <button data-automation-id="bottom-navigation-next-button">Submit</button></div>''')
+    ctx = _Ctx(page)
+    ctx.submit_mode, ctx.dry_run = 'full', False
+    run = workday._Run(_job(), ctx)
+    field = workday.Field('school', 'School or University', 'text', True, name='school')
+    run.fields[field.key] = field
+    run.answers[field.key] = workday.Answer(field.key, 'Stony Brook University', 'profile')
+
+    issues = run.verify_review()
+
+    assert issues == ['School or University']
+    assert run.answers[field.key].source == 'unknown'

@@ -63,7 +63,7 @@ class AshbyAdapter:
             return ApplyResult(ApplyStatus.NEEDS_REVIEW, "Ashby application form not found",
                                screenshot=shot, final_url=page.url)
         scope = page.main_frame
-        fields, answers, failed = fill_form(scope, job, ctx.profile, job_text=job_text)
+        fields, answers, failed = fill_form(scope, job, ctx.profile, job_text=job_text, layer_context=ctx)
         if not fields:
             return ApplyResult(ApplyStatus.NEEDS_REVIEW, "no fields found", screenshot=ctx.screenshot(job, "empty"),
                                final_url=page.url)

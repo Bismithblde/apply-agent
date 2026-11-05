@@ -9,7 +9,7 @@ from typing import Protocol
 from playwright.sync_api import BrowserContext, Page
 
 from ..config import SCREENSHOT_DIR
-from ..models import Answer, ApplyResult, ApplyStatus, Field, Job
+from ..models import Answer, ApplyResult, ApplyStatus, Field, Job, LayerEvent
 
 
 @dataclass
@@ -25,6 +25,16 @@ class ApplyContext:
     run_id: int | None = None
     notes: list[str] = field(default_factory=list)
     scope_block_reason: str | None = field(default=None, init=False)
+    layer_trace: list[LayerEvent] = field(default_factory=list)
+
+    def record_layer(self, layer: str, outcome: str, detail: str = "", *,
+                     fields_total: int = 0, fields_verified: int = 0) -> None:
+        """Record redacted layer evidence; details must never contain applicant answers."""
+        self.layer_trace.append(LayerEvent(
+            layer=layer, outcome=outcome, detail=detail[:240],
+            fields_total=max(0, int(fields_total)),
+            fields_verified=max(0, min(int(fields_verified), int(fields_total))),
+        ))
 
     def mark_submit_attempt(self, job_id: str) -> None:
         """Persist final-submit intent before the click, in case the worker dies afterwards."""
@@ -37,6 +47,7 @@ class ApplyContext:
         from .. import db
         try:
             db.record_submit_intent(job_id, self.run_id, self.config)
+            self.record_layer("submit_gate", "intent_persisted", "final_submit_allowed")
         except db.ScopeEvidenceRejected as e:
             self.scope_block_reason = str(e)
             raise

@@ -49,6 +49,72 @@ def _text_matches(candidate: Any, target: str) -> bool:
     return False
 
 
+def _validated_field_action(page: Page, locator: Locator | None, x: int, y: int,
+                            target_value: str, action: str) -> bool:
+    """Allow a visual field action only on its control or the matching option."""
+    try:
+        hit = page.evaluate(
+            """([x, y]) => {
+              const el = document.elementFromPoint(x, y);
+              if (!el) return null;
+              const control = el.closest('button, a, input[type=submit], input[type=button], [role=button]');
+              const safeDropdown = !!control && control.tagName === 'BUTTON' &&
+                (control.type || 'submit').toLowerCase() === 'button' &&
+                (control.getAttribute('aria-haspopup') === 'listbox' || control.getAttribute('role') === 'combobox' ||
+                 control.hasAttribute('aria-expanded'));
+              const option = el.closest('[role=option], option, [aria-selected], [data-value]');
+              return {dangerous: !!control && !safeDropdown, safeDropdown,
+                optionText: option ? (option.innerText || option.textContent || '').trim() : ''};
+            }""",
+            [x, y],
+        )
+        if not isinstance(hit, dict):
+            return False
+        if hit.get("dangerous"):
+            if action != "click" or not hit.get("safeDropdown") or locator is None:
+                return False
+            return _point_hits_locator(locator, x, y)
+        if action == "click" and _text_matches(hit.get("optionText"), target_value):
+            if locator is None:
+                return False
+            return bool(locator.evaluate(
+                """(el, [x, y]) => {
+                  const hit = el.ownerDocument.elementFromPoint(x, y);
+                  const option = hit && hit.closest('[role=option], option, [aria-selected], [data-value]');
+                  if (!option) return false;
+                  const ids = `${el.getAttribute('aria-controls') || ''} ${el.getAttribute('aria-owns') || ''}`
+                    .split(/\\s+/).filter(Boolean);
+                  const controlled = ids.map(id => el.ownerDocument.getElementById(id)).filter(Boolean);
+                  if (controlled.some(root => root === option || root.contains(option) || option.contains(root))) return true;
+                  const field = el.closest('[role=combobox], [role=group], [data-automation-id^="formField-"]');
+                  return !!field && field.contains(option);
+                }""",
+                [x, y],
+            ))
+        if locator is None:
+            return False
+        return _point_hits_locator(locator, x, y)
+    except Exception as e:
+        log.warning("Could not validate vision field action (%s)", type(e).__name__)
+        return False
+
+
+def _point_hits_locator(locator: Locator, x: int, y: int) -> bool:
+    bbox = locator.bounding_box()
+    if not bbox or bbox.get("width", 0) <= 0 or bbox.get("height", 0) <= 0:
+        return False
+    if not (bbox["x"] <= x < bbox["x"] + bbox["width"]
+            and bbox["y"] <= y < bbox["y"] + bbox["height"]):
+        return False
+    return bool(locator.evaluate(
+        """(el, [x, y]) => {
+          const hit = el.ownerDocument.elementFromPoint(x, y);
+          return !!hit && (hit === el || el.contains(hit) || hit.contains(el));
+        }""",
+        [x, y],
+    ))
+
+
 def _settle(page: Page, timeout_ms: int = 500) -> None:
     try:
         page.wait_for_timeout(timeout_ms)
@@ -62,13 +128,30 @@ def _settle(page: Page, timeout_ms: int = 500) -> None:
 
 def verify_option_selected(page: Page, box_locator: Locator | None, option_value: str) -> bool:
     """Verifies whether option_value is currently selected in box_locator or on page."""
-    if not option_value:
+    if not option_value or box_locator is None:
         return False
 
     if box_locator is not None:
         try:
             txt = box_locator.inner_text(timeout=1000)
             if _text_matches(txt, option_value):
+                return True
+        except Exception:
+            pass
+
+        # Portaled dropdowns are allowed only when the target control explicitly owns
+        # the listbox that contains the selected option.
+        try:
+            controlled = box_locator.evaluate("""el => {
+              const ids = `${el.getAttribute('aria-controls') || ''} ${el.getAttribute('aria-owns') || ''}`
+                .split(/\\s+/).filter(Boolean);
+              return ids.flatMap(id => {
+                const root = el.ownerDocument.getElementById(id);
+                return root ? [...root.querySelectorAll('[aria-selected="true"], [data-selected="true"]')]
+                  .map(item => item.innerText || item.textContent || '') : [];
+              });
+            }""")
+            if any(_text_matches(text, option_value) for text in controlled or []):
                 return True
         except Exception:
             pass
@@ -107,23 +190,13 @@ def verify_option_selected(page: Page, box_locator: Locator | None, option_value
         except Exception:
             pass
 
-    # Check page-level indicators
     try:
-        page_selected = page.locator(
-            '[aria-selected="true"], [data-selected="true"], [role="option"][aria-selected="true"]'
-        )
-        count = page_selected.count()
-        if isinstance(count, int):
-            for idx in range(min(count, 10)):
-                item_text = page_selected.nth(idx).inner_text(timeout=500)
-                if _text_matches(item_text, option_value):
-                    return True
-    except Exception:
-        pass
-
-    try:
-        active_val = page.evaluate(
-            "() => document.activeElement ? (document.activeElement.value || document.activeElement.innerText || '') : ''"
+        active_val = box_locator.evaluate(
+            """el => {
+              const active = el.ownerDocument.activeElement;
+              if (!active || !(active === el || el.contains(active) || active.contains(el))) return '';
+              return active.value || active.innerText || '';
+            }"""
         )
         if _text_matches(active_val, option_value):
             return True
@@ -139,6 +212,8 @@ def locate_and_act(
     target_value: str | None = None,
     action_hint: str = "click",
     locator: Locator | None = None,
+    context: str = "",
+    allow_locator_fallback: bool = True,
 ) -> bool:
     """Takes a viewport screenshot, asks LLM to locate the element, maps coordinates, and acts.
 
@@ -147,6 +222,8 @@ def locate_and_act(
     Returns True if an action was successfully executed, False otherwise.
     """
     def _fallback_to_locator() -> bool:
+        if not allow_locator_fallback:
+            return False
         if locator is not None:
             try:
                 bbox = locator.bounding_box()
@@ -176,8 +253,10 @@ def locate_and_act(
     )
     if target_value is not None:
         prompt += f"Target value / text: {target_value}\n"
+    if context:
+        prompt += f"Page and target context:\n{context[:1800]}\n"
     prompt += (
-        f"Preferred action hint: {action_hint}\n"
+        f"Required action: {action_hint}\n"
         f"Identify the center of the target element as normalized coordinates [y, x] in range 0..1000,\n"
         f"where y=0 is top, y=1000 is bottom, x=0 is left, x=1000 is right.\n"
         f"If action is 'click', return 'action': 'click', and 'point': [y, x].\n"
@@ -228,16 +307,34 @@ def locate_and_act(
     except (ValueError, TypeError):
         log.warning("Vision LLM returned non-numeric point: %r", point)
         return _fallback_to_locator()
+    if not (0 <= y_norm < 1000 and 0 <= x_norm < 1000):
+        log.warning("Vision LLM returned out-of-bounds point: %r", point)
+        return _fallback_to_locator()
 
-    px_x = int(point[1] / 1000.0 * viewport_size["width"])
-    px_y = int(point[0] / 1000.0 * viewport_size["height"])
+    if target_value is not None and action != action_hint:
+        log.warning("Vision LLM returned action %r for constrained %r request", action, action_hint)
+        return False
+
+    px_x = int(x_norm / 1000.0 * viewport_size["width"])
+    px_y = int(y_norm / 1000.0 * viewport_size["height"])
+
+    # A visual field action must resolve to the target control or matching option.
+    # This keeps screenshot-selected coordinates away from Submit, Next, and other fields.
+    if target_value is not None and not _validated_field_action(
+            page, locator, px_x, px_y, target_value, action_hint):
+        log.warning("Vision point did not resolve to the target field or matching option")
+        return False
 
     log.info("Vision action %s at (%d, %d) [norm: %s]: %s", action, px_x, px_y, point, reason)
 
     try:
         page.mouse.click(px_x, px_y)
-        text = reply.get("text") or (target_value if action == "type" else None)
+        # When the caller supplies an approved answer, vision may locate the target but
+        # cannot alter the answer text or its provenance.
+        text = target_value if target_value is not None else reply.get("text")
         if action == "type" and text:
+            if target_value is not None:
+                page.keyboard.press("Control+A")
             page.keyboard.type(text, delay=25)
     except Exception as e:
         log.warning("Failed executing vision action %s at (%d, %d): %s", action, px_x, px_y, e)
@@ -280,7 +377,7 @@ def vision_choose_option(
             goal=goal,
             target_value=option_value,
             action_hint="click",
-            locator=box_locator if step == 0 else None,
+            locator=box_locator,
         )
         if not ok:
             return False

@@ -495,11 +495,11 @@ def test_yes_no_options_require_consistent_polarity(isolated_evidence, monkeypat
 
 
 def test_explicit_negative_option_can_be_supported(isolated_evidence, monkeypatch):
-    _mock_cited_answer(monkeypatch, ["I am not a veteran."], "I am not a veteran")
     field = Field("veteran", "What is your veteran status?", "select", True,
                   ["I am not a veteran", "I am a veteran"])
-
-    got = _answer_map([field], {})["veteran"]
+    evidence = answers._Evidence("E1", "knowledge", "confirmed-veteran-status", "I am not a veteran.")
+    got = answers._validate(field, {"source": "bank", "value": "I am not a veteran",
+                                    "evidence_ids": ["E1"]}, [evidence])
 
     assert got.value == "I am not a veteran" and got.source == "bank"
 
@@ -519,7 +519,6 @@ def test_compeer_user_confirmed_answers_survive_a_new_run(isolated_evidence, mon
         answers.llm.LLMUnavailable("offline")))
     job = Job(id="test:compeer", company="Compeer Financial", title="Infrastructure Engineering Intern",
               url="https://example.test/compeer", locations=[], category="Software", date_posted=0)
-    yes_internal = "Yes - Internal team members must apply through Compeer's Internal Careers page."
     labels = [
         "This internship requires full-time work during the summer. Are you able to work 40 hours/week during the summer?",
         "Our internship program requires students to be actively enrolled in college during the time of their internship. Will you be an active college student at the time of this internship?",
@@ -531,18 +530,17 @@ def test_compeer_user_confirmed_answers_survive_a_new_run(isolated_evidence, mon
         "Are you open to relocating for this position, or are you currently within driving distance of the position location?",
     ]
     fields = [Field(str(i), label, "text" if i in {2, 3} else "select", True,
-                    [] if i in {2, 3} else [yes_internal, "No"])
+                    [] if i in {2, 3} else ["Yes", "No"])
               for i, label in enumerate(labels)]
-    got = {a.key: a for a in answers.answer_fields(fields, job, {})}
+    saved = ["Yes", "Yes", "Lakeville, MN", "No", "No", "No", "No", "Yes"]
+    profile = {"company_answers": {"Compeer Financial": dict(zip(labels, saved))}}
+    got = {a.key: a for a in answers.answer_fields(fields, job, profile)}
     assert [got[str(i)].source for i in range(len(fields))] == ["bank"] * len(fields)
-    assert [got[str(i)].value for i in (0, 1, 4, 7)] == [yes_internal] * 4
-    assert got["2"].value.startswith("Lakeville, MN")
-    assert got["3"].value == "No"
-    assert got["5"].value == "No" and got["6"].value == "No"
+    assert [got[str(i)].value for i in range(len(fields))] == saved
 
     other = Job(id="test:other", company="Other Financial", title=job.title, url=job.url,
                 locations=[], category="Software", date_posted=0)
-    outside = answers.answer_fields(fields, other, {})
+    outside = answers.answer_fields(fields, other, profile)
     assert all(a.source == "unknown" for a in outside)
 
 

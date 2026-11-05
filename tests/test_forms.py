@@ -3,7 +3,9 @@ Local HTML fixtures only (page.set_content); agent.llm is always mocked."""
 from __future__ import annotations
 
 import json
+import logging
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -262,6 +264,39 @@ def test_miscommitted_school_blocks_readiness_despite_search_text_and_menu_match
                                      fields, responses, failed, submit_texts=["Submit application"])
     assert result.status == ApplyStatus.NEEDS_REVIEW and "School" in result.reason
     assert not page.evaluate("window.sent || false")
+
+
+def test_uncommitted_combobox_logs_context_without_requested_answer(page, caplog):
+    private_answer = "private-applicant-answer-742"
+    page.set_content(f'''<label for="school">School</label><div class="select-control">
+      <div class="select__single-value">None selected</div>
+      <input id="school" role="combobox" aria-controls="schools" aria-expanded="false"
+        onclick="document.getElementById('schools').hidden=false;this.setAttribute('aria-expanded','true')">
+      <div id="schools" role="listbox" hidden>
+        <div role="option" onclick="document.getElementById('schools').hidden=true;
+          document.getElementById('school').setAttribute('aria-expanded','false')">{private_answer}</div>
+      </div></div>''')
+    field = form.extract_fields(page, probe_options=False)[0]
+    with caplog.at_level(logging.INFO, logger="agent.form"):
+        assert not form._fill_combo(page, page.locator("#school"), field, private_answer)
+    assert "did not commit" in caplog.text
+    assert field.key in caplog.text and field.label in caplog.text
+    assert private_answer not in caplog.text
+
+
+def test_fill_exception_log_does_not_repeat_applicant_answer(page, monkeypatch, caplog):
+    private_answer = "private-applicant-answer-743"
+    page.set_content('<label for="email">Email</label><input id="email" type="email">')
+    field = form.extract_fields(page)[0]
+
+    def fail_fill(*_args):
+        raise RuntimeError(f"input rejected: {private_answer}")
+
+    monkeypatch.setattr(form, "_fill_one", fail_fill)
+    with caplog.at_level(logging.INFO, logger="agent.form"):
+        assert form.fill_fields(page, [field], [Answer(field.key, private_answer, "profile")]) == [field.key]
+    assert field.key in caplog.text and "RuntimeError" in caplog.text
+    assert private_answer not in caplog.text
 
 
 def test_native_select_rechecks_actual_selection_after_change(page):
@@ -655,6 +690,87 @@ def test_optional_eeo_free_text_left_blank():
     assert a["p"].value is None and a["p"].source == "unknown"
 
 
+@pytest.mark.parametrize(("label", "key", "value", "options", "expected"), [
+    ("Hispanic or Latino?", "hispanic_latino", None, ["Yes", "No"], None),
+    ("Disability status", "disability_status", None, ["Yes", "No", "Prefer not to say"], "Prefer not to say"),
+    ("Veteran status", "veteran_status", "Yes", ["Yes", "No", "Decline to answer"], "Yes"),
+    ("Hispanic or Latino?", "hispanic_latino", "No", ["Yes", "No", "Decline to answer"], "No"),
+    ("Veteran status", "veteran_status", "Decline to answer", ["Yes", "No"], None),
+])
+def test_eeo_requires_evidence_or_decline_choice(label, key, value, options, expected):
+    profile = {**PROFILE, "eeo": {key: value} if value is not None else {}}
+    got = answers.answer_fields([Field("eeo", label, "radio", True, options)], JOB, profile)[0]
+    assert got.value == expected
+    assert got.source == ("profile" if expected is not None else "unknown")
+
+
+@pytest.mark.parametrize(("label", "extra", "expected"), [
+    ("Do you have a work permit?", {}, None),
+    ("Do you have a residency permit?", {}, None),
+    ("Do you have a work permit and are you authorized to work in the US?", {}, None),
+    ("Are you legally authorized to work in the US?", {}, "Yes"),
+    ("Do you have a work permit?", {"work_permit": "No"}, "No"),
+    ("Do you have a residency permit?", {"residency_permit": "Yes"}, "Yes"),
+])
+def test_permit_questions_need_separate_profile_evidence(label, extra, expected):
+    profile = {**PROFILE, "work_authorization": {**PROFILE["work_authorization"], **extra}}
+    got = answers.answer_fields([Field("permit", label, "radio", True, ["Yes", "No"])], JOB, profile)[0]
+    assert got.value == expected
+    assert got.source == ("profile" if expected is not None else "unknown")
+
+
+@pytest.mark.parametrize(("months", "options", "expected"), [
+    (None, ["3 months", "13 months"], None),
+    ("3", ["13 months", "3 months"], "3 months"),
+    ("3", ["13 months"], None),
+    ("13", ["3 months", "13 months"], "13 months"),
+])
+def test_duration_never_invents_or_substring_matches(months, options, expected):
+    profile = {**PROFILE, "preferences": {**PROFILE["preferences"]}}
+    if months is not None:
+        profile["preferences"]["internship_months"] = months
+    got = answers.answer_fields([Field("duration", "Internship duration in months", "select", True, options)], JOB, profile)[0]
+    assert got.value == expected
+
+
+def test_non_solicitation_is_independent_from_non_compete():
+    profile = {**PROFILE, "preferences": {**PROFILE["preferences"], "non_compete": "Yes"}}
+    fields = [Field("nc", "Are you subject to a noncompete?", "radio", True, ["Yes", "No"]),
+              Field("ns", "Are you subject to a nonsolicitation agreement?", "radio", True, ["Yes", "No"])]
+    got = {a.key: a for a in answers.answer_fields(fields, JOB, profile)}
+    assert got["nc"].value == "Yes"
+    assert got["ns"].value is None and got["ns"].source == "unknown"
+    profile["preferences"]["non_solicitation"] = "No"
+    assert answers.answer_fields([fields[1]], JOB, profile)[0].value == "No"
+
+
+def test_company_claims_and_qualified_answers_need_exact_evidence():
+    job = replace(JOB, company="Compeer Financial")
+    current = Field("current", "Are you a current team member at Compeer Financial?", "radio", True, ["Yes", "No"])
+    assert answers.answer_fields([current], job, PROFILE)[0].value is None
+    historical = "Have you previously worked for Compeer Financial?"
+    profile = {**PROFILE, "company_answers": {"Compeer Financial": {historical: "Yes"}},
+               "custom_answers": {historical: "Yes"}}
+    fields = [Field("prior", historical, "radio", True, ["Yes", "No"]), current]
+    got = {a.key: a for a in answers.answer_fields(fields, job, profile)}
+    assert got["prior"].value == "Yes"
+    assert got["current"].value is None
+
+
+@pytest.mark.parametrize(("source", "claim", "expected"), [
+    ("generated", "Yes", None),
+    ("bank", "Yes", None),
+    ("generated", "No", "No"),
+])
+def test_factual_generated_options_require_matching_evidence(source, claim, expected):
+    field = Field("employment", "Are you currently employed at Compeer Financial?", "radio", True, ["Yes", "No"])
+    evidence = [answers._Evidence("E1", "profile", "employment.status",
+                                  "No, I am not currently employed at Compeer Financial")]
+    got = answers._validate(field, {"value": claim, "source": source, "evidence_ids": ["E1"]}, evidence)
+    assert got.value == expected
+    assert got.source == (source if expected is not None else "unknown")
+
+
 def test_url_in_label_does_not_match_rules():
     a = _ans([Field("q", "Take this quiz: https://acme.github.io/quiz/", "text", True)])
     assert a["q"].source == "unknown" and a["q"].value is None
@@ -875,6 +991,102 @@ def test_submit_and_confirm_on_local_fixture(page, monkeypatch):
     form.fill_fields(page, fields, ans)
     res = form.finish_application(JOB, _ctx(page, submit_mode="full", run_id=1), page, fields, ans, [], submit_texts=["Submit"])
     assert res.status == ApplyStatus.SUBMITTED
+
+
+def test_computer_use_repairs_only_an_approved_text_answer(page, monkeypatch):
+    from agent import vision_agent
+
+    page.set_content('<form><label for="name">First Name</label><input id="name" required></form>')
+    field = form.extract_fields(page)[0]
+    answer = Answer(field.key, "Jordan Lee", "profile")
+    monkeypatch.setattr(form, "_fill_one", lambda *args: False)
+    calls = []
+
+    def visual_fill(target_page, **kwargs):
+        calls.append(kwargs)
+        target_page.locator(f'[data-aa-key="{field.key}"]').fill(kwargs["target_value"])
+        return True
+
+    monkeypatch.setattr(vision_agent, "locate_and_act", visual_fill)
+    ctx = _ctx(page, submit_mode="fill_only")
+    ctx.config["computer_use"] = {"enabled": True}
+    failed = form.fill_fields(page, [field], [answer], page=page, layer_context=ctx)
+
+    assert failed == []
+    assert page.locator(f'[data-aa-key="{field.key}"]').input_value() == "Jordan Lee"
+    assert calls[0]["target_value"] == "Jordan Lee"
+    assert calls[0]["allow_locator_fallback"] is False
+    assert any(event.layer == "computer_use" and event.outcome == "verified" for event in ctx.layer_trace)
+
+
+def test_computer_use_uses_screenshot_and_field_context(page, monkeypatch):
+    page.set_viewport_size({"width": 1000, "height": 800})
+    page.set_content('<form><label for="name">First Name</label><input id="name" '
+                     'style="position:absolute;left:200px;top:200px;width:200px;height:40px"></form>')
+    field = form.extract_fields(page)[0]
+    answer = Answer(field.key, "Jordan Lee", "profile")
+    target = page.locator(f'[data-aa-key="{field.key}"]')
+    box = target.bounding_box()
+    viewport = page.viewport_size
+    point = [round((box["y"] + box["height"] / 2) / viewport["height"] * 1000),
+             round((box["x"] + box["width"] / 2) / viewport["width"] * 1000)]
+    monkeypatch.setattr(form, "_fill_one", lambda *args: False)
+    observed = {}
+
+    def visual_decision(prompt, schema, **kwargs):
+        observed["prompt"] = prompt
+        observed["images"] = kwargs.get("images")
+        return {"action": "type", "point": point, "text": "model-supplied text", "reason": "field found"}
+
+    monkeypatch.setattr(llm, "generate_json", visual_decision)
+    ctx = _ctx(page, submit_mode="fill_only")
+    ctx.config["computer_use"] = {"enabled": True}
+
+    failed = form.fill_fields(page, [field], [answer], page=page, layer_context=ctx)
+
+    assert failed == []
+    assert target.input_value() == "Jordan Lee"
+    assert observed["images"] and observed["images"][0].startswith(b"\xff\xd8")
+    assert "Page and target context" in observed["prompt"]
+    assert "First Name" in observed["prompt"]
+    assert any(event.layer == "computer_use" and event.outcome == "verified" for event in ctx.layer_trace)
+
+
+def test_computer_use_unverified_text_repair_remains_failed(page, monkeypatch):
+    from agent import vision_agent
+
+    page.set_content('<form><label for="name">First Name</label><input id="name" required></form>')
+    field = form.extract_fields(page)[0]
+    answer = Answer(field.key, "Jordan Lee", "profile")
+    monkeypatch.setattr(form, "_fill_one", lambda *args: False)
+    monkeypatch.setattr(vision_agent, "locate_and_act", lambda *args, **kwargs: True)
+    ctx = _ctx(page, submit_mode="fill_only")
+    ctx.config["computer_use"] = {"enabled": True}
+
+    failed = form.fill_fields(page, [field], [answer], page=page, layer_context=ctx)
+
+    assert failed == [field.key]
+    assert any(event.layer == "computer_use" and event.outcome == "escalate" for event in ctx.layer_trace)
+
+
+@pytest.mark.parametrize("required", [True, False])
+def test_submit_gate_rechecks_answered_text_values(page, monkeypatch, required):
+    required_attr = " required" if required else ""
+    page.set_content(f'<form><label for="name">First Name</label><input id="name"{required_attr}>'
+                     '<button type="submit">Submit</button></form>')
+    field = form.extract_fields(page)[0]
+    answer = Answer(field.key, "Jordan Lee", "profile")
+    page.locator(f'[data-aa-key="{field.key}"]').fill("Wrong Value")
+    ctx = _ctx(page, submit_mode="full", run_id=1)
+    submit_attempts = []
+    ctx.mark_submit_attempt = lambda *args: submit_attempts.append(args)
+    monkeypatch.setattr(captcha, "solve_if_present", lambda *args: pytest.fail("submit gate was bypassed"))
+
+    result = form.finish_application(JOB, ctx, page, [field], [answer], [], submit_texts=["Submit"])
+
+    assert result.status == ApplyStatus.NEEDS_REVIEW
+    assert "current field values" in result.reason
+    assert not submit_attempts
 
 
 def test_education_section_workday_variants():
@@ -1131,7 +1343,7 @@ def test_submit_email_security_code_multi_box_otp(page, monkeypatch):
         document.getElementById('app').addEventListener('submit', e => {
           e.preventDefault();
           document.body.innerHTML = `
-            <div id="otp-section">
+            <form id="otp-section">
               <h3>Security code</h3>
               <p>Please enter the 8-digit verification code sent to your email</p>
               <div class="otp-inputs">
@@ -1144,8 +1356,8 @@ def test_submit_email_security_code_multi_box_otp(page, monkeypatch):
                 <input type="text" maxlength="1" class="otp-digit" />
                 <input type="text" maxlength="1" class="otp-digit" />
               </div>
-              <button type="button" id="submit_app">Submit application</button>
-            </div>
+              <button type="button" id="submit_app">Submit</button>
+            </form>
           `;
           document.getElementById('submit_app').addEventListener('click', () => {
             const val = Array.from(document.querySelectorAll('.otp-digit')).map(i => i.value).join('');
@@ -1167,5 +1379,35 @@ def test_submit_email_security_code_multi_box_otp(page, monkeypatch):
     assert res.reason == "submitted"
 
 
+def test_verification_code_never_clicks_final_submit_button(page, monkeypatch):
+    from agent import mail
+    monkeypatch.setattr(db, "record_submit_intent", lambda *args, **kwargs: None)
+    page.set_content("""
+      <form id="app"><label>Email <input name="email" value="someone@example.com"></label>
+        <button type="submit">Submit</button></form>
+      <script>
+        window.finalClicks = 0;
+        document.getElementById('app').addEventListener('submit', e => {
+          e.preventDefault();
+          document.body.innerHTML = `
+            <div><p>Please enter the verification code sent to your email</p>
+              <input name="security_code" />
+              <button id="final" onclick="window.finalClicks++">Submit application</button>
+            </div>`;
+        });
+      </script>
+    """)
+    monkeypatch.setattr(mail, "wait_for_verification", lambda *a, **kw: mail.Verification(
+        code="123456", link=None, message_id="fake", subject="Code", sender="recruiter@example.com"))
+    monkeypatch.setattr(form, "wait_for_outcome", lambda *a, **kw: "code")
+    fields = form.extract_fields(page)
+    values = [Answer(fields[0].key, "someone@example.com", "profile")]
+    form.fill_fields(page, fields, values)
+    res = form.finish_application(JOB, _ctx(page, submit_mode="full", run_id=1), page, fields, values,
+                                  [], submit_texts=["Submit"])
+    assert res.status == ApplyStatus.NEEDS_REVIEW
+    assert res.reason == "verification control not found"
+    assert page.evaluate("window.finalClicks") == 0
+    assert page.locator('input[name="security_code"]').input_value() == "123456"
 
 

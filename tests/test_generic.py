@@ -86,6 +86,18 @@ PAGES = {
     "/posting_submit_button": """<h1>Software Engineering Intern</h1><h2>Job Description</h2>
         <label for="match">Resume match</label><input id="match" name="match">
         <form action="/thanks" method="post"><button type="submit">Apply Now</button></form>""",
+    "/posting_danger": """<h1>Software Engineering Intern</h1><h2>Job Description</h2>
+        <form action="/thanks" method="post"><label for="fn">First name</label>
+        <input id="fn" name="first_name" required><button type="submit">Submit application</button></form>""",
+    "/posting_js_submit": """<h1>Software Engineering Intern</h1><h2>Job Description</h2>
+        <form method="post" action="/thanks"><input type="hidden" name="job" value="123"></form>
+        <button type="button" onclick="document.querySelector('form').requestSubmit()">Apply Now</button>""",
+    "/posting_js_mixed": """<h1>Software Engineering Intern</h1><h2>Job Description</h2>
+        <form method="post" action="/thanks"></form>
+        <button type="button" onclick="location.href='/apply'; document.querySelector('form').requestSubmit()">Apply Now</button>""",
+    "/posting_href_handler": """<h1>Software Engineering Intern</h1><h2>Job Description</h2>
+        <form method="post" action="/thanks"></form>
+        <a href="/apply" onclick="document.querySelector('form').requestSubmit()">Apply Now</a>""",
     "/apply": """<h1>Application</h1>
         <form method="post" action="/thanks">
           <label for="fn">First name</label><input id="fn" name="first_name" required>
@@ -138,11 +150,35 @@ PAGES = {
         <button type="button" onclick="document.querySelector('#future').style.cssText='';this.remove()">Next</button>
         </form>""",
     "/account": """<h1>Create your candidate account</h1>
-        <form method="get" action="/verify">
+        <form method="post" action="/verify">
           <label for="e">Email</label><input id="e" type="email" name="email">
           <label for="p">Password</label><input id="p" type="password" name="password">
           <button type="submit">Create account</button>
         </form>""",
+    "/account_separate": """<h1>Apply for this job</h1>
+        <form method="post" action="/thanks">
+          <label for="fn">First name</label><input id="fn" name="first_name" required>
+          <button type="submit">Submit application</button></form>
+        <h2>Create your account</h2><form method="post" action="/verify">
+          <label for="e">Email</label><input id="e" type="email" name="email">
+          <label for="p">Password</label><input id="p" type="password" name="password">
+          <button type="submit">Create account</button></form>""",
+    "/sign_in": """<h1>Sign in to your existing account</h1>
+        <form method="post" action="/login">
+          <label for="e">Email</label><input id="e" type="email" name="email">
+          <label for="p">Password</label><input id="p" type="password" name="password">
+          <button type="submit">Sign in</button></form>""",
+    "/login": "<h1>Signed in</h1>",
+    "/account_unsafe_action": """<h1>Create your account</h1>
+        <form method="post" action="/thanks">
+          <label for="e">Email</label><input id="e" type="email" name="email">
+          <label for="p">Password</label><input id="p" type="password" name="password">
+          <button type="submit">Create account</button></form>""",
+    "/account_unsafe_js": """<h1>Create your account</h1>
+        <form method="post" action="/verify">
+          <label for="e">Email</label><input id="e" type="email" name="email">
+          <label for="p">Password</label><input id="p" type="password" name="password">
+          <button type="button" onclick="fetch('/thanks',{method:'POST'})">Create account</button></form>""",
     "/account_pending": """<h1>Create an Account</h1>
         <form method="get" action="/verify" onsubmit="return window.accepted === true">
           <label for="e">Email</label><input id="e" type="email" name="email">
@@ -447,7 +483,7 @@ def fakes(monkeypatch, tmp_path):
 
 
 def run(site, monkeypatch, script, path="/job", *, dry_run=False, mode="full", host_override=None,
-        profile_override=None, **llm_kw):
+        profile_override=None, config_override=None, **llm_kw):
     fake = FakeLLM(script, **llm_kw)
     monkeypatch.setattr(generic, "llm", fake)
     job = Job(id="test:1", company="Acme", title="Software Engineering Intern", url=(host_override or HOST) + path,
@@ -457,6 +493,7 @@ def run(site, monkeypatch, script, path="/job", *, dry_run=False, mode="full", h
         "terms": ["Summer 2027"], "us_only": True, "software_categories": ["Software"],
         "ai_categories": [], "ai_title_keywords": [], "exclude_title_keywords": [],
     }}
+    config.update(config_override or {})
     evidence = {
         "policy_fingerprint": policy_fingerprint(config), "posting_id": job.id,
         "normalized_url": normalize_url(job.url), "url": job.url, "source": job.source,
@@ -488,11 +525,11 @@ def posted_thanks(site):
 APPLY_FLOW = [click("Apply"), act("fill_form"), click("Submit application", action="submit")]
 
 
-def test_ukg_custom_apply_button_is_available_and_navigates(site, monkeypatch):
-    script = [click("Apply now"), act("fill_form"), click("Submit application", action="submit")]
+def test_ukg_unverified_event_listener_fails_closed(site, monkeypatch):
+    script = [click("Apply now")]
     res, _ = run(site, monkeypatch, script, path="/ukg_job", dry_run=True)
-    assert res.status == ApplyStatus.DRY_RUN_OK, res.reason
-    assert any(method == "GET" and path == "/apply" for method, path, _ in site.hits)
+    assert res.status == ApplyStatus.NEEDS_REVIEW and "unverified" in res.reason
+    assert not any(method == "GET" and path == "/apply" for method, path, _ in site.hits)
     assert not posted_thanks(site)
 
 
@@ -518,6 +555,15 @@ def test_posting_apply_now_navigates_past_resume_matcher_without_submit_intent(
 def test_form_associated_apply_now_without_application_fields_is_blocked(site, monkeypatch):
     res, _ = run(site, monkeypatch, [click("Apply Now")], path="/posting_submit_button")
     assert res.status == ApplyStatus.NEEDS_REVIEW
+    assert not posted_thanks(site)
+    with db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM submit_intents").fetchone()[0] == 0
+
+
+def test_posting_markers_never_exempt_submit_button_from_gate(site, monkeypatch):
+    res, _ = run(site, monkeypatch, [click("Submit application", action="submit")],
+                 path="/posting_danger", dry_run=True)
+    assert res.status in (ApplyStatus.DRY_RUN_OK, ApplyStatus.NEEDS_REVIEW)
     assert not posted_thanks(site)
     with db.connect() as conn:
         assert conn.execute("SELECT COUNT(*) FROM submit_intents").fetchone()[0] == 0
@@ -577,6 +623,42 @@ def test_success_with_real_form_module(site, monkeypatch):
     assert "first_name=Ada" in next(q for m, p, q in site.hits if p == "/thanks")
 
 
+def test_computer_use_field_repair_still_submits_local_application(site, monkeypatch):
+    from agent import llm as vision_llm
+
+    real_form = sys.modules.get("agent.form")
+    monkeypatch.setattr(generic, "form", real_form)
+    original_fill = real_form._fill_one
+
+    def fail_first_name(scope, field, value):
+        if field.label.casefold() == "first name":
+            return False
+        return original_fill(scope, field, value)
+
+    monkeypatch.setattr(real_form, "_fill_one", fail_first_name)
+    observed = {}
+
+    def choose_field(prompt, schema, **kwargs):
+        observed["prompt"] = prompt
+        observed["images"] = kwargs.get("images")
+        box = site.page.locator('input[name="first_name"]').bounding_box()
+        viewport = site.page.viewport_size
+        point = [round((box["y"] + box["height"] / 2) / viewport["height"] * 1000),
+                 round((box["x"] + box["width"] / 2) / viewport["width"] * 1000)]
+        return {"action": "type", "point": point, "text": "unapproved model value", "reason": "found first name"}
+
+    monkeypatch.setattr(vision_llm, "generate_json", choose_field)
+    result, _ = run(site, monkeypatch, APPLY_FLOW,
+                    config_override={"computer_use": {"enabled": True}})
+
+    assert result.status == ApplyStatus.SUBMITTED, result.reason
+    assert posted_thanks(site)
+    assert "first_name=Ada" in next(q for m, p, q in site.hits if p == "/thanks")
+    assert observed["images"] and observed["images"][0][:2] == b"\xff\xd8"
+    assert "Page and target context" in observed["prompt"]
+    assert "First name" in observed["prompt"]
+
+
 @pytest.mark.parametrize("final", ["submit", "click"])
 def test_dry_run_never_clicks_submit(site, monkeypatch, final):
     res, _ = run(site, monkeypatch, APPLY_FLOW[:2] + [click("Submit application", action=final)], dry_run=True)
@@ -590,6 +672,36 @@ def test_dry_run_review_page_without_fields(site, monkeypatch):
     res, _ = run(site, monkeypatch, [click("Submit application")], path="/review", dry_run=True)
     assert res.status == ApplyStatus.NEEDS_REVIEW, res.reason
     assert "without validated applicant answers" in res.reason
+    assert not posted_thanks(site)
+
+
+def test_missing_click_index_cannot_use_vision_to_submit(site, monkeypatch):
+    from agent import vision_agent
+
+    vision_clicks = []
+    monkeypatch.setattr(vision_agent, "locate_and_act",
+                        lambda *args, **kwargs: vision_clicks.append(kwargs) or True)
+    script = [{"action": "click", "click_index": 999, "reason": "Click Submit application"},
+              act("give_up")]
+    res, _ = run(site, monkeypatch, script, path="/apply", dry_run=True,
+                 host_override="https://test.clearcompany.com")
+    assert res.status == ApplyStatus.NEEDS_REVIEW
+    assert not vision_clicks
+    assert not posted_thanks(site)
+
+
+def test_stuck_recovery_cannot_bypass_submit_gate_with_vision(site, monkeypatch):
+    from agent import vision_agent
+
+    vision_clicks = []
+    monkeypatch.setattr(vision_agent, "locate_and_act",
+                        lambda *args, **kwargs: vision_clicks.append(kwargs) or True)
+    script = [{"action": "click", "click_index": 999, "reason": "Click Submit application"}] * 8
+    res, _ = run(site, monkeypatch, script, path="/apply", dry_run=True,
+                 host_override="https://test.clearcompany.com")
+    assert res.status == ApplyStatus.NEEDS_REVIEW
+    assert "stuck" in res.reason
+    assert not vision_clicks
     assert not posted_thanks(site)
 
 
@@ -651,7 +763,7 @@ def test_apply_link_in_new_tab_becomes_active_application_page(site, monkeypatch
     assert not posted_thanks(site)
 
 
-def test_delayed_apply_popup_is_adopted_without_another_click(site, monkeypatch):
+def test_delayed_javascript_apply_popup_requires_review_without_click(site, monkeypatch):
     monkeypatch.setitem(PAGES, "/delayed_popup", """<h1>Software Engineering Intern</h1>
         <button type="button" onclick="window.applyClicks=(window.applyClicks||0)+1;setTimeout(()=>window.open('/apply'),1200)">
           Apply Now</button>""")
@@ -660,28 +772,28 @@ def test_delayed_apply_popup_is_adopted_without_another_click(site, monkeypatch)
     result, fake = run(site, monkeypatch, [click("Apply Now"), act("fill_form"),
                                           click("Submit application", action="submit")],
                         path="/delayed_popup", mode="fill_only")
-    assert result.status == ApplyStatus.NEEDS_REVIEW and "fill_only" in result.reason, result.reason
-    assert site.page.evaluate("window.applyClicks") == 1
-    assert result.final_url == HOST + "/apply"
-    assert "First name" in fake.prompts[-1]
-    assert len(site.ctx.pages) == 3
+    assert result.status == ApplyStatus.NEEDS_REVIEW and "unverified" in result.reason, result.reason
+    assert site.page.evaluate("window.applyClicks") is None
+    assert result.final_url == HOST + "/delayed_popup"
+    assert len(fake.prompts) == 1
+    assert len(site.ctx.pages) == 2
     assert not posted_thanks(site)
     with db.connect() as conn:
         assert conn.execute("SELECT COUNT(*) FROM submit_intents").fetchone()[0] == 0
 
 
-def test_apply_adopts_application_among_placeholder_popups(site, monkeypatch):
+def test_ambiguous_javascript_apply_popups_require_review_without_click(site, monkeypatch):
     monkeypatch.setitem(PAGES, "/multi_popup", """<h1>Software Engineering Intern</h1>
         <button type="button" onclick="window.clicks=(window.clicks||0)+1;
           window.open('null');setTimeout(()=>window.open('/apply'),350)">Apply Now</button>""")
     res, fake = run(site, monkeypatch, [click("Apply Now"), act("fill_form"),
                                        click("Submit application", action="submit")],
                     path="/multi_popup", dry_run=True)
-    assert res.status == ApplyStatus.DRY_RUN_OK, res.reason
-    assert res.final_url == HOST + "/apply"
-    assert site.page.evaluate("window.clicks") == 1
-    assert "First name" in fake.prompts[-1]
-    assert len(site.ctx.pages) == 3
+    assert res.status == ApplyStatus.NEEDS_REVIEW and "unverified" in res.reason, res.reason
+    assert res.final_url == HOST + "/multi_popup"
+    assert site.page.evaluate("window.clicks") is None
+    assert len(fake.prompts) == 1
+    assert len(site.ctx.pages) == 1
     assert not posted_thanks(site)
     with db.connect() as conn:
         assert conn.execute("SELECT COUNT(*) FROM submit_intents").fetchone()[0] == 0
@@ -710,13 +822,12 @@ def test_late_popup_discards_stale_apply_action(site, monkeypatch):
     run_state = generic.Run(job, ctx, site.page, time.time() + 30)
     stale = generic._collect(run_state)
     target = next(c for c in stale.clickables if c.text == "Apply Now")
-    generic.ADAPTER._execute(run_state, stale, "click", target.index, "open application")
-    site.page.wait_for_timeout(900)
-    generic.ADAPTER._execute(run_state, stale, "click", target.index, "stale retry")
-    assert site.page.evaluate("window.applyClicks") == 1
-    assert run_state.page.url == HOST + "/apply"
-    state = generic._collect(run_state)
-    assert any(f.label == "First name" for f in state.fields)
+    first = generic.ADAPTER._execute(run_state, stale, "click", target.index, "open application")
+    second = generic.ADAPTER._execute(run_state, stale, "click", target.index, "stale retry")
+    assert first.status == second.status == ApplyStatus.NEEDS_REVIEW
+    assert "unverified" in first.reason
+    assert site.page.evaluate("window.applyClicks") is None
+    assert run_state.page.url == HOST + "/late_popup"
     assert not posted_thanks(site)
     assert not run_state.submitted
 
@@ -1505,6 +1616,55 @@ def test_review_page_continue_is_treated_as_submit(site, monkeypatch):
     assert posted_thanks(site)
 
 
+def test_review_submit_requires_each_known_application_answer_verified(site, monkeypatch):
+    site.page.goto(HOST + "/review")
+    job = Job("test:review", "Acme", "Intern", HOST + "/apply", [], "Software", 0)
+    ctx = base.ApplyContext(page=site.page, browser=site.ctx, config={}, profile={}, submit_mode="full")
+    run_state = generic.Run(job, ctx, site.page, time.time() + 30)
+    fields = [Field("first", "First name", "text", True, name="first_name"),
+              Field("email", "Email", "email", True, name="email")]
+    keys = [generic._field_id("/apply", 0, field) for field in fields]
+    for key, field, value in zip(keys, fields, ("Ada", "ada@example.com")):
+        run_state.filled_fields[key] = Field(key, field.label, field.kind, field.required, name=field.name)
+        run_state.filled_answers[key] = Answer(key, value, "profile")
+        run_state.application_field_keys.add(key)
+    run_state.verified_field_keys.add(keys[0])
+    state = generic._collect(run_state)
+    target = next(c for c in state.clickables if c.text == "Submit application")
+
+    result = generic.ADAPTER._submit(run_state, state, target, "submit review")
+
+    assert result.status == ApplyStatus.NEEDS_REVIEW
+    assert "validated applicant answers" in result.reason or "lack verification" in result.reason
+    assert not posted_thanks(site)
+    with db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM submit_intents").fetchone()[0] == 0
+
+
+def test_review_submit_blocks_changed_summary_value(site, monkeypatch):
+    site.page.goto(HOST + "/review")
+    site.page.locator("body").evaluate("el => el.querySelector('p').textContent = 'First name: Grace'")
+    job = Job("test:review-changed", "Acme", "Intern", HOST + "/apply", [], "Software", 0)
+    ctx = base.ApplyContext(page=site.page, browser=site.ctx, config={}, profile={}, submit_mode="full")
+    run_state = generic.Run(job, ctx, site.page, time.time() + 30)
+    field = Field("first", "First name", "text", True, name="first_name")
+    key = generic._field_id("/apply", 0, field)
+    run_state.filled_fields[key] = Field(key, field.label, field.kind, field.required, name=field.name)
+    run_state.filled_answers[key] = Answer(key, "Ada", "profile")
+    run_state.application_field_keys.add(key)
+    run_state.verified_field_keys.add(key)
+    state = generic._collect(run_state)
+    target = next(c for c in state.clickables if c.text == "Submit application")
+
+    result = generic.ADAPTER._submit(run_state, state, target, "submit review")
+
+    assert result.status == ApplyStatus.NEEDS_REVIEW
+    assert "selected values do not match" in result.reason
+    assert not posted_thanks(site)
+    with db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM submit_intents").fetchone()[0] == 0
+
+
 def test_review_page_continue_is_gated_in_dry_run(site, monkeypatch):
     script = [act("fill_form"), click("Review application"), click("Continue")]
     res, _ = run(site, monkeypatch, script, path="/apply_to_review", dry_run=True)
@@ -1512,3 +1672,117 @@ def test_review_page_continue_is_gated_in_dry_run(site, monkeypatch):
     assert any(m == "GET" and p == "/review_continue" for m, p, _ in site.hits)
     assert not posted_thanks(site)
 
+
+def test_register_and_submit_preference_allows_account_action_and_proceeds(site, monkeypatch, fakes):
+    prof = {"preferences": {"register_and_submit": "true"}, "resume_path": "/tmp/resume.pdf"}
+    script = [act("create_account"), act("need_email_code")]
+    res, _ = run(site, monkeypatch, script, path="/account", profile_override=prof)
+    assert fakes.vault.created == ["jobs.example.test"]
+    assert any(p == "/verify" for _, p, _ in site.hits)
+
+
+def test_register_preference_cannot_submit_combined_application(site, monkeypatch):
+    prof = {"preferences": {"register_and_submit": "true"}, "resume_path": "/tmp/resume.pdf"}
+    res, _ = run(site, monkeypatch, [act("create_account")], path="/combined_account",
+                 profile_override=prof)
+    assert res.status == ApplyStatus.NEEDS_REVIEW
+    assert "manual review" in res.reason
+    assert not posted_thanks(site)
+    with db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM submit_intents").fetchone()[0] == 0
+
+
+def test_posting_apply_now_with_search_and_matcher_navigates_on_submit_action(site, monkeypatch):
+    from agent import form as real_form
+    monkeypatch.setattr(generic, "form", real_form)
+    script = [click("Apply Now", action="submit"), click("Apply Now", action="submit"),
+              act("fill_form"), click("Submit application", action="submit")]
+    res, fake = run(site, monkeypatch, script, path="/nvidia_job", mode="fill_only")
+    assert res.status == ApplyStatus.NEEDS_REVIEW and "fill_only" in res.reason, res.reason
+    assert any(path == "/nvidia_step" for _, path, _ in site.hits)
+    assert any(path == "/apply" for _, path, _ in site.hits)
+
+
+def test_consecutive_stuck_with_validation_error_halts_with_error_message(site, monkeypatch):
+    PAGES["/validation_stuck"] = """<h1>Apply</h1>
+        <form><input id="fn" required><div role="alert">First name is required</div>
+        <button type="button" onclick="void 0">Save</button></form>"""
+    script = [click("Save")] * 5
+    res, _ = run(site, monkeypatch, script, path="/validation_stuck")
+    assert res.status == ApplyStatus.NEEDS_REVIEW
+    assert "form validation error" in res.reason
+
+
+@pytest.mark.parametrize("path", ["/posting_js_submit", "/posting_js_mixed", "/posting_href_handler"])
+@pytest.mark.parametrize("action", ["click", "submit"])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_unverified_posting_apply_never_executes_javascript_submission(site, monkeypatch, path, action, dry_run):
+    res, _ = run(site, monkeypatch, [click("Apply Now", action=action)],
+                 path=path, dry_run=dry_run)
+    assert res.status == ApplyStatus.NEEDS_REVIEW and "unverified" in res.reason, res.reason
+    assert not posted_thanks(site)
+    assert not any(path == "/apply" for _, path, _ in site.hits)
+    with db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM submit_intents").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("path", ["/account_unsafe_action", "/account_unsafe_js", "/combined_account"])
+@pytest.mark.parametrize("action", ["create_account", "click", "submit"])
+def test_register_preference_never_exempts_unsafe_account_actions(site, monkeypatch, path, action):
+    prof = {"preferences": {"register_and_submit": True}, "resume_path": "/tmp/resume.pdf"}
+    script = [act("create_account")] if action == "create_account" else [click("Create Account" if path == "/combined_account" else "Create account", action=action)]
+    res, _ = run(site, monkeypatch, script, path=path, profile_override=prof)
+    assert res.status == ApplyStatus.NEEDS_REVIEW and "manual review" in res.reason, res.reason
+    assert not posted_thanks(site)
+    assert not any(p == "/verify" for _, p, _ in site.hits)
+    with db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM submit_intents").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("action", ["create_account", "click", "submit"])
+def test_register_preference_preserves_separate_account_form(site, monkeypatch, action):
+    prof = {"preferences": {"register_and_submit": True}, "resume_path": "/tmp/resume.pdf"}
+    script = [act("create_account")] if action == "create_account" else [click("Create account", action=action)]
+    res, _ = run(site, monkeypatch, script + [act("give_up")], path="/account_separate",
+                 profile_override=prof)
+    assert res.status == ApplyStatus.NEEDS_REVIEW
+    assert any(m == "POST" and p == "/verify" for m, p, _ in site.hits)
+    assert not posted_thanks(site)
+    with db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM submit_intents").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("action", ["create_account", "click", "submit"])
+def test_dry_run_never_posts_account_even_when_creation_is_enabled(site, monkeypatch, action):
+    prof = {"preferences": {"register_and_submit": True}, "resume_path": "/tmp/resume.pdf"}
+    script = [act("create_account")] if action == "create_account" else [click("Create account", action=action)]
+    res, _ = run(site, monkeypatch, script, path="/account",
+                 profile_override=prof, dry_run=True,
+                 config_override={"accounts": {"create_in_dry_run": True}})
+    assert res.status == ApplyStatus.NEEDS_REVIEW and "dry run" in res.reason, res.reason
+    assert not any(p == "/verify" for _, p, _ in site.hits)
+    assert not posted_thanks(site)
+
+
+@pytest.mark.parametrize("action", ["sign_in", "click", "submit"])
+def test_existing_account_sign_in_uses_verified_login_without_register_preference(site, monkeypatch, fakes, action):
+    fakes.vault.create("jobs.example.test", "Acme", HOST)
+    script = [act("sign_in")] if action == "sign_in" else [click("Sign in", action=action)]
+    res, _ = run(site, monkeypatch, script + [act("give_up")], path="/sign_in")
+    assert res.status == ApplyStatus.NEEDS_REVIEW
+    assert any(method == "POST" and path == "/login" for method, path, _ in site.hits)
+    assert not posted_thanks(site)
+    with db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM submit_intents").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("action", ["sign_in", "click", "submit"])
+def test_dry_run_blocks_even_verified_existing_account_login(site, monkeypatch, fakes, action):
+    fakes.vault.create("jobs.example.test", "Acme", HOST)
+    script = [act("sign_in")] if action == "sign_in" else [click("Sign in", action=action)]
+    res, _ = run(site, monkeypatch, script, path="/sign_in", dry_run=True)
+    assert res.status == ApplyStatus.NEEDS_REVIEW and "dry run" in res.reason, res.reason
+    assert not any(method == "POST" and path == "/login" for method, path, _ in site.hits)
+    assert not posted_thanks(site)
+    with db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM submit_intents").fetchone()[0] == 0

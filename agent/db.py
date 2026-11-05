@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS applications (
     answers_json TEXT NOT NULL DEFAULT '[]',
     generated_json TEXT NOT NULL DEFAULT '[]',
     unanswered_json TEXT NOT NULL DEFAULT '[]',
+    layer_trace_json TEXT NOT NULL DEFAULT '[]',
     created_at REAL NOT NULL,
     submitted_at REAL
 );
@@ -155,6 +156,9 @@ def init() -> None:
             c.execute("ALTER TABLE jobs ADD COLUMN active_run_id INTEGER")
         if "active_run_previous_status" not in columns:
             c.execute("ALTER TABLE jobs ADD COLUMN active_run_previous_status TEXT")
+        app_columns = {row[1] for row in c.execute("PRAGMA table_info(applications)")}
+        if "layer_trace_json" not in app_columns:
+            c.execute("ALTER TABLE applications ADD COLUMN layer_trace_json TEXT NOT NULL DEFAULT '[]'")
         c.execute("CREATE INDEX IF NOT EXISTS jobs_active_run ON jobs(active_run_id, status)")
         # Preserve intent markers from databases created before the per-run journal.
         c.execute(
@@ -179,13 +183,19 @@ def _row_to_job(r: sqlite3.Row) -> Job:
 # ---------- jobs ----------
 
 def upsert_jobs(jobs: list[Job]) -> int:
-    """Insert jobs not seen before (by normalized URL or company+title). Returns number inserted."""
+    """Deduplicate listings while preserving distinct direct ATS requisitions."""
     inserted = 0
     now = time.time()
     with connect() as c:
         for j in jobs:
             nu, dk = normalize_url(j.url), dedupe_key(j.company, j.title)
-            if c.execute("SELECT 1 FROM jobs WHERE norm_url=? OR dedupe_key=? OR id=?", (nu, dk, j.id)).fetchone():
+            if c.execute("SELECT 1 FROM jobs WHERE norm_url=? OR id=?", (nu, j.id)).fetchone():
+                continue
+            # Two postings on one ATS board may share an identical title while
+            # having separate requisition IDs and application forms. Preserve both.
+            direct_ats = j.source == "ats_boards" and j.ats in {"greenhouse", "lever", "ashby"} \
+                and j.id.startswith(f"{j.ats}:") and len(j.id.split(":")) == 3
+            if not direct_ats and c.execute("SELECT 1 FROM jobs WHERE dedupe_key=?", (dk,)).fetchone():
                 continue
             c.execute(
                 "INSERT INTO jobs (id, source, company, title, url, norm_url, dedupe_key, ats, locations,"
@@ -528,10 +538,12 @@ def record_application(job: Job, result: ApplyResult, run_id: int | None) -> int
     with connect() as c:
         cur = c.execute(
             "INSERT INTO applications (job_id, run_id, status, reason, screenshot, final_url, answers_json,"
-            " generated_json, unanswered_json, created_at, submitted_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            " generated_json, unanswered_json, layer_trace_json, created_at, submitted_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (job.id, run_id, result.status.value, result.reason, result.screenshot, result.final_url,
              json.dumps([asdict(a) for a in result.answers], default=str),
-             json.dumps(result.generated_answers), json.dumps(result.unanswered_required), now,
+             json.dumps(result.generated_answers), json.dumps(result.unanswered_required),
+             json.dumps([asdict(e) for e in result.layer_trace]), now,
              now if result.status == ApplyStatus.SUBMITTED else None),
         )
         return int(cur.lastrowid)

@@ -62,7 +62,8 @@ def fetch_once(config: dict) -> dict:
 
 def _run_apply_subprocess(timeout: float, cmd: list[str] | None = None) -> None:
     """Run one batch in a child process group so a hung browser/page can be killed without wedging the loop."""
-    proc = subprocess.Popen(cmd or [sys.executable, "-m", "agent", "apply"], cwd=str(ROOT),
+    command = cmd or [sys.executable, "-m", "agent", "apply"]
+    proc = subprocess.Popen(command, cwd=str(ROOT),
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     try:
         returncode = proc.wait(timeout=timeout)
@@ -78,11 +79,11 @@ def _run_apply_subprocess(timeout: float, cmd: list[str] | None = None) -> None:
         except ProcessLookupError:
             pass
         proc.wait()
-        return
+        raise TimeoutError(f"apply batch exceeded {timeout:.0f}s")
     if returncode == EX_TEMPFAIL:
         raise ApplyLockBusy("apply deferred: apply/review lock is busy; it will be retried")
     elif returncode != 0:
-        log.warning("apply batch exited with code %d", returncode)
+        raise subprocess.CalledProcessError(returncode, command)
 
 
 def _last_apply_run(since: float) -> dict | None:
@@ -106,15 +107,21 @@ def apply_once(config: dict, profile: dict | None = None) -> None:
     except ApplyLockBusy as exc:
         log.info("%s", exc)
         return
-    except BaseException:
+    except Exception as exc:
         db.kv_set("last_apply", str(time.time()))
+        run = _last_apply_run(started) or {"submitted": 0, "queued": 0, "failed": 0}
+        log.error("apply batch failed (%s)", type(exc).__name__)
+        notify("apply-agent run failed",
+               f"Batch failed ({type(exc).__name__}). This run: {run['submitted']} submitted, "
+               f"{run['queued']} queued, {run['failed']} failed. Check agent logs.",
+               config, urgent=True)
         raise
     else:
         db.kv_set("last_apply", str(time.time()))
     run = _last_apply_run(started) or {"id": "?", "submitted": 0, "queued": 0, "failed": 0}
     path, summary = report.build()
     log.info("apply run %s done: %s (report %s)", run["id"], summary, path)
-    if run["submitted"] or run["queued"]:
+    if run["submitted"] or run["queued"] or run["failed"]:
         notify("apply-agent run finished",
                f"This run: {run['submitted']} submitted, {run['queued']} queued, {run['failed']} failed.\n"
                f"Tonight: {summary}", config)

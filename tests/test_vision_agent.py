@@ -86,6 +86,10 @@ class TestLocateAndAct:
         mock_page.mouse.click.assert_called_once_with(640, 400)
 
     def test_type_action_with_text(self, mock_page, monkeypatch):
+        locator = MagicMock()
+        locator.bounding_box.return_value = {"x": 450, "y": 200, "width": 200, "height": 80}
+        locator.evaluate.return_value = True
+        mock_page.evaluate.return_value = {"dangerous": False, "optionText": ""}
         monkeypatch.setattr(
             llm,
             "generate_json",
@@ -97,13 +101,18 @@ class TestLocateAndAct:
             },
         )
 
-        ok = locate_and_act(mock_page, "Enter name", target_value="Jane Doe", action_hint="type")
+        ok = locate_and_act(mock_page, "Enter name", target_value="Jane Doe", action_hint="type",
+                            locator=locator)
         assert ok is True
         # px_x = 400 / 1000 * 1280 = 512, px_y = 300 / 1000 * 800 = 240
         mock_page.mouse.click.assert_called_once_with(512, 240)
         mock_page.keyboard.type.assert_called_once_with("Jane Doe", delay=25)
 
     def test_type_action_fallback_to_target_value(self, mock_page, monkeypatch):
+        locator = MagicMock()
+        locator.bounding_box.return_value = {"x": 450, "y": 200, "width": 200, "height": 80}
+        locator.evaluate.return_value = True
+        mock_page.evaluate.return_value = {"dangerous": False, "optionText": ""}
         # LLM returned action "type" but text was None/empty
         monkeypatch.setattr(
             llm,
@@ -116,10 +125,86 @@ class TestLocateAndAct:
             },
         )
 
-        ok = locate_and_act(mock_page, "Enter email", target_value="user@example.com")
+        ok = locate_and_act(mock_page, "Enter email", target_value="user@example.com", action_hint="type",
+                            locator=locator)
         assert ok is True
         mock_page.mouse.click.assert_called_once_with(512, 240)
         mock_page.keyboard.type.assert_called_once_with("user@example.com", delay=25)
+
+    def test_approved_value_overrides_model_text(self, mock_page, monkeypatch):
+        locator = MagicMock()
+        locator.bounding_box.return_value = {"x": 450, "y": 200, "width": 200, "height": 80}
+        locator.evaluate.return_value = True
+        mock_page.evaluate.return_value = {"dangerous": False, "optionText": ""}
+        monkeypatch.setattr(llm, "generate_json", lambda *a, **k: {
+            "action": "type", "point": [300, 400], "text": "different answer", "reason": "typed",
+        })
+        assert locate_and_act(mock_page, "Enter name", target_value="Approved Name", action_hint="type",
+                              locator=locator)
+        mock_page.keyboard.type.assert_called_once_with("Approved Name", delay=25)
+        mock_page.keyboard.press.assert_called_once_with("Control+A")
+
+    def test_out_of_bounds_coordinates_are_rejected(self, mock_page, monkeypatch):
+        monkeypatch.setattr(llm, "generate_json", lambda *a, **k: {
+            "action": "click", "point": [1001, 500], "reason": "invalid point",
+        })
+        assert not locate_and_act(mock_page, "Click target", allow_locator_fallback=False)
+        mock_page.mouse.click.assert_not_called()
+
+    def test_vision_field_action_does_not_fall_back_to_locator(self, mock_page, monkeypatch):
+        locator = MagicMock()
+        locator.bounding_box.return_value = {"x": 10, "y": 10, "width": 100, "height": 20}
+        monkeypatch.setattr(llm, "generate_json", lambda *a, **k: {
+            "action": "none", "point": [500, 500], "reason": "ambiguous",
+        })
+        assert not locate_and_act(mock_page, "Enter answer", target_value="value", action_hint="type",
+                                  locator=locator, allow_locator_fallback=False)
+        locator.bounding_box.assert_not_called()
+        mock_page.mouse.click.assert_not_called()
+
+    def test_constrained_type_action_rejects_model_click(self, mock_page, monkeypatch):
+        locator = MagicMock()
+        locator.bounding_box.return_value = {"x": 450, "y": 200, "width": 200, "height": 40}
+        monkeypatch.setattr(llm, "generate_json", lambda *a, **k: {
+            "action": "click", "point": [300, 500], "reason": "clicked another control",
+        })
+        assert not locate_and_act(mock_page, "Enter approved value", target_value="Jordan Lee",
+                                  action_hint="type", locator=locator, allow_locator_fallback=False)
+        mock_page.mouse.click.assert_not_called()
+        mock_page.keyboard.type.assert_not_called()
+
+    def test_constrained_type_action_must_hit_target_field(self, mock_page, monkeypatch):
+        locator = MagicMock()
+        locator.bounding_box.return_value = {"x": 500, "y": 300, "width": 200, "height": 40}
+        mock_page.evaluate.return_value = {"dangerous": False, "optionText": ""}
+        monkeypatch.setattr(llm, "generate_json", lambda *a, **k: {
+            "action": "type", "point": [300, 400], "text": "wrong", "reason": "typed",
+        })
+        assert not locate_and_act(mock_page, "Enter approved value", target_value="Jordan Lee",
+                                  action_hint="type", locator=locator, allow_locator_fallback=False)
+        mock_page.mouse.click.assert_not_called()
+        mock_page.keyboard.type.assert_not_called()
+
+    def test_dropdown_action_cannot_hit_submit_button(self, mock_page, monkeypatch):
+        mock_page.evaluate.return_value = {"dangerous": True, "optionText": "California"}
+        monkeypatch.setattr(llm, "generate_json", lambda *a, **k: {
+            "action": "click", "point": [300, 400], "reason": "selected California",
+        })
+        assert not locate_and_act(mock_page, "Select state", target_value="California",
+                                  action_hint="click", allow_locator_fallback=False)
+        mock_page.mouse.click.assert_not_called()
+
+    def test_dropdown_can_open_target_listbox_button(self, mock_page, monkeypatch):
+        locator = MagicMock()
+        locator.bounding_box.return_value = {"x": 450, "y": 200, "width": 200, "height": 80}
+        locator.evaluate.return_value = True
+        mock_page.evaluate.return_value = {"dangerous": True, "safeDropdown": True, "optionText": ""}
+        monkeypatch.setattr(llm, "generate_json", lambda *a, **k: {
+            "action": "click", "point": [300, 500], "reason": "opened target listbox",
+        })
+        assert locate_and_act(mock_page, "Open state dropdown", target_value="California",
+                              action_hint="click", locator=locator, allow_locator_fallback=False)
+        mock_page.mouse.click.assert_called_once_with(640, 240)
 
     def test_action_none_returns_false(self, mock_page, monkeypatch):
         monkeypatch.setattr(
@@ -245,8 +330,11 @@ class TestLocateAndAct:
 class TestVisionChooseOption:
     def test_single_step_success_with_box_locator(self, mock_page, monkeypatch):
         box_loc = MagicMock()
+        box_loc.bounding_box.return_value = {"x": 500, "y": 220, "width": 40, "height": 40}
+        box_loc.evaluate.return_value = True
         box_loc.inner_text.return_value = "California"
         box_loc.scroll_into_view_if_needed = MagicMock()
+        mock_page.evaluate.return_value = {"dangerous": False, "optionText": "California"}
 
         called = []
 
@@ -268,6 +356,8 @@ class TestVisionChooseOption:
 
     def test_two_step_flow_open_then_select(self, mock_page, monkeypatch):
         box_loc = MagicMock()
+        box_loc.bounding_box.return_value = {"x": 200, "y": 50, "width": 100, "height": 50}
+        box_loc.evaluate.return_value = True
         # Step 1: inner_text is unselected ("Select State...")
         # Step 2: inner_text becomes "California"
         box_loc.inner_text.side_effect = ["Select State...", "California"]
@@ -276,6 +366,10 @@ class TestVisionChooseOption:
         box_loc.locator.return_value.count.return_value = 0
         mock_page.locator.return_value.count.return_value = 0
         mock_page.evaluate.return_value = ""
+        mock_page.evaluate.side_effect = [
+            {"dangerous": False, "optionText": ""},
+            {"dangerous": False, "optionText": "California"},
+        ]
 
         llm_responses = [
             {"action": "click", "point": [100, 200], "reason": "opened dropdown box"},
@@ -291,7 +385,7 @@ class TestVisionChooseOption:
         assert ok is True
         assert len(llm_responses) == 0
 
-    def test_box_locator_none_success(self, mock_page, monkeypatch):
+    def test_box_locator_none_fails_closed(self, mock_page, monkeypatch):
         monkeypatch.setattr(
             llm,
             "generate_json",
@@ -301,17 +395,19 @@ class TestVisionChooseOption:
                 "reason": "clicked option directly",
             },
         )
-        # Verified via page active element
         mock_page.locator.return_value.count.return_value = 0
-        mock_page.evaluate.return_value = "California"
+        mock_page.evaluate.return_value = {"dangerous": False, "optionText": "California"}
 
-        ok = vision_choose_option(mock_page, None, "State", "California")
-        assert ok is True
+        assert not vision_choose_option(mock_page, None, "State", "California")
+        mock_page.mouse.click.assert_not_called()
 
     def test_scroll_failure_proceeds_gracefully(self, mock_page, monkeypatch):
         box_loc = MagicMock()
+        box_loc.bounding_box.return_value = {"x": 200, "y": 140, "width": 100, "height": 40}
+        box_loc.evaluate.return_value = True
         box_loc.scroll_into_view_if_needed.side_effect = RuntimeError("Scroll error")
         box_loc.inner_text.return_value = "United States"
+        mock_page.evaluate.return_value = {"dangerous": False, "optionText": "United States"}
 
         monkeypatch.setattr(
             llm,
@@ -341,6 +437,7 @@ class TestVisionChooseOption:
         box_loc.locator.return_value.count.return_value = 0
         mock_page.locator.return_value.count.return_value = 0
         mock_page.evaluate.return_value = ""
+        mock_page.evaluate.return_value = {"dangerous": False, "optionText": "another option"}
 
         monkeypatch.setattr(
             llm,
@@ -397,7 +494,7 @@ class TestVerifyOptionSelected:
 
         assert verify_option_selected(mock_page, box, "Python") is True
 
-    def test_matches_via_page_level_locator(self, mock_page):
+    def test_page_level_option_does_not_verify_without_target_field(self, mock_page):
         page_opt = MagicMock()
         page_opt.inner_text.return_value = "Senior Software Engineer"
 
@@ -406,7 +503,29 @@ class TestVerifyOptionSelected:
         loc.nth.return_value = page_opt
         mock_page.locator.return_value = loc
 
-        assert verify_option_selected(mock_page, None, "Senior Software Engineer") is True
+        assert verify_option_selected(mock_page, None, "Senior Software Engineer") is False
+
+    def test_option_from_other_field_does_not_verify_target(self, mock_page):
+        box = MagicMock()
+        box.inner_text.return_value = "Select One"
+        box.input_value.return_value = ""
+        box.get_attribute.return_value = ""
+        box.locator.return_value.count.return_value = 0
+        box.evaluate.return_value = []
+        mock_page.locator.return_value.count.return_value = 1
+        mock_page.locator.return_value.nth.return_value.inner_text.return_value = "California"
+        assert not verify_option_selected(mock_page, box, "California")
+
+    def test_matching_option_must_belong_to_target_dropdown(self, mock_page, monkeypatch):
+        box = MagicMock()
+        box.evaluate.return_value = False
+        mock_page.evaluate.return_value = {"dangerous": False, "optionText": "California"}
+        monkeypatch.setattr(llm, "generate_json", lambda *a, **k: {
+            "action": "click", "point": [300, 400], "reason": "clicked California in another list",
+        })
+        assert not locate_and_act(mock_page, "Choose California", target_value="California",
+                                  action_hint="click", locator=box, allow_locator_fallback=False)
+        mock_page.mouse.click.assert_not_called()
 
     def test_text_matches_helper(self):
         assert _text_matches("United States of America", "United States") is True
@@ -486,14 +605,20 @@ class TestPlaywrightIntegration:
             page.set_content("""
                 <html>
                 <body style="margin:0; padding:0;">
-                    <div id="dropdown_box" role="combobox" style="position:absolute; left:100px; top:50px; width:200px; height:40px; border:1px solid #ccc;">
-                        Select Role
+                    <label for="role">Role</label>
+                    <input id="role" role="combobox" aria-controls="role-list" aria-expanded="true"
+                      style="position:absolute; left:100px; top:50px; width:200px; height:40px;">
+                    <div id="role-list" role="listbox" style="position:absolute;left:100px;top:100px">
+                      <div id="role-option" role="option" style="width:200px;height:40px;"
+                        onclick="document.getElementById('role').value='Software Engineer';">Software Engineer</div>
                     </div>
+                    <button id="submit" style="position:absolute;left:500px;top:100px"
+                      onclick="window.submitClicked=true">Submit</button>
                 </body>
                 </html>
             """)
 
-            box = page.locator("#dropdown_box")
+            box = page.locator("#role")
 
             # Mock LLM clicking the option
             monkeypatch.setattr(
@@ -501,21 +626,15 @@ class TestPlaywrightIntegration:
                 "generate_json",
                 lambda *a, **k: {
                     "action": "click",
-                    "point": [87, 200],  # y=70 (70/800*1000=87), x=200
+                    "point": [150, 200],  # option center: x=200, y=120
                     "reason": "click dropdown to pick Software Engineer",
                 },
             )
 
-            # Update the DOM text when clicked to simulate option selection
-            page.evaluate("""
-                document.getElementById('dropdown_box').onclick = function() {
-                    this.innerText = 'Software Engineer';
-                };
-            """)
-
             ok = vision_choose_option(page, box, "Role", "Software Engineer")
             assert ok is True
-            assert box.inner_text() == "Software Engineer"
+            assert box.input_value() == "Software Engineer"
+            assert page.evaluate("window.submitClicked || false") is False
 
             browser.close()
 

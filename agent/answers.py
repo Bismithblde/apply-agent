@@ -370,7 +370,7 @@ def _direct_degree_question(field: Field) -> bool:
         return False
     if re.search(r"\b(and|or)\b|\b(job|role|position)\b", label):
         return False
-    if re.fullmatch(r"(?:education )?(?:degree|degree type|degree program|current degree|expected degree)", label):
+    if re.fullmatch(r"(?:education(?:\s*\d+)?\s+)?(?:degree|degree type|degree program|current degree|expected degree)", label):
         return True
     return bool(
         re.search(r"\b(?:your|current|expected|pursuing)\b.{0,40}\bdegree\b", label)
@@ -420,7 +420,7 @@ def _major(f: Field, p: dict) -> Any:
     if re.search(r"\bmajor\b.{0,30}\b(life activities|challenge|issue|problem|responsibilit|impact|project)\b", label) or "disabilit" in label:
         return None
     direct = re.fullmatch(
-        r"(?:education )?(?:major|field of study|area of study|discipline|concentration|program of study)", label)
+        r"(?:education(?:\s*\d+)?\s+)?(?:major|field of study|area of study|discipline|concentration|program of study)", label)
     direct = direct or re.search(r"\b(?:your|current)\b.{0,30}\bmajor\b", label)
     direct = direct or re.search(r"\bmajor\s+in\b", label)
     direct = direct or re.search(r"\b(?:what|which)\b.{0,25}\bmajor\b.{0,30}\byou\b", label)
@@ -461,12 +461,20 @@ def _sanctioned_countries(f: Field, p: dict) -> Any:
 def _months_available(f: Field, p: dict) -> Any:
     if f.options and {"yes", "no"} <= {o.lower() for o in f.options}:
         return None
-    months = str(_get(p, "preferences.internship_months") or "3")
+    raw = _get(p, "preferences.internship_months")
+    if raw in (None, ""):
+        return CONFLICT
+    months = str(raw).strip()
+    if not re.fullmatch(r"\d{1,2}", months) or int(months) == 0:
+        return CONFLICT
     if f.options:
-        hit = next((o for o in f.options if months in o or "3" in o), None)
+        hit = next((o for o in f.options if re.findall(r"\d+", o) == [months]
+                    and (re.search(r"\bmonths?\b|\bmos?\b", o, re.I)
+                         or o.strip() == months)), None)
         if hit:
             return hit
-    return f"{months} months (May 2027 - August 2027)" if f.kind == "textarea" else months
+        return CONFLICT
+    return f"{months} months" if f.kind == "textarea" else months
 
 
 def _assignment_availability(f: Field, p: dict) -> Any:
@@ -607,34 +615,34 @@ def _yes_no(value: Any) -> str | None:
 
 def _eeo(path: str) -> Resolver:
     def r(f: Field, p: dict) -> Any:
-        if f.options:
-            dec = [o for o in f.options if _DECLINE.search(o)]
-            if dec:
-                return dec[0]
-            if set(o.lower() for o in f.options) <= {"yes", "no", "select one"}:
-                if any(k in path for k in ("hispanic", "veteran", "disability")):
-                    return "No"
+        raw = _get(p, path)
         if f.kind in ("text", "textarea") and not f.required:
             return SKIP
-        return _get(p, path)
+        if raw in (None, "") or _DECLINE.search(str(raw)):
+            if f.options:
+                dec = next((o for o in f.options if _DECLINE.search(o)), None)
+                return dec if dec else SKIP
+            return SKIP if raw in (None, "") else raw
+        if f.options:
+            chosen = matching_option(raw, f.options)
+            return chosen if chosen else SKIP
+        return raw
     return r
+
+
+def _permit(f: Field, p: dict) -> Any:
+    label = f.label or f.name
+    work = bool(re.search(r"\bwork permits?\b", label, re.I))
+    residence = bool(re.search(r"\b(?:residency|resident|residence) permits?\b", label, re.I))
+    if work == residence:
+        return CONFLICT
+    path = "work_authorization.work_permit" if work else "work_authorization.residency_permit"
+    value = _get(p, path)
+    return value if value not in (None, "") else CONFLICT
 
 
 def _bank(key: str) -> Resolver:
     return lambda f, p: (p.get("answer_bank") or {}).get(key) if f.kind in ("text", "textarea") else None
-
-
-_COMPEER_CONFIRMED: list[tuple[re.Pattern, str]] = [
-    (re.compile(r"internship requires full.time work.*40 hours/week", re.I), "Yes"),
-    (re.compile(r"internship program requires students.*actively enrolled.*active college student", re.I), "Yes"),
-    (re.compile(r"preferred office location.*compeer does not provide housing reimbursement", re.I),
-     "Lakeville, MN. I can cover my own housing and transportation."),
-    (re.compile(r"\bagricultural experience\b", re.I), "No"),
-    (re.compile(r"\bcurrent team member at Compeer Financial\b", re.I), "Yes"),
-    (re.compile(r"\b(previous|former|prior) team member (?:at|of) Compeer Financial\b", re.I), "No"),
-    (re.compile(r"\b(previous|prior|ever)\b.*\b(?:worked|employed)\b.*\bFarm Credit\b", re.I), "No"),
-    (re.compile(r"\bopen to relocating for this position\b", re.I), "Yes"),
-]
 
 
 def _norm_q(text: str) -> str:
@@ -651,14 +659,15 @@ def _custom_confirmed_answer(field: Field, profile: dict,
     if isinstance(custom_answers, dict):
         for question, value in custom_answers.items():
             nq, nl = _norm_q(question), _norm_q(label)
-            if nq == nl or (len(nq) > 15 and (nq in nl or nl in nq)):
+            if nq == nl:
                 if field.kind == "checkbox" and field.options and isinstance(value, list):
                     selected = [matching_option(v, field.options) for v in value]
                     if not selected or any(v is None for v in selected):
                         selected = None
                 else:
-                    if field.options:
-                        opt = matching_option(value, field.options)
+                    real_options = [o for o in (field.options or []) if o.strip().lower() not in ("select one", "select", "select...", "")]
+                    if real_options:
+                        opt = matching_option(value, real_options)
                         if opt is None:
                             return Answer(field.key, None, "unknown", "custom option unavailable")
                         selected = opt
@@ -680,14 +689,15 @@ def _company_confirmed_answer(field: Field, job: Job, profile: dict,
                 continue
             for question, value in question_answers.items():
                 nq, nl = _norm_q(question), _norm_q(label)
-                if nq == nl or (len(nq) > 15 and (nq in nl or nl in nq)):
+                if nq == nl:
                     if field.kind == "checkbox" and field.options and isinstance(value, list):
                         selected = [matching_option(v, field.options) for v in value]
                         if not selected or any(v is None for v in selected):
                             selected = None
                     else:
-                        if field.options:
-                            opt = matching_option(value, field.options)
+                        real_options = [o for o in (field.options or []) if o.strip().lower() not in ("select one", "select", "select...", "")]
+                        if real_options:
+                            opt = matching_option(value, real_options)
                             if opt is None:
                                 return Answer(field.key, None, "unknown", "company option unavailable")
                             selected = opt
@@ -695,12 +705,6 @@ def _company_confirmed_answer(field: Field, job: Job, profile: dict,
                             selected = _coerce(field, value, option_matcher)
                     if selected is not None:
                         return Answer(field.key, selected, "bank", "company answer confirmed in profile")
-    if company == "compeer financial":
-        for pattern, value in _COMPEER_CONFIRMED:
-            if pattern.search(label):
-                selected = _coerce(field, value, option_matcher)
-                if selected is not None:
-                    return Answer(field.key, selected, "bank", "user confirmed for Compeer Financial")
     if re.search(
             r"\bcurrently enrolled,? or recently graduated with a degree in any of the following\b",
             label, re.I):
@@ -812,6 +816,7 @@ _RULES: list[tuple[re.Pattern, Resolver, str]] = [(re.compile(rx, re.I), fn, src
     (r"\beducation\b.*(?:end date|\bto\b)|\bexpected graduation\b|\bgraduation\b|\bgraduat|education.*to\s*\(actual or expected\)", _graduation, "profile"),
     (r"\beducation\b.*(?:start date|\bfrom\b)", _edu_start, "profile"),
     (r"\b(?:prior|previous) (?:internship|intern|co-?op)(?: (?:or|and) (?:internship|intern|co-?op))? experience\b", _prior_internship, "profile"),
+    (r"\bwork permits?\b|\b(?:residency|resident|residence) permits?\b", _permit, "profile"),
     (r"authori[sz]ed to work|legally (authorized|eligible|able|permitted) to work|eligible to work|work authori[sz]ation"
      r"|right to work|permitted to work|legally work", _p("work_authorization.authorized_us"), "profile"),
     (r"citizenship status|immigration status", _citizenship_status, "profile"),
@@ -849,8 +854,13 @@ _RULES: list[tuple[re.Pattern, Resolver, str]] = [(re.compile(rx, re.I), fn, src
     (r"\b(?:sat|act)\s+score\b", lambda f, p: ["Did not take/Do not recall", "Did not take", "N/A", "None", "Do not recall"], "profile"),
     (r"\b(relatives?|family members?)\b.{0,80}\b(employ|work|current)|related to (anyone|an employee|any employee)"
      r"|\b(employ|work)\w*\b.{0,60}\b(relatives?|family members?)\b", _p("preferences.relatives_at_company"), "profile"),
-    (r"(?:previously|ever|currently)\s+(?:been\s+)?(?:employed|worked|intern\w*)|worked\s+(?:here|for\s+us)\s+before|former\s+employee|(?:ever|currently)\s+(?:been\s+)?(?:employed|working)\s+(?:by|at|for)|(?:current|former)\s+or\s+(?:current|former)\s+employee|currently\s+an\s+(?:employee|intern|worker|contractor)", _p("preferences.previously_employed_here"), "profile"),
-    (r"non-?compete|restrictive covenant", _p("preferences.non_compete"), "profile"),
+    (r"\bcurrently\b.{0,35}\b(?:employed|working|employee|intern|worker|contractor|team member)\b|\bcurrent (?:employee|team member)\b",
+     lambda f, p: None, "profile"),
+    (r"(?:previously|ever)\s+(?:been\s+)?(?:employed|worked|intern\w*)|worked\s+(?:here|for\s+us)\s+before|former\s+employee|(?:previously|ever)\s+(?:been\s+)?(?:employed|working)\s+(?:by|at|for)",
+     _p("preferences.previously_employed_here"), "profile"),
+    (r"non-?solicit", _p("preferences.non_solicitation"), "profile"),
+    (r"non-?compet|restrictions on competition", _p("preferences.non_compete"), "profile"),
+    (r"restrictive covenant", _p("preferences.restrictive_covenant"), "profile"),
     (r"consider (me|you) for other|other (job )?(opportunities|openings|roles|positions)|talent (pool|community|network)|interested in a (?:full[- ]time|permanent|future) role|full[- ]time role within",
      _p("preferences.consider_other_roles"), "profile"),
     (r"background check", _p("preferences.background_check_ok"), "profile"),
@@ -883,21 +893,22 @@ def _coerce(field: Field, value: Any, option_matcher: Callable[[list[str], str],
         if normalized in ("no", "false"):
             return False
         return None
-    if field.options:
+    real_options = [o for o in (field.options or []) if o.strip().lower() not in ("select one", "select", "select...", "")]
+    if real_options:
         for c in cands:
             candidate = ("Yes" if c else "No") if isinstance(c, bool) else c
             if option_matcher and field.kind in ("select", "combobox"):
-                idx = option_matcher(field.options, str(candidate))
-                hit = field.options[idx] if idx is not None else None
+                idx = option_matcher(real_options, str(candidate))
+                hit = real_options[idx] if idx is not None else None
                 if hit and not option_matches(candidate, hit):
                     hit = None
             else:
-                hit = (matching_option(candidate, field.options) if field.kind in ("select", "combobox")
-                       else best_option(candidate, field.options))
+                hit = (matching_option(candidate, real_options) if field.kind in ("select", "combobox")
+                       else best_option(candidate, real_options))
             if not hit and not _needs_fact_evidence(field):
-                idx = llm.pick_option(field.options, candidate, field.label or field.name)
-                if idx is not None and 0 <= idx < len(field.options):
-                    hit = field.options[idx]
+                idx = llm.pick_option(real_options, candidate, field.label or field.name)
+                if idx is not None and 0 <= idx < len(real_options):
+                    hit = real_options[idx]
             if hit:
                 return [hit] if field.kind == "checkbox" else hit
         if searchable_options(field):
@@ -1371,6 +1382,9 @@ _FACTUAL = re.compile(
     r"|clearance|\breferr|years of experience|how many years|languages?\b|citizenship|visa|immigration|work authori[sz]ation"
     r"|authori[sz]ed to work|eligible to work|right to work|sponsor(?:ship)?|social security|ssn|license|certif"
     r"|criminal|convicted|\brelatives?\b|\bfamily members?\b|currently employed|notice period"
+    r"|\b(?:work|residen(?:t|cy|ce)) permits?\b|non-?compete|non-?solicit|restrictive covenant"
+    r"|\b(?:veteran|disabilit\w*|hispanic|latino|ethnicity|race|gender|sexual orientation|transgender)\b"
+    r"|\b(?:worked|employed|employee|team member|employment)\b"
     r"|\b(?:school|university|college|institution|degree|major|field of study|gpa|grade point|graduat(?:e|ion)|class year)\b"
     r"|\b(?:city|state|province|country|location|residence|relocat(?:e|ion)|availability|available|start date|end date)\b"
     r"|\b(?:student|enroll(?:ed|ment)?|protocols?|tools?|frameworks?|technolog(?:y|ies)|experience|used|using)\b", re.I)
@@ -1423,6 +1437,10 @@ def _is_preference_or_survey(field: Field) -> bool:
 
 def _needs_fact_evidence(field: Field) -> bool:
     label = re.sub(r"https?://\S+", " ", field.label or field.name)
+    if re.search(r"\b(?:work|residen(?:t|cy|ce)) permits?\b|non-?compete|non-?solicit|restrictive covenant|"
+                 r"\b(?:veteran|disabilit\w*|hispanic|latino|ethnicity|race|gender|sexual orientation|transgender|"
+                 r"worked|employed|employee|team member|employment)\b", label, re.I):
+        return True
     if _experience_narrative(field) or _essay_prompt(field) or _is_preference_or_survey(field):
         return False
     return bool(_FACTUAL.search(label))
@@ -1498,7 +1516,7 @@ def _binary_supported(option: str, field: Field, cited: list[_Evidence], match: 
                 if relevant and action and action.search(clause):
                     if bool(_NEGATION.search(clause)) == polarity:
                         return False
-                elif relevant and _NEGATION.search(clause):
+                elif relevant and bool(_NEGATION.search(clause)) == polarity:
                     return False
                 previous_relevant = relevant
             supported = True
@@ -1634,7 +1652,7 @@ def _validate(f: Field, r: dict, evidence: list[_Evidence], job_text: str = "",
                     hit = f.options[idx]
             if not hit:
                 return Answer(f.key, None, "unknown", f"LLM option not in list: {p[:60]}")
-            if factual and src == "bank" and not _option_supported(hit, f, cited):
+            if factual and not _option_supported(hit, f, cited):
                 return Answer(f.key, None, "unknown", f"selected option lacks evidence: {hit[:60]}")
             mapped.append(hit)
         return Answer(f.key, mapped if f.kind == "checkbox" else mapped[0], src, note)

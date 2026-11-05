@@ -28,6 +28,21 @@ Restore the project's existing Python 3.14 environment at .venv, then rerun ./se
 EOF
   exit 1
 fi
+if [ ! -f profile.yaml ]; then
+  cp profile.example.yaml profile.yaml
+  chmod 600 profile.yaml
+  echo "Created profile.yaml from the blank template. Fill in your personal details before applying."
+fi
+if ! "$PY" - <<'PY'
+import yaml
+profile = yaml.safe_load(open('profile.yaml')) or {}
+person = profile.get('personal', {})
+raise SystemExit(0 if person.get('first_name') and person.get('email') else 1)
+PY
+then
+  echo "Fill in at least personal.first_name and personal.email in profile.yaml, then rerun ./setup.sh." >&2
+  exit 1
+fi
 "$PY" -m pip install -q --upgrade pip
 "$PY" -m pip install -q -r requirements.txt
 "$PY" -m playwright install chromium >/dev/null

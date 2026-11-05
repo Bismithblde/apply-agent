@@ -81,7 +81,7 @@ class LeverAdapter:
             except Exception:
                 pass
         scope = page.main_frame
-        fields, answers, failed = fill_form(scope, job, ctx.profile, job_text=job_text)
+        fields, answers, failed = fill_form(scope, job, ctx.profile, job_text=job_text, layer_context=ctx)
         _pick_location(page, fields, answers)
         if not fields:
             return ApplyResult(ApplyStatus.NEEDS_REVIEW, "no fields found", screenshot=ctx.screenshot(job, "empty"),

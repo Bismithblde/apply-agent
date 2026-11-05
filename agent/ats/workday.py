@@ -293,10 +293,11 @@ def _match_option(options: list[str], value: str) -> int | None:
     v_deg = _degree_level(v)
     if v_deg:
         for i, option in enumerate(options):
-            if re.search(r"years? of education", option, re.I):
-                clean = re.sub(r"\(.*?\)", "", option).strip()
-                if _degree_level(clean) == v_deg:
-                    return i
+            clean = re.sub(r"\(.*?\)", "", option).strip()
+            if re.search(r"\b(?:in|major(?:ing)?\s+in)\b", clean, re.I) and not re.search(r"\b(?:in|major(?:ing)?\s+in)\b", v, re.I):
+                continue
+            if _degree_level(clean) == v_deg or (re.search(r"years? of education", option, re.I) and _degree_level(option) == v_deg):
+                return i
     return None
 
 
@@ -369,9 +370,44 @@ def _yes_no(value) -> str | None:
     return {"yes": "Yes", "no": "No", "true": "Yes", "false": "No"}.get(str(value).strip().casefold())
 
 
+def _unqualified_response_index(options: list[str], value) -> int | None:
+    response = _yes_no(value)
+    if response is None:
+        response = {"agree": "Yes", "i agree": "Yes", "accept": "Yes", "i accept": "Yes",
+                    "consent": "Yes", "i consent": "Yes", "acknowledge": "Yes",
+                    "i acknowledge": "Yes"}.get(str(value).strip().casefold())
+    if response is None:
+        return None
+    choices = (("Yes", "I Agree", "Agree", "I Accept", "Accept", "I Consent", "Consent",
+                "I Acknowledge", "Acknowledge") if response == "Yes" else
+               ("No", "I Disagree", "Disagree", "I Decline", "Decline"))
+    return next((i for candidate in choices if (i := _exact_option(options, candidate)) is not None), None)
+
+
+_LEGAL_AGREEMENT_RE = re.compile(
+    r"\b(?:consent|agree|agreement|accept|certify|attest|acknowledge|terms|privacy|"
+    r"arbitration|waiver|waive|release|binding|signature|e-signature|policy)\b", re.I
+)
+
+
+def _is_legal_agreement(f: Field) -> bool:
+    return f.kind in ("checkbox", "radio", "select", "combobox") and bool(
+        _LEGAL_AGREEMENT_RE.search(" ".join((f.label or "", f.name or "", *(f.options or []))))
+    )
+
+
+def _legal_option_index(options: list[str], value) -> int | None:
+    if isinstance(value, bool):
+        value = "Yes" if value else "No"
+    idx = _exact_option(options, str(value or ""))
+    if idx is None:
+        idx = _unqualified_response_index(options, value)
+    return idx if idx is not None and _is_reasonable(options[idx]) else None
+
+
 def _pick_option_index(
     texts: list[str],
-    value: str,
+    value: str | bool | None,
     *,
     is_phone_device: bool = False,
     is_referral: bool = False,
@@ -380,6 +416,7 @@ def _pick_option_index(
 ) -> int | None:
     if not texts:
         return None
+    value = str(value) if value is not None else ""
 
     reasonable_indices = [j for j, t in enumerate(texts) if _is_reasonable(t)]
     if not reasonable_indices:
@@ -401,12 +438,10 @@ def _pick_option_index(
             return decline_idx
         return None
 
-    if set(t.lower() for t in texts if _is_reasonable(t)) <= {"yes", "no"}:
-        aff = _yes_no(value)
-        if aff:
-            idx = _match_option(texts, aff)
-            if idx is not None:
-                return idx
+    if _yes_no(value) is not None or str(value).strip().casefold() in {
+            "agree", "i agree", "accept", "i accept", "consent", "i consent",
+            "acknowledge", "i acknowledge"}:
+        return _unqualified_response_index(texts, value)
 
     if value and _is_reasonable(value):
         idx = _match_option(texts, value)
@@ -423,28 +458,49 @@ def _pick_option_index(
 
 
 def _ai_pick_option(label: str, texts: list[str], info: dict, wanted: str = "") -> int | None:
-    """Use LLM to dynamically select the best matching option from ATS choices when rules/aliases fail."""
+    """Use LLM to match a known applicant fact to an ATS option when aliases fail."""
     from .. import llm
+    if not wanted or not _is_reasonable(wanted) or wanted.strip().casefold() in ("unknown", "n/a", "null"):
+        return None
+    facts = {key: str(value).strip() for key, value in info.items()
+             if value is not None and str(value).strip() and str(value).strip().casefold() not in ("none", "unknown", "n/a", "null")}
+    field_facts = (
+        (r"citizen|nationality", "us_citizen"),
+        (r"sponsor|\bvisa\b", "needs_sponsorship"),
+        (r"authoriz|eligib.{0,20}work|work.{0,20}eligib|work permit", "authorized_us"),
+        (r"relocat", "willing_to_relocate"),
+        (r"referr|\bsource\b|\bhear\b|\bheard\b|\bfound\b.*\bjob\b", "how_did_you_hear"),
+        (r"school|university|college|institution", "school"),
+        (r"degree", "degree"),
+        (r"major|field of study|area of study|discipline", "major"),
+        (r"skills?", "skills"),
+        (r"location|\bcity\b|\bstate\b|\bcountry\b|residen", "location"),
+    )
+    fact_key = next((key for pattern, key in field_facts if re.search(pattern, label, re.I)), None)
+    if fact_key is None or fact_key not in facts:
+        return None
+    if fact_key in ("us_citizen", "authorized_us", "needs_sponsorship", "willing_to_relocate"):
+        confirmed = _yes_no(facts[fact_key])
+        requested = _yes_no(wanted)
+        if confirmed is None or requested is None or confirmed != requested:
+            return None
     valid = [(idx, t) for idx, t in enumerate(texts) if _is_reasonable(t) and t.strip().lower() not in ("select one", "select...", "choose...")]
     if not valid:
         return None
     valid_texts = [v[1] for v in valid]
     prompt = f"""You are filling an employment application for a job candidate.
-Candidate profile facts:
-- Education: {info.get('school', 'Undergraduate Student')}, Major: {info.get('major', 'Computer Science')}
-- Work Authorization: US Citizen ({info.get('us_citizen', 'Yes')}), Legally Authorized to work in US ({info.get('authorized_us', 'Yes')}), Needs Sponsorship ({info.get('needs_sponsorship', 'No')})
-- Willing to Relocate: {info.get('willing_to_relocate', 'Yes')}
-- Preferred Referral Source: {info.get('how_did_you_hear', 'Simplify')}
-- Location: {info.get('location', 'New York, NY')}
-- Preferred Value for this field: {wanted or 'N/A'}
+Confirmed applicant facts (missing facts are unknown):
+{json.dumps(facts)}
+Confirmed answer for this field: {json.dumps(wanted)}
 
 Question / Dropdown Field: "{label}"
 Available choices:
 {json.dumps(valid_texts)}
 
-Select the best, most truthful matching choice from the available choices that corresponds to the preferred value '{wanted}' and the candidate's background.
-Do NOT choose an Employee Referral if candidate does not have one.
-If NO available choice truthfully represents '{wanted}' or the candidate profile, return null for chosen_option.
+Select only an option supported by the confirmed answer and facts. Never infer citizenship, work authorization,
+sponsorship, education, employment, or other applicant facts from unrelated information.
+Do not choose a named referral source unless it is confirmed. A generic job board category may represent a confirmed job board source.
+If no choice truthfully represents the confirmed answer, return null for chosen_option.
 Return JSON: {{"chosen_option": "<exact string from choices or null>"}}"""
 
     schema = {
@@ -458,10 +514,10 @@ Return JSON: {{"chosen_option": "<exact string from choices or null>"}}"""
             choice = reply["chosen_option"].strip().casefold()
             for idx, t in valid:
                 if t.strip().casefold() == choice:
-                    log.info("AI matched option %r -> %r for %r", wanted, t, label)
+                    log.info("AI matched option for %r (index=%d)", label, idx)
                     return idx
     except Exception as e:
-        log.warning("AI option picking failed: %s", e)
+        log.warning("AI option picking failed (error_type=%s)", type(e).__name__)
     return None
 
 
@@ -481,7 +537,7 @@ class WorkdayAdapter:
         except _Stop as s:
             return s.result
         except Exception as e:
-            log.exception("workday adapter crashed on %s", job.url)
+            log.error("workday adapter crashed (error_type=%s)", type(e).__name__)
             return run.result(ApplyStatus.FAILED, f"workday error: {type(e).__name__}: {str(e)[:200]}", "error")
 
 
@@ -807,7 +863,7 @@ class _Run:
                 try:
                     self.page.reload(wait_until="domcontentloaded", timeout=20000)
                 except Exception as e:
-                    log.warning("Workday reload failed: %s", e)
+                    log.warning("Workday reload failed (error_type=%s)", type(e).__name__)
                 self.settle()
             if _OOPS_RE.search(_text(self.page, ROOT)):
                 raise self.stop(ApplyStatus.NEEDS_REVIEW, "Workday 'Something went wrong' page", "oops")
@@ -965,7 +1021,7 @@ class _Run:
             pass
         fields = [f for f in form.extract_fields(self.page, root) if not self.is_honeypot(f)]
         fields += self.extract_workday_widgets(root, {f.key for f in fields})
-        log.info("fill_step %r extracted fields: %r", name, [(f.key, f.label, f.name) for f in fields])
+        log.info("fill_step %r extracted %d fields", name, len(fields))
         radios = self.extract_workday_radios(root)
         if radios:
             aids = {f.name for f in radios}
@@ -1060,9 +1116,12 @@ class _Run:
             self.answers[a.key] = a
             self.expected_answers[a.key] = a
         fill_fields = [f for f in todo if f.key not in self.wd_keys]
-        failed = form.fill_fields(self.page, fill_fields, ans) if fill_fields else []
+        failed = form.fill_fields(self.page, fill_fields, ans, page=self.page,
+                                  layer_context=self.ctx) if fill_fields else []
         by_key = {a.key: a for a in ans}
-        for k in list(failed) + [f.key for f in todo if f.key in self.wd_keys]:
+        widget_keys = [f.key for f in todo if f.key in self.wd_keys]
+        log.info("fill_step: failed=%d, widgets=%d, answers=%d", len(failed), len(widget_keys), len(by_key))
+        for k in list(failed) + widget_keys:
             f, a = self.fields.get(k), by_key.get(k)
             if not f:
                 continue
@@ -1138,15 +1197,53 @@ class _Run:
 
     def _profile_widget_answer(self, f: Field) -> Answer | None:
         from .. import answers as answers_mod
+        if _is_legal_agreement(f):
+            company = self.job.company.strip().casefold()
+            label = answers_mod._norm_q(f.label or f.name)
+            for name, questions in (self.ctx.profile.get("company_answers") or {}).items():
+                if str(name).strip().casefold() != company or not isinstance(questions, dict):
+                    continue
+                for question, value in questions.items():
+                    if answers_mod._norm_q(question) != label:
+                        continue
+                    if f.kind == "checkbox" and not f.options:
+                        yes = _yes_no(value)
+                        if yes is not None:
+                            return Answer(f.key, yes == "Yes", "bank", "company agreement explicitly confirmed")
+                    elif f.options:
+                        values = value if f.kind == "checkbox" and isinstance(value, list) else [value]
+                        matches = [_legal_option_index(f.options, v) for v in values]
+                        if matches and all(i is not None for i in matches):
+                            chosen = [f.options[i] for i in matches]
+                            return Answer(f.key, chosen if isinstance(value, list) else chosen[0], "bank",
+                                          "company agreement explicitly confirmed")
+                    elif value is not None and (isinstance(value, str) or isinstance(value, bool)):
+                        return Answer(f.key, value, "bank", "company agreement explicitly confirmed")
+                    return Answer(f.key, None, "unknown", "company agreement choice needs explicit confirmation")
+            return Answer(f.key, None, "unknown", "legal agreement needs company-specific confirmation")
         company_ans = answers_mod._company_confirmed_answer(f, self.job, self.ctx.profile, _match_option)
         if company_ans is not None:
             return company_ans
         preferences = self.ctx.profile.get("preferences") or {}
         personal = self.ctx.profile.get("personal") or {}
         lab = f.label or ""
-        if f.kind in ("checkbox", "radio", "select", "combobox") and re.search(
-                r"\b(?:consent|agree|accept|certify|attest|acknowledge|terms|privacy|arbitration)\b", lab, re.I):
-            return Answer(f.key, None, "unknown", "consent needs an explicit answer for this question")
+        fid = f.name or ""
+        lab_and_name = lab + ' ' + fid
+        if self._is_school_field(f):
+            school = (self.ctx.profile.get("education") or {}).get("school")
+            if school:
+                return Answer(f.key, school, "profile", "school from profile")
+        if re.search(r"\bdegree\b", lab_and_name, re.I) and not re.search(r"\b(?:major|field\s*of\s*study|gpa|score)\b", lab_and_name, re.I):
+            deg = (self.ctx.profile.get("education") or {}).get("degree_full") or (self.ctx.profile.get("education") or {}).get("degree")
+            return Answer(f.key, deg, "profile" if deg else "unknown", "degree from profile")
+        if re.search(r"\b(?:field\s*of\s*study|major|area\s*of\s*study|discipline|concentration|program\s*of\s*study)\b", lab_and_name, re.I) and not re.search(r"\b(?:degree|gpa)\b", lab_and_name, re.I):
+            major = (self.ctx.profile.get("education") or {}).get("major")
+            if major:
+                return Answer(f.key, major, "profile", "major from profile")
+        if self._is_education_date_field(f):
+            edu_date_ans = self._education_year_answer(f)
+            if edu_date_ans:
+                return edu_date_ans
         if f.kind in ("checkbox", "radio", "select", "combobox"):
             for pattern, key in (
                 (r"hispanic|latin[oax]", "hispanic_latino"),
@@ -1256,7 +1353,7 @@ class _Run:
                     if key:
                         self.answers[key] = Answer(key, True, "generated", "current job from profile")
             except Exception as e:
-                log.debug("current-job check failed: %s", e)
+                log.debug("current-job check failed (error_type=%s)", type(e).__name__)
 
     def is_honeypot(self, f: Field) -> bool:
         if HONEYPOT in (f.name or "").lower() or HONEYPOT in f.key.lower():
@@ -1324,7 +1421,7 @@ class _Run:
                     known.add(key)
                     self.wd_keys.add(key)
                 except Exception as e:
-                    log.debug("workday widget skipped: %s", e)
+                    log.debug("workday widget skipped (error_type=%s)", type(e).__name__)
         return found
 
     def extract_workday_radios(self, root: str | None) -> list[Field]:
@@ -1380,7 +1477,7 @@ class _Run:
                                        options=info["texts"], current_value=info["current"], name=info["name"]))
                     self.wd_keys.add(info["key"])
             except Exception as e:
-                log.debug("workday radio extraction skipped: %s", e)
+                log.debug("workday radio extraction skipped (error_type=%s)", type(e).__name__)
         return found
 
     def _set_choice(self, ctl: Locator, wanted: bool) -> bool:
@@ -1427,7 +1524,8 @@ class _Run:
         indices = set()
         for value in values:
             value = _yes_no(value) or str(value)
-            index = _pick_option_index(f.options, value, is_required=f.required)
+            index = (_legal_option_index(f.options, value) if _is_legal_agreement(f)
+                     else _pick_option_index(f.options, value, is_required=f.required))
             if index is None:
                 return False
             indices.add(index)
@@ -1497,7 +1595,7 @@ class _Run:
             log.info("_dropdown_options: fresh=%d, menus=%d, prompts=%d, box=%r",
                      fresh_cnt, menus_cnt, prompt_cnt, box.count())
         except Exception as e:
-            log.info("_dropdown_options count error: %s", e)
+            log.info("_dropdown_options count error (error_type=%s)", type(e).__name__)
         for owner in (el, box):
             if not owner.count():
                 continue
@@ -1581,18 +1679,13 @@ class _Run:
                     return opts
             return None
         menus = self.page.locator('[role="listbox"]:visible')
-        try:
-            m_dump = menus.evaluate_all("els => els.map(e => ({id: e.id, cls: e.className, top: e.getBoundingClientRect().top, text: e.innerText.slice(0, 40)}))")
-            log.info("_dropdown_options menus dump: %r", m_dump)
-        except Exception as e:
-            log.info("_dropdown_options dump error: %s", e)
         changed_indices = menus.evaluate_all(
             """els => els.flatMap((el, i) => el.hasAttribute('data-aa-existing-text') &&
                 el.innerText.trim() !== el.getAttribute('data-aa-existing-text') ? [i] : [])"""
         )
         fresh_prompts = self.page.locator(A("promptOption") + ':visible:not([data-aa-existing-menu])')
-        log.info("_dropdown_options debug: el=%r fresh=%d menus=%d changed=%r fresh_prompts=%d",
-                 el, fresh.count(), menus.count(), changed_indices, fresh_prompts.count())
+        log.info("_dropdown_options debug: fresh=%d menus=%d changed_count=%d fresh_prompts=%d",
+                 fresh.count(), menus.count(), len(changed_indices), fresh_prompts.count())
         if len(changed_indices) == 1:
             try:
                 m = menus.nth(changed_indices[0])
@@ -1610,7 +1703,7 @@ class _Run:
                     if changed.count():
                         return changed
             except Exception as e:
-                log.info("changed_indices proximity check error: %s", e)
+                log.info("changed_indices proximity check error (error_type=%s)", type(e).__name__)
         key = el.get_attribute("data-aa-key")
         fresh_prompts = self.page.locator(A("promptOption") + ':visible:not([data-aa-existing-menu])')
         if key and not fresh_prompts.count():
@@ -1700,10 +1793,15 @@ class _Run:
             )
         except Exception:
             pass
-        if el.evaluate("el => el.tagName === 'INPUT'"):
-            el.evaluate("el => el.blur()")
-        if box.count():
-            box.evaluate("el => el.click()")
+        try:
+            if el.count() and el.evaluate("el => el.tagName === 'INPUT'"):
+                el.evaluate("el => el.blur()")
+        except Exception:
+            pass
+        try:
+            self.page.evaluate("() => { if (document.activeElement && document.activeElement !== document.body) document.activeElement.blur(); }")
+        except Exception:
+            pass
 
     def _scroll_dropdown_to_match(self, el: Locator, box: Locator, value: str,
                                   aliases: tuple[str, ...] = (), *, exact: bool = False) -> tuple[Locator, list[str], int] | None:
@@ -1790,6 +1888,8 @@ class _Run:
     def fill_workday_widget(self, f: Field, a: Answer) -> bool:
         el = self.page.locator(f'[data-aa-key="{f.key}"]').first
         values = a.value if isinstance(a.value, list) else [a.value]
+        log.info("fill_workday_widget called for %r (key=%r, kind=%r, fid=%r, source=%s, values=%d)",
+                 f.label, f.key, f.kind, f.name, a.source, len(values))
         try:
             if f.kind in ("radio", "checkbox"):
                 return self.fill_workday_radio(f, a)
@@ -1811,8 +1911,10 @@ class _Run:
                 value = values[0] if values else None
                 value = ("Yes" if value else "No") if isinstance(value, bool) else str(value or "")
                 is_lang = bool(re.search(r"language", (f.label or "") + " " + (f.name or ""), re.I))
-                idx = _pick_option_index(options, value, is_phone_device=_is_phone_device(f),
-                                         is_referral=_is_referral_source(f), is_language=is_lang, is_required=f.required)
+                idx = (_legal_option_index(options, value) if _is_legal_agreement(f) else
+                       _pick_option_index(options, value, is_phone_device=_is_phone_device(f),
+                                          is_referral=_is_referral_source(f), is_language=is_lang,
+                                          is_required=f.required))
                 if idx is None or not _is_reasonable(options[idx]):
                     return False
                 el.select_option(index=idx, timeout=5000)
@@ -1823,19 +1925,71 @@ class _Run:
                 f.current_value = options[idx]
                 return True
 
+            is_plain_text = False
+            try:
+                is_plain_text = el.evaluate("""el => {
+                    const tag = el.tagName.toLowerCase();
+                    const type = (el.getAttribute('type') || '').toLowerCase();
+                    const role = (el.getAttribute('role') || '').toLowerCase();
+                    const popup = !!(el.getAttribute('aria-haspopup') || el.getAttribute('data-automation-id')?.includes('prompt'));
+                    if (tag === 'textarea') return true;
+                    if (tag === 'input' && ['text', '', 'search', 'email', 'tel', 'url', 'number', 'password'].includes(type)) {
+                        if (role === 'combobox' || popup) return false;
+                        if (el.getAttribute('data-uxi-widget-type') === 'selectinput') return false;
+                        return true;
+                    }
+                    const inps = el.querySelectorAll('input, textarea');
+                    if (inps.length === 1) {
+                        const inp = inps[0];
+                        const itag = inp.tagName.toLowerCase();
+                        const itype = (inp.getAttribute('type') || '').toLowerCase();
+                        const irole = (inp.getAttribute('role') || '').toLowerCase();
+                        const ipopup = !!(inp.getAttribute('aria-haspopup') || inp.getAttribute('data-automation-id')?.includes('prompt'));
+                        if (itag === 'textarea') return true;
+                        if (itag === 'input' && ['text', '', 'search', 'email', 'tel', 'url', 'number', 'password'].includes(itype)) {
+                            if (irole === 'combobox' || ipopup) return false;
+                            if (inp.getAttribute('data-uxi-widget-type') === 'selectinput') return false;
+                            return true;
+                        }
+                    }
+                    return false;
+                }""")
+            except Exception:
+                pass
+
+            if is_plain_text:
+                target = el if el.evaluate("e => e.matches('input, textarea')") else el.locator('input, textarea').first
+                val = str(values[0] if values else (a.value or ""))
+                try:
+                    target.fill("")
+                    target.fill(val)
+                except Exception:
+                    target.evaluate("(e, v) => { e.value = v; e.dispatchEvent(new Event('input', {bubbles: true})); e.dispatchEvent(new Event('change', {bubbles: true})); }", val)
+                self.answers[f.key] = Answer(f.key, val, a.source, "filled text")
+                f.current_value = val
+                log.info("fill_workday_widget: filled plain text for %r (key=%r)", f.label, f.key)
+                return True
+
             ok = True
             for v in values:
                 if isinstance(v, bool):
                     v = "Yes" if v else "No"
                 v = "" if v is None or v == "None" else str(v)
-                match = _exact_option if _is_referral_source(f) or _is_phone_device(f) else _match_option
-                if match(self._control_values(el), v) is not None:
+                match = (_legal_option_index if _is_legal_agreement(f) else
+                         _exact_option if _is_referral_source(f) or _is_phone_device(f) else _match_option)
+                c_vals = self._control_values(el)
+                matched_idx = match(c_vals, v)
+                if matched_idx is not None:
+                    matched_val = c_vals[matched_idx]
+                    log.info("fill_workday_widget: existing selection matched for %r (key=%r)", f.label, f.key)
+                    self.answers[f.key] = Answer(f.key, matched_val, a.source, f"already matched: {matched_val}")
+                    f.current_value = matched_val
                     continue
                 cands = [v]
                 ok = any(self.choose_option(el, c, multi=f.kind == "combobox", field=f, required=f.required) for c in cands) and ok
             return ok
         except Exception as e:
-            log.debug("workday widget fill failed for %s: %s", f.label, e)
+            log.warning("workday widget fill failed for %r (error_type=%s)", f.label, type(e).__name__)
             return False
 
     def choose_option(self, el: Locator, value: str, *, multi: bool = False,
@@ -1850,10 +2004,8 @@ class _Run:
         key = None
         try:
             key = el.get_attribute("data-aa-key")
-            log.info("choose_option start for %r: tag=%r cls=%r key=%r fid=%r",
-                     el.evaluate("e => e.getAttribute('aria-label') || ''"),
-                     el.evaluate("e => e.tagName"), el.evaluate("e => e.className"), key,
-                     box.evaluate("e => e.getAttribute('data-automation-id')") if box.count() else None)
+            log.info("choose_option start: tag=%r key=%r",
+                     el.evaluate("e => e.tagName"), key)
         except Exception:
             pass
 
@@ -1895,8 +2047,9 @@ class _Run:
         )
         is_major = bool(re.search(r"field\s*of\s*study|fieldOfStudy|major|area\s*of\s*study", label + " " + fid, re.I))
         is_skills = bool(re.search(r"\bskills?\b", label + " " + fid, re.I))
+        is_degree = bool(re.search(r"\bdegree\b", label + " " + fid, re.I) and not is_major)
 
-        if not multi or is_school or is_major:
+        if not multi or is_school or is_major or is_degree:
             try:
                 selected_pills = box.locator(A("selectedItem"))
                 for s_idx in range(selected_pills.count()):
@@ -1923,7 +2076,7 @@ class _Run:
             try:
                 el.click(timeout=5000, force=True)
             except Exception as e:
-                log.info("could not click dropdown element: %s", e)
+                log.info("could not click dropdown element (error_type=%s)", type(e).__name__)
                 return False
 
         # If element or box has an input, or if multi/school, type the value to filter options
@@ -1937,7 +2090,7 @@ class _Run:
             pass
 
         target_inp = inp or el
-        if value and (multi or is_school or is_major or (inp and inp.is_visible())):
+        if value and not is_referral and (multi or is_school or is_major or is_degree or (inp and inp.is_visible())):
             try:
                 target_inp.fill("")
                 target_inp.press_sequentially(value, delay=20)
@@ -1948,16 +2101,23 @@ class _Run:
                     pass
 
         self.page.wait_for_timeout(1000)
+        search_val = ""
         if value:
-            try:
-                popup_inp = self.page.locator('[role="dialog"] input:visible, [role="listbox"] input:visible, input[data-automation-id="searchBox"]:visible, input[placeholder*="Search" i]:visible')
-                if popup_inp.count() and popup_inp.first.is_visible():
-                    popup_inp.first.fill("")
-                    popup_inp.first.press_sequentially(value, delay=20)
-                    popup_inp.first.press("Enter")
-                    self.page.wait_for_timeout(800)
-            except Exception:
-                pass
+            search_val = value
+            if is_referral and value.strip().casefold() in ("simplify", "job board"):
+                search_val = ""
+            elif re.search(r"\(\+\d+\)", search_val):
+                search_val = re.sub(r"\s*\(\+\d+\)", "", search_val).strip()
+            if search_val:
+                try:
+                    popup_inp = self.page.locator('[role="dialog"] input:visible, [role="listbox"] input:visible, input[data-automation-id="searchBox"]:visible, input[placeholder*="Search" i]:visible')
+                    if popup_inp.count() and popup_inp.first.is_visible():
+                        popup_inp.first.fill("")
+                        popup_inp.first.press_sequentially(search_val, delay=20)
+                        popup_inp.first.press("Enter")
+                        self.page.wait_for_timeout(800)
+                except Exception:
+                    pass
         picked = False
         chosen_text: str | None = None
         last_texts: list[str] = []
@@ -1971,15 +2131,27 @@ class _Run:
                 opts_count = 0
 
             if opts_count == 0:
-                log.info("choose_option for %r (wanted=%r, step=%d): opts_count=0", label, value, step)
-                if picked:
-                    break
-                if value and (multi or is_school or is_major or is_skills):
+                if opts_count == 0 and search_val:
                     try:
-                        target_inp.press("Enter")
-                        self.page.wait_for_timeout(400)
+                        popup_inp = self.page.locator('[role="dialog"] input:visible, [role="listbox"] input:visible, input[data-automation-id="searchBox"]:visible, input[placeholder*="Search" i]:visible')
+                        if popup_inp.count() and popup_inp.first.is_visible():
+                            popup_inp.first.fill("")
+                            popup_inp.first.press("Enter")
+                            self.page.wait_for_timeout(500)
+                            opts = self._dropdown_options(el, box)
+                            opts_count = opts.count() if opts else 0
                     except Exception:
                         pass
+                if opts_count == 0:
+                    log.info("choose_option for %r (step=%d): opts_count=0", label, step)
+                    if picked:
+                        break
+                    if value and (multi or is_school or is_major or is_skills or is_degree):
+                        try:
+                            target_inp.press("Enter")
+                            self.page.wait_for_timeout(400)
+                        except Exception:
+                            pass
                 for _ in range(6):
                     self.page.wait_for_timeout(500)
                     opts = self._dropdown_options(el, box)
@@ -1998,7 +2170,7 @@ class _Run:
             except Exception:
                 texts = []
 
-            log.info("choose_option for %r (wanted=%r): found %d options: %s", label, value, len(texts), texts[:6])
+            log.info("choose_option for %r: found %d options", label, len(texts))
 
             if not texts:
                 break
@@ -2024,40 +2196,53 @@ class _Run:
                     idx = _match_option(texts, alias)
                     if idx is not None:
                         i = idx
-                        log.info("Major matched via alias %r -> %r", alias, texts[i])
+                        log.info("Major matched via alias (option_index=%d)", i)
+                        break
+            if i is None and is_degree and value:
+                from ..answers import _degree_level
+                deg_level = _degree_level(value)
+                deg_cands = [value]
+                if deg_level == "bachelor":
+                    deg_cands += ["Bachelor of Science", "Bachelor's Degree", "Bachelor's", "Bachelor", "B.S.", "Bachelor of Science (B.S.)", "Undergraduate"]
+                for cand in deg_cands:
+                    idx = _match_option(texts, cand)
+                    if idx is not None:
+                        i = idx
+                        log.info("Degree matched via candidate (option_index=%d)", i)
                         break
             if i is None:
                 is_lang = bool(re.search(r"language", label + " " + fid, re.I))
-                i = _pick_option_index(
-                    texts, value,
-                    is_phone_device=is_phone_device,
-                    is_referral=is_referral,
-                    is_language=is_lang,
-                    is_required=is_required,
-                )
+                i = (_legal_option_index(texts, value) if _is_legal_agreement(context_field) else
+                     _pick_option_index(texts, value, is_phone_device=is_phone_device,
+                                        is_referral=is_referral, is_language=is_lang,
+                                        is_required=is_required))
             if i is None:
                 for idx, t in enumerate(texts):
                     if t.strip().lower() in ("all", "search by category", "partial list (first 500 entries)", "search by location"):
                         i = idx
                         break
-            if i is None and (is_school or is_major or is_skills or (is_referral and value.strip().casefold() in ("simplify", "job board", ""))):
+            if i is None and (is_degree or is_school or is_major or is_skills or (is_referral and value.strip().casefold() in ("simplify", "job board", ""))):
                 edu = (self.ctx.profile.get("education") or {}) if hasattr(self, "ctx") else {}
                 pers = (self.ctx.profile.get("personal") or {}) if hasattr(self, "ctx") else {}
                 pref = (self.ctx.profile.get("preferences") or {}) if hasattr(self, "ctx") else {}
                 auth = (self.ctx.profile.get("work_authorization") or {}) if hasattr(self, "ctx") else {}
                 info = {
                     "school": edu.get("school"),
+                    "degree": edu.get("degree_full") or edu.get("degree"),
                     "major": edu.get("major"),
                     "how_did_you_hear": pref.get("how_did_you_hear"),
                     "location": pers.get("location"),
-                    "us_citizen": auth.get("us_citizen", "Yes"),
-                    "authorized_us": auth.get("authorized_us", "Yes"),
-                    "needs_sponsorship": auth.get("needs_sponsorship_now", "No"),
-                    "willing_to_relocate": pref.get("willing_to_relocate", "Yes"),
+                    "us_citizen": auth.get("us_citizen"),
+                    "authorized_us": auth.get("authorized_us"),
+                    "needs_sponsorship": auth.get("needs_sponsorship_now"),
+                    "willing_to_relocate": pref.get("willing_to_relocate"),
                 }
+                source = self.answers.get(key) if key else None
+                if is_skills and source and source.source in ("profile", "bank"):
+                    info["skills"] = value
                 i = _ai_pick_option(label, texts, info, value)
             if i is None:
-                log.info("workday option %r not matched in %s", value, texts[:15])
+                log.info("workday option not matched for %r (options=%d)", label, len(texts))
                 break
 
             chosen_text = texts[i]
@@ -2078,7 +2263,7 @@ class _Run:
                     opts.nth(i).click(timeout=5000, force=True)
                     picked = True
                 except Exception as e:
-                    log.info("workday failed clicking option %d (%r): %s", i, chosen_text, e)
+                    log.info("workday failed clicking option %d (error_type=%s)", i, type(e).__name__)
                     break
 
             self.page.wait_for_timeout(500)
@@ -2088,6 +2273,8 @@ class _Run:
                 if _match_option([chosen_text], value) is not None:
                     is_target_match = True
                 elif is_major and any(_match_option([chosen_text], a) is not None for a in _major_aliases(value)):
+                    is_target_match = True
+                elif is_degree and any(_match_option([chosen_text], c) is not None for c in (deg_cands if 'deg_cands' in locals() else [value])):
                     is_target_match = True
             if is_target_match:
                 break
@@ -2119,6 +2306,8 @@ class _Run:
                 targets = [chosen_text, value]
                 if is_major and value:
                     targets.extend(_major_aliases(value))
+                if is_degree and value:
+                    targets.extend(["Bachelor of Science", "Bachelor's Degree", "Bachelor's", "Bachelor", "B.S.", "Undergraduate"])
                 pills = []
                 state = []
                 for _ in range(5):
@@ -2139,23 +2328,27 @@ class _Run:
                     self.page.wait_for_timeout(300)
                 else:
                     picked = False
-                log.info("choose_option verification for %r: pills=%r, state=%r, chosen=%r, picked=%r",
-                         label, pills, state, chosen_text, picked)
+                log.info("choose_option verification for %r: pill_count=%d, state_count=%d, picked=%r",
+                         label, len(pills), len(state), picked)
             except Exception as e:
-                log.info("choose_option verification exception: %s", e)
+                log.info("choose_option verification exception (error_type=%s)", type(e).__name__)
                 picked = False
 
         is_unit_test = self.page.url in ("about:blank", "") or self.page.url.startswith("data:")
-        if not picked and value and not is_unit_test and not (self.page.locator('[role="listbox"]:visible').count() > 1):
+        if (not picked and value and not is_unit_test and not _is_legal_agreement(context_field)
+                and not (self.page.locator('[role="listbox"]:visible').count() > 1)):
             # Fall back to Computer Use vision agent
             try:
                 from agent import vision_agent
                 log.info("choose_option DOM attempts failed for %r. Trying vision fallback...", label)
-                if vision_agent.vision_choose_option(self.page, box, label, value):
+                visual_ok = vision_agent.vision_choose_option(self.page, box, label, value)
+                self.ctx.record_layer("computer_use", "verified" if visual_ok else "escalate",
+                                      "workday_choice", fields_total=1, fields_verified=int(visual_ok))
+                if visual_ok:
                     picked = True
                     chosen_text = value
             except Exception as e:
-                log.warning("Vision choose_option fallback failed: %s", e)
+                log.warning("Vision choose_option fallback failed (error_type=%s)", type(e).__name__)
 
         if multi or not picked:
             try:
@@ -2170,7 +2363,7 @@ class _Run:
             if f:
                 f.current_value = chosen_text
 
-        log.info("choose_option result for %r: picked=%r, chosen_text=%r", label, picked, chosen_text)
+        log.info("choose_option result for %r: picked=%r", label, picked)
         return picked
 
     def fill_date(self, el: Locator, value: str) -> bool:
@@ -2219,7 +2412,7 @@ class _Run:
                 for part, present in (("month", has_month), ("day", has_day), ("year", info.get("hasYear")))
                 if present
             )
-            log.info("fill_date spinbuttons: ok=%r, actual=%r, expected=%r", ok, actual, expected)
+            log.info("fill_date spinbuttons: ok=%r, has_day=%r, has_month=%r", ok, has_day, has_month)
             return ok
         else:
             # Preserve a supplied day; native date inputs require ISO format.
@@ -2262,14 +2455,14 @@ class _Run:
             self.page.locator(f'{A("file-upload-successful")}, {A("delete-file")}').first.wait_for(timeout=30000)
             self.settle()
         except Exception as e:
-            log.info("resume upload not confirmed: %s", e)
+            log.info("resume upload not confirmed (error_type=%s)", type(e).__name__)
 
     def _ensure_education_panel(self) -> None:
         """If candidate profile contains education and the page has no education fields, click Add Education."""
         if not (self.ctx.profile.get("education") or {}).get("school"):
             return
         try:
-            log.info("running _ensure_education_panel on page %s", self.page.url)
+            log.info("running _ensure_education_panel")
             has_edu = self.page.evaluate("""() => {
                 const groups = document.querySelectorAll(
                     '[data-automation-id^="education-"], [role=group][aria-labelledby*="Education"], [role=group][aria-labelledby*="education" i]');
@@ -2319,13 +2512,13 @@ class _Run:
                 }
                 return [false, {headings, buttons: buttons.slice(0, 15)}];
             }""")
-            log.info("_ensure_education_panel: clicked=%r debug=%s", clicked, debug_info)
+            log.info("_ensure_education_panel: clicked=%r", clicked)
             if clicked:
                 log.info("clicked Add Education button on experience step")
                 self.page.wait_for_timeout(1000)
                 self.settle()
         except Exception as e:
-            log.info("could not add education panel: %s", e)
+            log.info("could not add education panel (error_type=%s)", type(e).__name__)
 
     def fill_self_identify(self) -> dict[str, Answer]:
         out: dict[str, Answer] = {}
@@ -2369,7 +2562,7 @@ class _Run:
         errs = error_texts(self.page)
         if not errs or step_name(self.page) != name:
             return
-        log.info("workday step '%s' errors: %s", name, errs)
+        log.info("workday step '%s' errors: count=%d", name, len(errs))
         if re.search(r"experience", name, re.I):
             self.drop_bad_work_experience()
         self.fill_step(name, repair=errs,
@@ -2508,8 +2701,10 @@ class _Run:
                 return bool(re.fullmatch(r"\d{4}", actual[0].strip()) and got and got[0] == wanted[0])
             return got == wanted
         if f.kind in ("select", "combobox", "radio", "checkbox"):
-            indices = {_pick_option_index(actual, _yes_no(value) or str(value),
-                         is_referral=_is_referral_source(f), is_phone_device=_is_phone_device(f)) for value in values}
+            indices = {(_legal_option_index(actual, value) if _is_legal_agreement(f) else
+                        _pick_option_index(actual, _yes_no(value) or str(value),
+                                           is_referral=_is_referral_source(f),
+                                           is_phone_device=_is_phone_device(f))) for value in values}
             return None not in indices and len(indices) == len(actual) and bool(actual)
         normalize = lambda value: " ".join(str(value).casefold().split())
         if f.kind == "file":
@@ -2520,6 +2715,8 @@ class _Run:
     def verify_review(self) -> list[str]:
         """Compare the current controls and read-only summary with grounded answers."""
         issues = []
+        checked = 0
+        verified = 0
         rows = self._review_rows()
         normalize = lambda text: re.sub(r"[\s*✱:]+$", "", " ".join(str(text).casefold().split()))
         for f in list(self.fields.values()):
@@ -2529,6 +2726,7 @@ class _Run:
                 if grounded is not None:
                     self.answers[f.key] = grounded
                 continue
+            checked += 1
             candidates = [row for row in rows if (
                 f.name and row['name'] == f.name) or normalize(row['label']) in {
                     normalize(f.label), normalize(f.label.rsplit(' - ', 1)[-1])}]
@@ -2553,9 +2751,8 @@ class _Run:
                     actual = self._control_values(el)
                 matched = self._value_matches(f, expected.value, actual)
             else:
-                if not candidates:
-                    continue
-                matched = len(candidates) == 1 and self._value_matches(f, expected.value, [candidates[0]['value']])
+                matched = bool(candidates) and len(candidates) == 1 and self._value_matches(
+                    f, expected.value, [candidates[0]['value']])
 
             if not matched:
                 # Check composite review cards (e.g. Legal Name, Address, Phone) or overall review text
@@ -2573,12 +2770,11 @@ class _Run:
                     matched = any(exp_str.casefold() in r['value'].casefold() for r in rows if "name" in r['label'].lower() or "name" in r['context'].lower())
                 elif any(w in flab for w in ("country", "state", "province", "city", "postal", "zip", "address")):
                     matched = any(exp_str.casefold() in r['value'].casefold() for r in rows if "address" in r['label'].lower() or "contact" in r['context'].lower() or "information" in r['context'].lower() or "country" in r['label'].lower())
-                if not matched and exp_str and rows:
-                    review_body = " ".join(r['value'] for r in rows)
-                    matched = exp_str.casefold() in review_body.casefold()
             if not matched:
                 self.answers[f.key] = Answer(f.key, None, "unknown", "review value could not be verified")
                 issues.append(f.label or f.key)
+            else:
+                verified += 1
         for row in rows:
             label, value = normalize(row['label']), normalize(row['value'])
             field = Field('wd-review-' + str(len(self.fields)), row['label'], 'select', True, name=row['name'])
@@ -2606,7 +2802,13 @@ class _Run:
                     self.fields[field.key] = field
                     self.answers[field.key] = Answer(field.key, None, 'unknown', 'review contradicts profile')
                     issues.append(field.label)
-        return list(dict.fromkeys(issues))
+        issues = list(dict.fromkeys(issues))
+        record_layer = getattr(self.ctx, "record_layer", None)
+        if callable(record_layer):
+            record_layer("submit_verification", "verified" if not issues else "needs_review",
+                         f"answers_checked={checked};mismatches={checked - verified}",
+                         fields_total=checked, fields_verified=verified)
+        return issues
 
     def review(self) -> ApplyResult:
         self.furthest = step_name(self.page) or "Review"
@@ -2621,7 +2823,7 @@ class _Run:
         try:
             issues = self.verify_review()
         except Exception as error:
-            log.info("Workday review inspection failed: %s", error)
+            log.info("Workday review inspection failed (error_type=%s)", type(error).__name__)
             issues = ['review could not be inspected']
         if issues:
             return self.result(ApplyStatus.NEEDS_REVIEW, "review verification failed: " + "; ".join(issues[:8]), "review")

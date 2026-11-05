@@ -9,7 +9,7 @@ from collections import Counter
 from dataclasses import dataclass, field, replace
 from itertools import zip_longest
 from pathlib import Path
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 from playwright.sync_api import Frame, Page, TimeoutError as PlaywrightTimeoutError
 
@@ -72,6 +72,12 @@ _DECLINE_RE = re.compile(r"no(?:\b.*)?|false|decline(?:\b.*)?|opt out|unsubscrib
 _MESSAGING_CHANNEL_RE = re.compile(r"\bsms\b|text messages?|whats\s*app|e-?mail|news|talent communit", re.I)
 _MESSAGING_INTENT_RE = re.compile(r"send|receiv|contact|opt.?in|subscrib|communicat|updates|consent", re.I)
 _FUTURE_PERMISSION_RE = re.compile(r"future.?opportunit|future.?consideration|other positions|additional job", re.I)
+_NON_APP_FIELD_RE = re.compile(
+    r"\b(?:search|keyword|location|radius|find jobs?|filter|job title)\b"
+    r"|match with this job|how well you match|resume match|match.*resume|match.*job|match score"
+    r"|talent community|talent network|job alerts?",
+    re.I
+)
 
 _RESUME_UPLOAD_CONTEXT_JS = r"""
 el => {
@@ -137,7 +143,41 @@ def _verification_filters(url: str, company: str, email: str | None) -> tuple[st
             if domain.lower() in ("gmail.com", "googlemail.com"):
                 email = local.split("+", 1)[0] + "@" + domain
     return hint, email
+def _form_validation_errors(page: Page) -> list[str]:
+    try:
+        errors = page.evaluate("""() => {
+          const visible = el => {
+            const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+            return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+          };
+          const errs = [];
+          document.querySelectorAll('[role=alert], [aria-invalid=true], [data-automation-id*="error" i], .error-message, .validation-error, .invalid-feedback, .field-validation-error, .alert-danger, .has-error').forEach(el => {
+            if (visible(el)) {
+              const text = (el.innerText || el.textContent || '').trim();
+              if (text && text.length < 200 && !errs.includes(text) && !/cookie|privacy/i.test(text)) {
+                errs.push(text);
+              }
+            }
+          });
+          return errs;
+        }""")
+        return errors or []
+    except Exception:
+        return []
+
+
+def _allow_register_and_submit(run: Run) -> bool:
+    pref = run.ctx.profile.get("preferences", {}).get("register_and_submit")
+    return pref is True or (isinstance(pref, str) and pref.strip().lower() in ("true", "1", "yes"))
+
+
 ACCOUNT_ACTION_RE = re.compile(r"^\s*(?:create\s+(?:an?\s+)?account|sign\s+up|register|sign\s+in|log\s*in|next|continue)\s*$", re.I)
+_ACCOUNT_BUTTON_RE = re.compile(r"^\s*(?:create\s+(?:an?\s+)?account|sign\s+up|register|sign\s+in|log\s*in)\s*$", re.I)
+_ACCOUNT_ENDPOINT_RE = re.compile(r"(?:^|[/_-])(?:account|register|registration|sign[-_]?up|sign[-_]?in|login|auth|verify|verification)(?:[/_.-]|$)", re.I)
+_NAV_ASSIGN_RE = re.compile(
+    r"(?:window\.)?location(?:\.href)?\s*=\s*(['\"])([^'\"\r\n]+)\1\s*;?\s*"
+    r"|(?:window\.)?location\.assign\(\s*(['\"])([^'\"\r\n]+)\3\s*\)\s*;?\s*"
+)
 
 _CLICKABLES_JS = r"""
 (start) => {
@@ -251,6 +291,7 @@ class Run:
     history: list[str] = field(default_factory=list)
     filled_fields: dict[str, Field] = field(default_factory=dict)
     filled_answers: dict[str, Answer] = field(default_factory=dict)
+    verified_field_keys: set[str] = field(default_factory=set)
     application_field_keys: set[str] = field(default_factory=set)
     failed_fields: set[str] = field(default_factory=set)
     retried_fields: set[str] = field(default_factory=set)
@@ -285,7 +326,9 @@ class GenericAdapter:
 
     def _run(self, run: Run) -> ApplyResult:
         if not _llm_ok():
+            run.ctx.record_layer("dom_llm", "blocked", "llm_unavailable")
             return ApplyResult(ApplyStatus.NEEDS_REVIEW, "LLM unavailable")
+        run.ctx.record_layer("dom_llm", "attempted", "generic_page_state_agent")
         page = run.page
         try:
             page.goto(run.job.url, wait_until="domcontentloaded")
@@ -315,6 +358,12 @@ class GenericAdapter:
                 consecutive_stuck = 1
                 last_sig = sig
             if consecutive_stuck >= LOOP_REPEATS or seen[sig] >= 5:
+                val_errs = _form_validation_errors(run.page)
+                if val_errs:
+                    return self._result(run, ApplyStatus.NEEDS_REVIEW,
+                                        f"form validation error: {'; '.join(val_errs[:3])}")
+                # A screenshot-only click cannot be checked by submit_decision.
+                # Stop here instead of risking an unverified final submission.
                 return self._result(run, ApplyStatus.NEEDS_REVIEW,
                                     f"stuck: same page state {LOOP_REPEATS} times at {_redacted_url(state.url)}")
 
@@ -358,26 +407,27 @@ class GenericAdapter:
             return None
         if action in ("click", "submit"):
             target = _find_clickable(state, click_index)
+            if target is not None and _account_button_label(target) and _target_has_password_form(target):
+                if not _verified_account_form(target, state.url):
+                    return self._result(run, ApplyStatus.NEEDS_REVIEW,
+                                        "account action may submit an application; manual review required")
+                return self._account(run, state, "sign_in" if re.search(r"sign\s*in|log\s*in", target.text or target.aria, re.I)
+                                     else "create_account")
             if target is not None and not run.submitted and _ambiguous_account_target(state, target):
                 return self._result(run, ApplyStatus.NEEDS_REVIEW,
                                     "account action may submit an application; manual review required")
+            if target is not None and _apply_now_label(target) and not _application_page_context(run, state):
+                if not _posting_apply_navigation(run, state, target):
+                    return self._result(run, ApplyStatus.NEEDS_REVIEW,
+                                        "Apply Now navigation is unverified; manual review required")
+                if not _click(run, target):
+                    return self._result(run, ApplyStatus.NEEDS_REVIEW,
+                                        "verified Apply Now navigation failed")
+                return None
             if action == "submit":
-                if target is not None and _posting_apply_navigation(run, state, target):
-                    _click(run, target)
-                    return None
                 return self._submit(run, state, target, reason)
             if target is None:
-                is_unit_test = run.page.url in ("about:blank", "") or run.page.url.startswith("data:")
-                if not is_unit_test:
-                    try:
-                        from .. import vision_agent
-                        ok = vision_agent.locate_and_act(run.page, goal=reason or "Click the requested element", action_hint="click")
-                        if ok:
-                            run.history.append(f"  (vision locate_and_act clicked for: {reason[:100]})")
-                            return None
-                    except Exception:
-                        pass
-                run.history.append(f"  (no clickable with index {click_index})")
+                run.history.append(f"  (no verified clickable with index {click_index}; vision click withheld)")
                 return None
             label = f"{target.text} {target.aria}".strip()
             if FORBIDDEN_TEXT_RE.search(label):
@@ -438,7 +488,11 @@ class GenericAdapter:
             ans = _guard_choices(fields, ans, run.ctx.profile)
             ans = _guard_files(fields, ans, run.ctx.profile)
             try:
-                scope_failed = set(form.fill_fields(scope, fields, ans))
+                if run.ctx.config.get("computer_use", {}).get("enabled", False):
+                    filled_failures = form.fill_fields(scope, fields, ans, page=run.page, layer_context=run.ctx)
+                else:
+                    filled_failures = form.fill_fields(scope, fields, ans)
+                scope_failed = set(filled_failures)
                 for f in fields:
                     a = next((a for a in ans if a.key == f.key), None)
                     if (f.kind in ("select", "combobox", "radio", "checkbox") and a
@@ -447,7 +501,8 @@ class GenericAdapter:
                             scope_failed.discard(f.key)
                         else:
                             is_unit_test = run.page.url in ("about:blank", "") or run.page.url.startswith("data:")
-                            if not is_unit_test and f.kind in ("select", "combobox"):
+                            if (not is_unit_test and f.kind in ("select", "combobox")
+                                    and not run.ctx.config.get("computer_use", {}).get("enabled", False)):
                                 try:
                                     from .. import vision_agent
                                     el = scope.locator(f'[data-aa-key="{f.key}"]')
@@ -469,12 +524,14 @@ class GenericAdapter:
                 run.filled_fields[k] = replace(f, key=k)
                 a = by_key.get(f.key)
                 run.filled_answers[k] = replace(a, key=k) if a else Answer(k, None, "unknown")
+                if on_application:
+                    run.application_field_keys.add(k)
                 if f.key in scope_failed:
                     run.failed_fields.add(k)
+                    run.verified_field_keys.discard(k)
                 else:
                     run.failed_fields.discard(k)
-                    if on_application:
-                        run.application_field_keys.add(k)
+                    run.verified_field_keys.add(k)
                     if f.kind == "file" and a and a.source == "profile" and a.value:
                         run.resume_uploaded = True
         if failed:
@@ -510,18 +567,51 @@ class GenericAdapter:
             run.retried_fields.update(retry)
             self._fill(run, state, only_keys=retry)
         mismatches = []
+        current_answer_keys = set()
+        mismatch_keys = set()
         for n, (scope, fs) in enumerate(state.scopes):
             for f in fs:
                 key = _field_id(path, n, f)
                 answer = run.filled_answers.get(key)
-                if (f.kind in ("select", "combobox", "radio", "checkbox") and answer
-                        and answer.source != "unknown" and answer.value not in (None, "", [])
-                        and not _verified_choice(scope, f, answer)):
+                if answer and answer.source != "unknown" and answer.value not in (None, "", []):
+                    current_answer_keys.add(key)
+                    verify_answer = getattr(form, "verify_answer_value", None)
+                    value_matches = (verify_answer(scope, f, answer) if verify_answer else
+                                     _verified_choice(scope, f, answer)
+                                     if f.kind in ("select", "combobox", "radio", "checkbox") else True)
+                    if value_matches:
+                        continue
                     run.failed_fields.add(key)
                     mismatches.append(f.label or f.key)
-        if mismatches:
+                    mismatch_keys.add(key)
+        app_answer_keys = _known_application_answer_keys(run)
+        if review_page:
+            for key in app_answer_keys - current_answer_keys:
+                field = run.filled_fields.get(key)
+                answer = run.filled_answers.get(key)
+                if field is None or answer is None:
+                    continue
+                present, shown = _review_summary_value(state, field)
+                if present and not _review_summary_matches(field, answer, shown):
+                    run.failed_fields.add(key)
+                    mismatch_keys.add(key)
+                    mismatches.append(field.label or key)
+        checked_keys = app_answer_keys | current_answer_keys
+        unverified = {key for key in checked_keys
+                      if key not in run.verified_field_keys or key in run.failed_fields}
+        verified = len(checked_keys) - len(unverified)
+        mismatch_count = len(unverified | mismatch_keys)
+        run.ctx.record_layer("submit_verification", "verified" if mismatch_count == 0 else "needs_review",
+                             f"answers_checked={len(checked_keys)};mismatches={mismatch_count}",
+                             fields_total=len(checked_keys), fields_verified=verified)
+        if mismatches or unverified or mismatch_keys:
+            labels = [run.filled_fields[key].label or key for key in sorted(unverified)
+                      if key in run.filled_fields]
+            detail = list(dict.fromkeys(mismatches + labels))
+            message = ("selected values do not match verified answers" if mismatches or mismatch_keys
+                       else "application values lack verification")
             return self._result(run, ApplyStatus.NEEDS_REVIEW,
-                                f"selected values do not match verified answers: {', '.join(mismatches[:8])}")
+                                f"{message}: {', '.join(detail[:8]) or 'unknown field'}")
         failed_required = [run.filled_fields[k].label or k for k in sorted(run.failed_fields)
                            if k in run.filled_fields and run.filled_fields[k].required]
         if failed_required:
@@ -568,6 +658,7 @@ class GenericAdapter:
         run.submitted = True
         _settle(run.page, idle_ms=8000)
         if _new_confirmation(run, _page_text(run.page)):
+            run.ctx.record_layer("submission", "confirmed", "confirmation_detected")
             return self._success(run, "confirmation text seen")
         return None
 
@@ -576,6 +667,11 @@ class GenericAdapter:
                 and not run.ctx.config.get("accounts", {}).get("create_in_fill_only", False)):
             return self._result(run, ApplyStatus.NEEDS_REVIEW,
                                 "account required (not created in fill_only mode)")
+        account_button = next((c for c in state.clickables if _account_button_label(c)
+                               and _target_has_password_form(c)
+                               and (bool(re.fullmatch(r"\s*(?:sign\s*in|log\s*in)\s*",
+                                                      (c.text or c.aria), re.I)) == (action == "sign_in"))), None)
+        account_only = account_button is not None and _verified_account_form(account_button, state.url)
         url = run.page.url
         try:
             tenant = vault.tenant_key_for(url)
@@ -593,7 +689,9 @@ class GenericAdapter:
         except Exception as e:
             return self._result(run, ApplyStatus.NEEDS_REVIEW, f"account vault error: {e}"[:300])
         run.account = acct
-        scope = _scope_with(state, "input[type=password]") or run.page
+        scope = (account_button.frame.locator(f'[data-aa-click="{account_button.index}"]')
+                 .locator("xpath=ancestor::form[1]") if account_button else
+                 (_scope_with(state, "input[type=password]") or run.page))
         if not _fill_first(scope, _EMAIL_SEL, acct.email):
             run.history.append("  (no email/username input found)")
             return None
@@ -604,12 +702,21 @@ class GenericAdapter:
                     pw.nth(i).fill(acct.password)
         except Exception:
             pass
-        others = [(s, [f for f in fs if f.kind != "email" and not re.search(r"e-?mail|password|user ?name", f.label, re.I)])
-                  for s, fs in state.scopes]
-        if any(fs for _, fs in others):
-            self._fill(run, State(state.url, state.title, None, others, [], ""))
-        return self._result(run, ApplyStatus.NEEDS_REVIEW,
-                            "account form filled; action may submit an application, manual review required")
+        if not account_only:
+            return self._result(run, ApplyStatus.NEEDS_REVIEW,
+                                "account form is not a separate account-only action; manual review required")
+        if run.ctx.dry_run:
+            return self._result(run, ApplyStatus.NEEDS_REVIEW,
+                                "account action withheld in dry run; manual review required")
+        if action == "create_account" and not _allow_register_and_submit(run):
+            return self._result(run, ApplyStatus.NEEDS_REVIEW,
+                                "account form filled; action may submit an application, manual review required")
+        if not _click(run, account_button):
+            return self._result(run, ApplyStatus.NEEDS_REVIEW,
+                                "account action click failed; manual review required")
+        run.history.append(f"  (clicked account action: {account_button.text or account_button.aria})")
+        _settle(run.page, idle_ms=3000)
+        return None
 
     def _verify(self, run: Run, state: State, want: str) -> ApplyResult | None:
         if want != "code":
@@ -934,12 +1041,24 @@ Previous actions:
 Reply with JSON: {{"action": ..., "click_index": <int, for click/submit>, "reason": <short>}}."""
 
 
+def _is_initial_posting(run: Run, state: State) -> bool:
+    if run.application_field_keys or run.filled_fields:
+        return False
+    has_posting_markers = bool(re.search(
+        r"job description|about (?:the |this )?(?:job|role|position)|responsibilities|qualifications|about (?:us|the company)|what you(?:'ll| will) do|who you are|position summary",
+        state.text, re.I
+    ))
+    is_job_url = bool(re.search(r"/(?:job|jobs|careers|posting|position)s?/", state.url, re.I))
+    return has_posting_markers or is_job_url
+
+
 def _has_app_form(run: Run, state: State) -> bool:
     """True once we're on an actual application (not a posting page with a search or newsletter box)."""
-    fs = state.fields
+    fs = [f for f in state.fields if not _NON_APP_FIELD_RE.search(f"{f.label} {f.name}")]
+    app_file_fields = [f for f in fs if f.kind == "file"]
     applicant_fields = sum(1 for f in fs if f.kind != "file"
                            and (f.kind in ("email", "tel") or APP_FIELD_RE.search(f.label)))
-    if applicant_fields >= 2 or (applicant_fields >= 1 and any(f.kind == "file" for f in fs)):
+    if applicant_fields >= 2 or (applicant_fields >= 1 and bool(app_file_fields)):
         return True
     # Later wizard steps (questions, review) have no contact fields; a talent-community box is 1-2 fields.
     return bool(run.application_field_keys)
@@ -992,21 +1111,57 @@ def _review_action_button(state: State, target: Clickable) -> bool:
 
 
 def _validated_app_answers(run: Run) -> bool:
-    for key, field in run.filled_fields.items():
-        answer = run.filled_answers.get(key)
-        if (key in run.application_field_keys and key not in run.failed_fields and answer is not None
-                and answer.source in ("profile", "bank")
-                and isinstance(answer.value, str) and answer.value.strip()
-                and (field.kind in ("email", "tel", "file")
-                     or APP_FIELD_RE.search(f"{field.label} {field.name}"))):
-            return True
-    return False
+    keys = _known_application_answer_keys(run)
+    return bool(keys) and all(key in run.verified_field_keys and key not in run.failed_fields for key in keys)
+
+
+def _known_application_answer_keys(run: Run) -> set[str]:
+    return {
+        key for key in run.application_field_keys
+        if (answer := run.filled_answers.get(key)) is not None
+        and answer.source != "unknown" and answer.value not in (None, "", [])
+    }
+
+
+def _review_summary_value(state: State, field: Field) -> tuple[bool, str]:
+    normalize = lambda value: re.sub(r"[^a-z0-9]+", " ", str(value).casefold()).strip()
+    labels = {normalize(field.label), normalize(field.name.replace("_", " ")) if field.name else ""}
+    scopes = [scope for scope, _ in state.scopes]
+    for scope in scopes:
+        try:
+            text = scope.locator("body").inner_text(timeout=2000)
+        except Exception:
+            continue
+        for line in text.splitlines():
+            label, sep, value = line.partition(":")
+            if sep and normalize(label) in labels:
+                return True, value.strip()
+    return False, ""
+
+
+def _review_summary_matches(field: Field, answer: Answer, shown: str) -> bool:
+    if isinstance(answer.value, list):
+        values = [value.strip() for value in re.split(r"[,;]", shown) if value.strip()]
+        return len(values) == len(answer.value) and all(
+            form.option_matches(wanted, actual)
+            for wanted, actual in zip(sorted(answer.value), sorted(values)))
+    expected = str(answer.value)
+    if field.kind == "file":
+        from pathlib import Path
+        return Path(expected).name.casefold() == shown.casefold()
+    if field.kind == "tel":
+        left, right = re.sub(r"\D", "", expected), re.sub(r"\D", "", shown)
+        return bool(left and right and (left.endswith(right) or right.endswith(left)))
+    matcher = getattr(form, "option_matches", None)
+    return ((callable(matcher) and matcher(expected, shown))
+            or " ".join(expected.casefold().split()) == " ".join(shown.casefold().split()))
 
 
 def _application_page_context(run: Run, state: State) -> bool:
     if _has_app_form(run, state) or _application_review(state):
         return True
-    if not state.fields:
+    app_fields = [f for f in state.fields if not _NON_APP_FIELD_RE.search(f"{f.label} {f.name}")]
+    if not app_fields:
         return False
     path = urlparse(state.url).path
     return bool(re.search(r"(?:^|/)(?:apply|application)(?:-[^/]*)?(?:/|$)", path, re.I)
@@ -1039,6 +1194,52 @@ def _ambiguous_account_target(state: State, target: Clickable) -> bool:
         return False
 
 
+def _account_button_label(target: Clickable) -> bool:
+    labels = [s.strip() for s in (target.text, target.aria) if s.strip()]
+    return bool(labels) and all(_ACCOUNT_BUTTON_RE.fullmatch(s) for s in labels)
+
+
+def _target_has_password_form(target: Clickable) -> bool:
+    try:
+        return bool(target.frame.locator(f'[data-aa-click="{target.index}"]').first.evaluate(
+            "el => !!(el.form || el.closest('form'))?.querySelector('input[type=password]')"))
+    except Exception:
+        return False
+
+
+def _verified_account_form(target: Clickable, page_url: str) -> bool:
+    """Account submission is allowed only for a distinct, plain account form."""
+    try:
+        info = target.frame.locator(f'[data-aa-click="{target.index}"]').first.evaluate("""el => {
+          const f = el.form || el.closest('form');
+          if (!f || el.tagName !== 'BUTTON' || el.type !== 'submit' ||
+              el.hasAttribute('formaction') || el.hasAttribute('formmethod') ||
+              el.hasAttribute('onclick') || f.hasAttribute('onsubmit')) return null;
+          const fields = [...f.querySelectorAll('input,select,textarea')];
+          const named = x => [x.name, x.id, x.getAttribute('autocomplete'), x.getAttribute('aria-label')]
+            .filter(Boolean).join(' ').toLowerCase();
+          if (!fields.some(x => x.type === 'password') ||
+              !fields.some(x => x.type === 'email' || /(?:^|\\W)(email|username|user name)(?:$|\\W)/.test(named(x)))) return null;
+          const onlyAccountFields = fields.every(x => {
+            const n = named(x);
+            if (x.type === 'hidden') return /csrf|authenticity|token|nonce/.test(n);
+            if (x.tagName !== 'INPUT') return false;
+            if (x.type === 'password' || x.type === 'email') return true;
+            if (x.type === 'checkbox') return /terms|privacy|consent/.test(n);
+            return /^(?:user(?:name)?|email|confirm.?password|password|login|identifier)$/.test(n.trim());
+          });
+          return onlyAccountFields ? {action: f.action, method: f.method} : null;
+        }""")
+        if not info or info["method"].lower() != "post":
+            return False
+        dest, source = urlparse(info["action"]), urlparse(page_url)
+        return (dest.scheme in ("http", "https") and dest.netloc == source.netloc
+                and bool(_ACCOUNT_ENDPOINT_RE.search(dest.path))
+                and not re.search(r"(?:^|/)(?:apply|application|submit|thanks|confirmation)(?:/|$)", dest.path, re.I))
+    except Exception:
+        return False
+
+
 def _final_like(run: Run, state: State, target: Clickable, label: str) -> bool:
     """Whether clicking `target` could send the application (then it must go through submit_decision)."""
     if _posting_apply_navigation(run, state, target):
@@ -1065,9 +1266,40 @@ def _apply_now_label(target: Clickable) -> bool:
 
 
 def _posting_apply_navigation(run: Run, state: State, target: Clickable) -> bool:
-    """Apply Now on a posting can open the actual form even beside a resume matching widget."""
-    return (not target.is_submit and _apply_now_label(target)
-            and not _application_page_context(run, state))
+    """Only explicit links and navigation-only inline handlers bypass the submit gate."""
+    if not _apply_now_label(target) or target.is_submit or run.filled_fields or run.application_field_keys:
+        return False
+    if _application_page_context(run, state) or _application_review(state):
+        return False
+    try:
+        info = target.frame.locator(f'[data-aa-click="{target.index}"]').first.evaluate("""el => ({
+          tag: el.tagName.toLowerCase(), href: el.getAttribute('href'), onclick: el.getAttribute('onclick'),
+          inForm: !!(el.form || el.closest('form')),
+          otherHandlers: [...el.attributes].some(a => /^on/i.test(a.name) && a.name !== 'onclick'
+            || /^(?:data-bind|ng-click|x-on:click|@click|v-on:click)$/.test(a.name))
+        })""")
+        if info["inForm"] or info["otherHandlers"]:
+            return False
+        handler = (info["onclick"] or "").strip()
+        if handler:
+            if info["href"]:
+                return False
+            m = _NAV_ASSIGN_RE.fullmatch(handler)
+            if not m:
+                return False
+            destination = m.group(2) or m.group(4)
+        elif info["tag"] == "a" and info["href"]:
+            destination = info["href"]
+        else:
+            return False
+        dest = urlparse(urljoin(state.url, destination))
+        current = urlparse(state.url)
+        return (dest.scheme in ("http", "https") and bool(dest.netloc)
+                and (dest.netloc, dest.path, dest.query) != (current.netloc, current.path, current.query)
+                and not re.search(r"(?:^|/)(?:submit|thanks|complete|confirmation|finish)(?:/|$)", dest.path, re.I)
+                and not re.search(r"(?:^|[?&])(?:submit|complete|confirm)=", dest.query, re.I))
+    except Exception:
+        return False
 
 
 def _find_clickable(state: State, index) -> Clickable | None:

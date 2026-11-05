@@ -97,3 +97,16 @@ def test_apply_cli_reports_lock_busy_with_tempfail(temp_db, monkeypatch, capsys)
 
     assert exit_code == cli.EX_TEMPFAIL
     assert "apply skipped" in capsys.readouterr().err
+
+
+def test_pick_continues_when_email_sync_fails(temp_db, monkeypatch, capsys):
+    from agent import prior_apps
+
+    def fail_sync(**kwargs):
+        raise RuntimeError("mail service temporarily unavailable")
+
+    monkeypatch.setattr(prior_apps, "sync_email_confirmations", fail_sync)
+    result = cli.cmd_pick(SimpleNamespace(all=True, limit=10, include_applied=False,
+                                           export=False, list_only=True))
+    assert result == 0
+    assert "No new unapplied postings" in capsys.readouterr().out
