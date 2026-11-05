@@ -3,8 +3,13 @@ from __future__ import annotations
 
 import argparse
 import curses
-import subprocess
+import json
+import logging
+import threading
+import time
 import sys
+
+from concurrent.futures import CancelledError
 
 from . import db
 
@@ -18,7 +23,7 @@ def _draw(screen, y, text, selected=False):
             pass
 
 
-def _choose(screen, title, options):
+def _choose(screen, title, options, *, email_toggle=False):
     selected = 0
     while True:
         screen.erase()
@@ -27,9 +32,14 @@ def _choose(screen, title, options):
         first = max(0, selected - count + 1)
         for i, label in enumerate(options[first:first + count], first):
             _draw(screen, i - first + 2, label, i == selected)
-        _draw(screen, screen.getmaxyx()[0] - 2, '↑/↓ move · Enter select · Esc back · q quit')
+        footer = '↑/↓ move · Enter select · q back'
+        if email_toggle:
+            footer += ' · e email ' + ('ON' if db.kv_get('pick_email_check') != 'false' else 'OFF')
+        _draw(screen, screen.getmaxyx()[0] - 2, footer)
         screen.refresh()
         key = screen.getch()
+        if email_toggle and key == ord('e'):
+            db.kv_set('pick_email_check', 'false' if db.kv_get('pick_email_check') != 'false' else 'true')
         if key in (27, ord('q')):
             return None
         if key in (curses.KEY_UP, ord('k')):
@@ -63,84 +73,184 @@ def _input(screen, label, default=''):
             edited = True
 
 
-def _number(screen):
-    from .__main__ import _positive_int
-    while True:
-        value = _input(screen, 'Maximum jobs', db.kv_get('tui_limit') or '25')
-        if value is None:
-            return None
+def _queue():
+    try:
+        value = json.loads(db.kv_get('tui_queue') or '[]')
+        return {item for item in value if isinstance(item, str)} if isinstance(value, list) else set()
+    except ValueError:
+        return set()
+
+
+def _save_selection(rows, selected):
+    queue = (_queue() - {row['id'] for row in rows}) | selected
+    db.kv_set('tui_queue', json.dumps(sorted(queue)))
+
+
+def _working(screen, title, work):
+    """Keep curses on the main thread while a finite operation runs."""
+    done, stop, result = threading.Event(), threading.Event(), {}
+    progress = [title]
+
+    def emit(message):
+        progress[0] = str(message)
+
+    class Progress(logging.Handler):
+        def emit(self, record):
+            emit(record.getMessage())
+
+    root = logging.getLogger()
+    original_handlers = list(root.handlers)
+    streams = [h for h in root.handlers if isinstance(h, logging.StreamHandler)
+               and not isinstance(h, logging.FileHandler)]
+    handler = Progress()
+    for stream in streams:
+        root.removeHandler(stream)
+    root.addHandler(handler)
+
+    def worker():
         try:
-            _positive_int(value)
-            db.kv_set('tui_limit', value)
-            return value
-        except argparse.ArgumentTypeError:
-            if _choose(screen, 'Enter a positive whole number', ['Try again']) is None:
-                return None
+            result['value'] = work(emit, stop)
+        except BaseException as error:
+            result['error'] = error
+        finally:
+            done.set()
+
+    thread = threading.Thread(target=worker, name='tui-operation')
+    frame = 0
+    try:
+        screen.nodelay(True)
+        thread.start()
+        while frame == 0 or not done.is_set():
+            try:
+                screen.erase()
+                _draw(screen, 0, f'⚙ {"⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[frame % 10]} {title}')
+                _draw(screen, 2, progress[0])
+                _draw(screen, screen.getmaxyx()[0] - 2, 'q / Esc / Ctrl-C: stop after current operation')
+                screen.refresh()
+                if screen.getch() in (ord('q'), 27, 3):
+                    stop.set()
+                if stop.is_set():
+                    emit('Stopping after the current operation…')
+                done.wait(0.1)
+                frame += 1
+            except KeyboardInterrupt:
+                stop.set()
+                emit('Stopping after the current operation…')
+        thread.join()
+    finally:
+        # A worker must finish before terminal ownership or logging is restored.
+        if thread.is_alive():
+            stop.set()
+        while thread.is_alive():
+            try:
+                thread.join(0.1)
+            except KeyboardInterrupt:
+                pass
+        root.handlers[:] = original_handlers
+        screen.nodelay(False)
+        try:
+            curses.flushinp()
+        except curses.error:
+            pass
+    if 'error' in result:
+        raise result['error']
+    return result['value']
 
 
-def _application_options(screen):
-    choice = _choose(screen, 'Application mode', ['Dry run', 'Fill only', 'Submit real applications'])
-    if choice is None:
-        return None
-    flags = [['--dry-run'], ['--mode', 'fill_only'], ['--mode', 'full']][choice]
-    if db.kv_get('tui_visible') == 'true':
-        flags += ['--visible']
-    return flags
-
-
-def _search(screen):
+def _dates(screen):
     from .__main__ import _date_arg
     while True:
-        dates = []
+        values = []
         for label in ('From date (YYYY-MM-DD, blank for any)', 'Through date (YYYY-MM-DD, blank for any)'):
-            value = _input(screen, label)
-            if value is None:
+            text = _input(screen, label)
+            if text is None:
                 return None
-            dates.append(value)
-        try:
-            parsed = [_date_arg(v) if v else None for v in dates]
-            if all(parsed) and parsed[0] > parsed[1]:
-                raise ValueError
-            break
-        except (ValueError, argparse.ArgumentTypeError):
-            if _choose(screen, 'Use valid dates with From on or before Through', ['Try again']) is None:
-                return None
-    limit = _number(screen)
-    if limit is None:
-        return None
-    choice = _choose(screen, 'Search jobs', ['Show list', 'Select jobs to apply'])
-    if choice is None:
-        return None
-    flags = ['pick', '--all', '--limit', limit]
-    for flag, value in zip(('--from-date', '--to-date'), dates):
-        if value:
-            flags += [flag, value]
-    if choice == 0:
-        flags += ['--list-only']
-    else:
-        options = _application_options(screen)
-        if options is None:
+            try:
+                values.append(_date_arg(text) if text else None)
+            except argparse.ArgumentTypeError:
+                break
+        if len(values) == 2 and not (all(values) and values[0] > values[1]):
+            return values
+        if _choose(screen, 'Use valid dates with From on or before Through', ['Try again']) is None:
             return None
-        flags += options
-    return flags
 
 
-def _settings(screen):
+def _load_jobs(emit, stop, *, dates=None, latest=False):
+    from .config import load_config
+    from .job_search import find_jobs
+    from .scheduler import fetch_once
+    emit('Refreshing job sources…')
+    fetch_once(load_config())
+    if stop.is_set():
+        raise CancelledError()
+    notes = []
+
+    def progress(message):
+        notes.append(message)
+        emit(message)
+
+    rows, _ = find_jobs(start_date=dates[0] if dates else None, end_date=dates[1] if dates else None,
+                        since_last_application=latest, emit=progress)
+    if stop.is_set():
+        raise CancelledError()
+    return rows, notes[-1] if notes else ''
+
+
+def _select_jobs(screen, rows, note='', *, queue_view=False):
+    if not rows:
+        _choose(screen, 'No matching jobs', ['Back'])
+        return False
+    cursor, selected = 0, _queue() & {row['id'] for row in rows}
     while True:
-        email = db.kv_get('pick_email_check') != 'false'
-        visible = db.kv_get('tui_visible') == 'true'
-        choice = _choose(screen, 'Settings', [
-            f'Check recent email before listing jobs: {"ON" if email else "OFF"}',
-            f'Show application browser: {"ON" if visible else "OFF"}',
-            'Default maximum jobs', 'Back'])
-        if choice is None or choice == 3:
-            return
-        if choice == 0:
-            db.kv_set('pick_email_check', 'false' if email else 'true')
-        elif choice == 1:
-            db.kv_set('tui_visible', 'false' if visible else 'true')
-        else:
-            _number(screen)
+        screen.erase()
+        height = screen.getmaxyx()[0]
+        _draw(screen, 0, f'{"Queued jobs" if queue_view else "Jobs"} ({len(rows)}) · Selected ({len(selected)})')
+        _draw(screen, 1, note)
+        count = max(1, height - 6)
+        first = max(0, cursor - count + 1)
+        for index, row in enumerate(rows[first:first + count], first):
+            date = time.strftime('%Y-%m-%d', time.localtime(row['date_posted'] or row['first_seen']))
+            mark = 'x' if row['id'] in selected else ' '
+            _draw(screen, index - first + 3, f"[{mark}] {date} [{row['status']}] {row['company']} — {row['title']}", index == cursor)
+        _draw(screen, height - 3, rows[cursor]['url'])
+        _draw(screen, height - 2, 'Space toggle · a all · n none · Enter ' + ('submit ready jobs' if queue_view else 'queue') + ' · q cancel')
+        screen.refresh()
+        key = screen.getch()
+        if key in (27, ord('q')):
+            return False
+        if key in (curses.KEY_UP, ord('k')):
+            cursor = (cursor - 1) % len(rows)
+        elif key in (curses.KEY_DOWN, ord('j')):
+            cursor = (cursor + 1) % len(rows)
+        elif key == ord(' '):
+            job_id = rows[cursor]['id']
+            selected.symmetric_difference_update({job_id})
+        elif key == ord('a'):
+            selected = {row['id'] for row in rows}
+        elif key == ord('n'):
+            selected.clear()
+        elif key in (10, 13, curses.KEY_ENTER):
+            _save_selection(rows, selected)
+            return True
+
+
+def _apply_queue(emit, stop):
+    from .config import load_config, load_profile
+    from .runner import apply_batch
+    from . import application_history
+    application_history.initialize_from_records()
+    queued = _queue()
+    retained = {job_id for job_id in queued
+                if (job := db.get_job(job_id)) is not None and not application_history.find_application(job)}
+    jobs = sorted(job_id for job_id in retained if db.get_job_status(job_id) in ('new', 'failed_retry'))
+    db.kv_set('tui_queue', json.dumps(sorted(retained)))
+    if not jobs:
+        return None
+    stats = apply_batch(load_config(), load_profile(), limit=len(jobs), job_ids=jobs, submit_mode='full', stop_event=stop)
+    if stats.run_id:
+        remaining = {job_id for job_id in jobs if db.get_job_status(job_id) in ('new', 'failed_retry', 'needs_review', 'failed')}
+        db.kv_set('tui_queue', json.dumps(sorted((_queue() - set(jobs)) | remaining)))
+    return stats
 
 
 def _menu(screen):
@@ -149,58 +259,49 @@ def _menu(screen):
     except curses.error:
         pass
     screen.keypad(True)
-    options = ['Search saved jobs by date', 'Fetch latest jobs', 'Apply to queued jobs',
-               'Review jobs', 'Interview', 'Status', 'Report', 'Settings',
-               'Check setup', 'Authorize Gmail', 'Scheduled loop', 'Saved accounts', 'Initialize application WAL', 'Quit']
     while True:
-        choice = _choose(screen, 'Application agent', options)
-        if choice is None or choice == 13:
-            return None
-        if choice == 0:
-            result = _search(screen)
-            if result:
-                return result
-        elif choice == 7:
-            _settings(screen)
-        elif choice == 10:
-            start = _choose(screen, 'Scheduled loop can submit real applications',
-                            ['Cancel', 'Start configured loop (real submissions allowed)'])
-            if start == 1:
-                return ['loop']
-        elif choice == 12:
-            source = _choose(screen, 'Initialize application WAL',
-                             ['Past application records (local)', 'Confirmation emails (Gmail)', 'Both'])
-            if source is not None:
-                return ['init-wal', '--source', ['records', 'emails', 'both'][source]]
-        elif choice in (2, 3):
-            limit = _number(screen)
-            if limit is None:
-                continue
-            if choice == 3:
-                return ['review', '--limit', limit]
-            flags = _application_options(screen)
-            if flags is not None:
-                return ['apply', '--limit', limit, *flags]
-        else:
-            return {1: ['fetch'], 4: ['interview'], 5: ['status'], 6: ['report'],
-                    8: ['doctor'], 9: ['auth', 'gmail'], 11: ['accounts', 'list']}[choice]
+        choice = _choose(screen, 'Application agent', ['Get latest jobs', 'Search by date',
+                         f'Apply to queued jobs ({len(_queue())})', 'Quit'], email_toggle=True)
+        if choice is None or choice == 3:
+            return
+        try:
+            if choice in (0, 1):
+                dates = _dates(screen) if choice == 1 else None
+                if choice == 1 and dates is None:
+                    continue
+                rows, note = _working(screen, 'Getting jobs',
+                                      lambda emit, stop: _load_jobs(emit, stop, dates=dates, latest=choice == 0))
+                _select_jobs(screen, rows, note)
+            elif not _queue():
+                _choose(screen, 'The application queue is empty', ['Back'])
+            else:
+                queued = _queue()
+                with db.connect() as c:
+                    rows = [row for row in c.execute('SELECT * FROM jobs ORDER BY company,title')
+                            if row['id'] in queued]
+                if not _select_jobs(screen, rows, 'Enter submits ready jobs; review items stay queued.', queue_view=True):
+                    continue
+                stats = _working(screen, 'Applying to queued jobs', _apply_queue)
+                if stats and stats.run_id:
+                    _choose(screen, f'Submitted {stats.submitted} · Review {stats.queued} · Failed {stats.failed}', ['Back'])
+                elif stats is not None:
+                    _choose(screen, 'Queue is busy; queued jobs were kept', ['Back'])
+                else:
+                    _choose(screen, 'No ready jobs; review items remain queued', ['Back'])
+        except CancelledError:
+            continue
+        except Exception as error:
+            logging.getLogger(__name__).exception('TUI operation failed')
+            _choose(screen, f'Operation failed ({type(error).__name__}); see logs', ['Back'])
 
 
 def run() -> int:
     if not sys.stdin.isatty() or not sys.stdout.isatty():
-        print('The terminal menu needs an interactive terminal. Use python -m agent --help for CLI modes.',
-              file=sys.stderr)
+        print('The terminal menu needs an interactive terminal. Use python -m agent --help for CLI modes.', file=sys.stderr)
         return 2
     try:
-        while True:
-            command = curses.wrapper(_menu)
-            if command is None:
-                return 0
-            try:
-                subprocess.run([sys.executable, '-m', 'agent', *command], check=False)
-            except KeyboardInterrupt:
-                print('\nCommand interrupted.')
-            input('\nPress Enter to return to the menu…')
+        curses.wrapper(_menu)
+        return 0
     except (KeyboardInterrupt, EOFError):
         return 0
     except curses.error:

@@ -1,4 +1,5 @@
 from datetime import datetime
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -81,24 +82,6 @@ def test_reversed_dates_rejected_before_mail(local_db, monkeypatch):
     assert cli.main(['pick', '--from-date', '2026-11-02', '--to-date', '2026-11-01']) == 2
 
 
-def test_tui_search_builds_cli_arguments_and_cancel_has_no_command(local_db, monkeypatch):
-    answers = iter(['2026-10-01', '2026-10-03', '5'])
-    monkeypatch.setattr(tui, '_input', lambda *a: next(answers))
-    monkeypatch.setattr(tui, '_choose', lambda *a: 0)
-    assert tui._search(None) == ['pick', '--all', '--limit', '5', '--from-date', '2026-10-01',
-                                 '--to-date', '2026-10-03', '--list-only']
-    monkeypatch.setattr(tui, '_input', lambda *a: None)
-    assert tui._search(None) is None
-
-
-def test_settings_persist_email_toggle(local_db, monkeypatch):
-    choices = iter([0, 3])
-    monkeypatch.setattr(tui, '_choose', lambda *a: next(choices))
-    tui._settings(None)
-    assert db.kv_get('pick_email_check') == 'false'
-    choices = iter([0, 3])
-    tui._settings(None)
-    assert db.kv_get('pick_email_check') == 'true'
 
 
 def test_historical_cycle_can_match_explicit_historical_role():
@@ -127,30 +110,141 @@ def test_initialize_local_wal_is_idempotent_and_never_reads_email(local_db, monk
     assert cli.main(['init-wal', '--source', 'records']) == 0
 
 
-def test_tui_initialization_dispatch_and_default_application_mode(local_db, monkeypatch):
-    choices = iter([12, 1])
-    monkeypatch.setattr(tui, '_choose', lambda *a: next(choices))
-    assert tui._menu(SimpleNamespace(keypad=lambda _: None)) == ['init-wal', '--source', 'emails']
-    monkeypatch.setattr(tui, '_choose', lambda *a: 0)
-    assert tui._application_options(None) == ['--dry-run']
 
 
-def test_launcher_reuses_cli_without_shell(local_db, monkeypatch):
-    commands = iter([['status'], None])
-    monkeypatch.setattr(tui.sys, 'stdin', SimpleNamespace(isatty=lambda: True))
-    monkeypatch.setattr(tui.sys, 'stdout', SimpleNamespace(isatty=lambda: True))
-    monkeypatch.setattr(tui.curses, 'wrapper', lambda _: next(commands))
-    called = []
-    monkeypatch.setattr(tui.subprocess, 'run', lambda args, **kw: called.append((args, kw)))
-    monkeypatch.setattr('builtins.input', lambda _: '')
-    assert tui.run() == 0
-    assert called == [([tui.sys.executable, '-m', 'agent', 'status'], {'check': False})]
+
+class Screen:
+    def __init__(self, keys=()):
+        self.keys = iter(keys)
+        self.lines = []
+    def getmaxyx(self):
+        return 24, 120
+    def erase(self):
+        pass
+    def refresh(self):
+        pass
+    def keypad(self, value):
+        pass
+    def addnstr(self, y, x, text, *args):
+        self.lines.append(text)
+    def getch(self):
+        return next(self.keys, -1)
+
+    def nodelay(self, value):
+        pass
 
 
-def test_scheduled_loop_requires_explicit_real_submission_choice(local_db, monkeypatch):
-    choices = iter([10, 0, None])
-    monkeypatch.setattr(tui, '_choose', lambda *a: next(choices))
-    screen = SimpleNamespace(keypad=lambda _: None)
-    assert tui._menu(screen) is None
-    choices = iter([10, 1])
-    assert tui._menu(screen) == ['loop']
+def test_select_all_then_deselect_individually_and_preserve_other_queue(local_db):
+    import json
+    for name in ('one', 'two', 'three', 'outside'):
+        add_job(name, 1, 1)
+    db.kv_set('tui_queue', json.dumps(['outside']))
+    with db.connect() as c:
+        rows = c.execute("SELECT * FROM jobs WHERE id<>'outside' ORDER BY id").fetchall()
+    screen = Screen([ord('a'), tui.curses.KEY_DOWN, ord(' '), 10])
+    tui._select_jobs(screen, rows)
+    assert tui._queue() == {'outside', rows[0]['id'], rows[2]['id']}
+    tui._select_jobs(Screen([ord(' '), 10]), rows)
+    assert tui._queue() == {'outside', rows[2]['id']}
+    tui._select_jobs(Screen([ord('n'), 10]), rows)
+    assert tui._queue() == {'outside'}
+    tui._select_jobs(Screen([ord('a'), ord('q')]), rows)
+    assert tui._queue() == {'outside'}
+
+
+def test_latest_uses_last_confirmed_application_not_last_attempt(local_db, monkeypatch):
+    from agent.models import ApplyResult, ApplyStatus
+    receipt = stamp('2026-10-02T12:00:00')
+    add_job('old', 1, receipt - 1)
+    add_job('new', 1, receipt + 1)
+    for i in range(60):
+        add_job(f'additional-{i}', 1, receipt + 1)
+    add_job('applied', 1, 1)
+    application_history.record_application(db.get_job('applied'), receipt)
+    db.kv_set('last_apply', str(receipt + 10000))
+    db.kv_set('pick_email_check', 'false')
+    calls = []
+    monkeypatch.setattr('agent.config.load_config', lambda: {})
+    monkeypatch.setattr('agent.scheduler.fetch_once', lambda config: calls.append('fetch'))
+    rows, _ = tui._load_jobs(lambda _: None, threading.Event(), latest=True)
+    assert calls == ['fetch']
+    assert {row['id'] for row in rows} == {'new', *(f'additional-{i}' for i in range(60))}
+
+
+def test_apply_processes_entire_queue_and_keeps_retryable_jobs(local_db, monkeypatch):
+    import json
+    for name in ('one', 'two', 'retry'):
+        add_job(name, 1, 1)
+    db.kv_set('tui_queue', json.dumps(['one', 'two', 'retry']))
+    monkeypatch.setattr('agent.config.load_config', lambda: {})
+    monkeypatch.setattr('agent.config.load_profile', lambda: {})
+    calls = []
+    def apply(config, profile, **kwargs):
+        calls.append(kwargs)
+        db.set_job_status('one', 'submitted')
+        db.set_job_status('two', 'needs_review')
+        return SimpleNamespace(run_id=1)
+    monkeypatch.setattr('agent.runner.apply_batch', apply)
+    stop = threading.Event()
+    assert tui._apply_queue(lambda _: None, stop).run_id == 1
+    assert calls == [{'limit': 3, 'job_ids': ['one', 'retry', 'two'], 'submit_mode': 'full', 'stop_event': stop}]
+    assert tui._queue() == {'retry', 'two'}
+    tui._apply_queue(lambda _: None, stop)
+    assert calls[-1]['job_ids'] == ['retry']
+
+
+def test_spinner_animates_and_restores_logging_on_success_and_failure(local_db):
+    import logging
+    import time
+    root = logging.getLogger()
+    handlers = list(root.handlers)
+    screen = Screen()
+    def work(emit, stop):
+        emit('Synthetic operation')
+        time.sleep(0.25)
+        return 42
+    assert tui._working(screen, 'Working', work) == 42
+    frames = {line for line in screen.lines if line.startswith('⚙')}
+    assert len(frames) >= 2
+    assert root.handlers == handlers
+    def fail(emit, stop):
+        raise ValueError('synthetic')
+    with pytest.raises(ValueError, match='synthetic'):
+        tui._working(screen, 'Working', fail)
+    assert root.handlers == handlers
+
+
+def test_menu_is_three_actions_and_cancel_cannot_apply(local_db, monkeypatch):
+    import json
+    db.kv_set('tui_queue', json.dumps(['synthetic']))
+    choices = iter([2, None])
+    menus = []
+    def choose(screen, title, options, **kwargs):
+        menus.append(options)
+        return next(choices)
+    monkeypatch.setattr(tui, '_choose', choose)
+    monkeypatch.setattr(tui, '_apply_queue', lambda *a: pytest.fail('cancelled apply'))
+    monkeypatch.setattr(tui, '_select_jobs', lambda *a, **kw: False)
+    tui._menu(Screen())
+    assert menus[0] == ['Get latest jobs', 'Search by date', 'Apply to queued jobs (1)', 'Quit']
+
+
+def test_queue_lock_contention_does_not_drop_jobs(local_db, monkeypatch):
+    import json
+    add_job('one', 1, 1)
+    db.kv_set('tui_queue', json.dumps(['one']))
+    monkeypatch.setattr('agent.config.load_config', lambda: {})
+    monkeypatch.setattr('agent.config.load_profile', lambda: {})
+    monkeypatch.setattr('agent.runner.apply_batch', lambda *a, **kw: SimpleNamespace(run_id=0))
+    assert tui._apply_queue(lambda _: None, threading.Event()).run_id == 0
+    assert tui._queue() == {'one'}
+
+
+def test_working_consumes_cancel_and_discards_buffered_input(local_db, monkeypatch):
+    flushed = []
+    monkeypatch.setattr(tui.curses, 'flushinp', lambda: flushed.append(True))
+    def work(emit, stop):
+        assert stop.wait(1), 'cancel was not forwarded'
+        return 'stopped'
+    assert tui._working(Screen([ord('q'), 10]), 'Working', work) == 'stopped'
+    assert flushed == [True]

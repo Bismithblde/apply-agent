@@ -41,26 +41,33 @@ Testing-mode tokens expire after 7 days. Re-run `auth gmail` when `doctor` says 
 
 ## Daily use
 
-Run `.venv/bin/python -m agent tui` (or run without arguments in a terminal) for the keyboard menu.
-Use arrows or j/k to move, Enter to select, and Esc/q to go back. Search saved jobs by an inclusive
-posting-date range; jobs without a posting date use their discovery date. Fetch latest jobs first
-when you want fresh listings. Application mode starts on Dry run and real submissions require
-choosing Submit real applications.
+Run `.venv/bin/python -m agent tui` (or run without arguments in a terminal).
+The menu has three actions:
 
-Settings persist the recent-email check, visible browser, and maximum list size. Email checking
-is on by default, matching the existing CLI behavior. The application WAL is always checked even
-when email checking is off. It uses exact posting identities and known posting cycles, rather than
-company/title similarity, so distinct requisitions can appear separately. Confirmation emails without
-an exact posting identity are retained as unlinked evidence and do not hide jobs. A reused URL with
-no posting date cannot reliably distinguish a repost; exact history is retained conservatively.
-A posting timestamp later than a receipt is treated as a later posting cycle;
-that distinction depends on the source timestamp being accurate.
+- **Get latest jobs** refreshes listings and shows jobs discovered since the last confirmed application.
+  If no application has been recorded, it shows all eligible jobs.
+- **Search by date** refreshes listings and filters by an inclusive posting-date range. Missing posting
+  dates use the discovery date. Leave a boundary blank for no boundary.
+- **Apply to queued jobs** processes the saved selection as one real application batch, after confirmation.
+  Existing verification, queue locks, and submission caps still apply. Unprocessed, failed, and review jobs stay visible in the queue; only ready jobs are applied.
 
-Choose Initialize application WAL to import saved application records, Gmail confirmations, or both.
-Email initialization scans all confirmation pages unless `--max-emails` is set. This can take time;
-Gmail authorization is required. Normal list checks scan up to 50 recent confirmations and report
-when only cached results are available. No email is accessed during search while the setting is off, and cached
-WAL entries imported earlier still apply. Explicit email initialization still runs when selected.
+Use arrows or j/k to move. In results, Space selects/deselects one job, **a** selects all, **n** deselects
+all, and Enter saves the selection to the queue. Esc/q cancels changes. In the queue view, Enter submits all selected ready jobs; review jobs show their status and remain queued.
+Use the existing CLI `review`/`resolve` commands to finish them. The queue persists across restarts;
+selections from a different search remain queued. The highlighted posting URL distinguishes same-title jobs.
+A cog and rotating indicator remain visible while loading and applying. Press q, Esc, or Ctrl-C to stop
+starting more jobs after in-flight operations finish; remaining selections stay queued. **e** on the main menu toggles
+email checking (on by default); the application WAL is checked regardless.
+
+The WAL uses posting identities and known posting cycles, rather than company/title similarity.
+Ambiguous emails remain unlinked and do not hide jobs. A reused URL without a reliable posting date
+cannot reliably distinguish a repost; history matching stays conservative. A known posting timestamp
+later than a receipt is treated as a later cycle and depends on the source timestamp being accurate.
+
+Initialize the WAL through `init-wal --source records|emails|both`. Email initialization scans all
+confirmation pages unless `--max-emails` is set and requires Gmail authorization. Ordinary searches scan
+up to 50 recent confirmations and report when only cached results are available. Email checking off skips
+Gmail during search; WAL entries imported earlier still apply. Other modes remain available through the CLI.
 
 ```bash
 .venv/bin/python -m agent pick --from-date 2026-10-01 --to-date 2026-10-31 --list-only

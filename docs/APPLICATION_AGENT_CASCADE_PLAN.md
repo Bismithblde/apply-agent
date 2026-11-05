@@ -68,9 +68,16 @@ Every attempt should make it possible to determine which layer handled the page,
 ## Terminal workflow and application history
 
 The standard-library curses menu (`python -m agent tui`, or no arguments in an interactive terminal)
-launches existing CLI modes. Search accepts inclusive local calendar dates, with discovery-date fallback
-for missing posting dates. Settings persist the email precheck, visible browser, and maximum list size;
-application mode defaults to dry run. `pick --email-check/--no-email-check` overrides the saved preference.
+has Get latest jobs, Search by date, and Apply to queued jobs. Latest refreshes sources and filters by
+discovery time since the last confirmed application, not a failed attempt. Date search refreshes sources
+and uses inclusive posting dates with discovery-date fallback. Results support individual toggles,
+select all, deselect all, and persistent queuing across searches. Apply shows the saved queue with status labels. Enter submits selected ready jobs while review/failed
+items remain visible and cannot be automatically retried; shared safeguards and caps still apply.
+The main-menu `e` key retains the email preference; other CLI modes remain available separately.
+Finite fetch/apply operations run outside the curses thread while a cog/rotating indicator and progress
+message animate on the main thread. Buffered keys are consumed/discarded before the next screen.
+Cancellation stops new claims while in-flight applications finish, retaining pending selections.
+File logging continues and console handlers are restored afterward.
 
 The append-only application WAL snapshots confirmed receipts in the same SQLite transaction, including
 flow confirmations, manual marks, and resolved submissions. Search consults it even with email disabled.
@@ -81,8 +88,9 @@ identity remain unlinked and do not hide jobs. A reused identity with a known po
 after the old receipt is treated as a later cycle; missing or inaccurate timestamps limit that
 inference. Previously discarded source listings can return on the next fetch.
 
-Verification: the final TUI/history/prior-email/source/CLI/flow-journal/runner/scheduler run passed
-187 tests. An additional focused Generic receipt-flow run passed 14 tests. Synthetic SQLite/Gmail
+Verification: the simplified TUI/history/prior-email/source/CLI/flow-journal/runner/scheduler run passed
+190 tests, including selection persistence, whole-queue dispatch, spinner/log cleanup, and cooperative
+cancellation between jobs. The earlier focused Generic receipt-flow run passed 14 tests. Synthetic SQLite/Gmail
 fixtures cover exact identities, repost dates, atomic receipts, pagination, malformed messages,
 ambiguous recommendations, settings, dates, and launch safeguards. A temporary-database PTY session
 verified keyboard navigation, settings, initialization-menu cancellation, and terminal restoration.

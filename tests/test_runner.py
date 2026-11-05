@@ -915,3 +915,23 @@ def test_adapter_result_without_screenshot_gets_capture(monkeypatch):
     monkeypatch.setattr(ApplyContext, "screenshot", lambda self, job, tag: f"{job.id}-{tag}.png")
     result = runner._run_one(job, FakeBrowser(), {}, {}, "fill_only", True, 1)
     assert result.screenshot == f"{job.id}-needs_review.png"
+
+
+def test_cooperative_cancel_finishes_current_job_and_claims_no_more(tmp_db, monkeypatch):
+    jobs = _jobs(2)
+    db.upsert_jobs(jobs)
+    stop = threading.Event()
+    original = ScriptedAdapter.apply
+    def apply_and_stop(adapter, job, ctx):
+        result = original(adapter, job, ctx)
+        stop.set()
+        return result
+    monkeypatch.setattr(ScriptedAdapter, 'apply', apply_and_stop)
+    results = {job.id: ApplyResult(ApplyStatus.SUBMITTED, 'fixture confirmation') for job in jobs}
+    stats, adapter = _run(monkeypatch, results, stop_event=stop)
+    assert len(adapter.calls) == 1
+    assert stats.submitted == 1
+    remaining = next(job for job in jobs if job.id != adapter.calls[0][0])
+    assert db.get_job_status(remaining.id) == 'new'
+    with db.connect() as c:
+        assert c.execute('SELECT attempts FROM jobs WHERE id=?', (remaining.id,)).fetchone()[0] == 0

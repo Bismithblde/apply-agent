@@ -5,7 +5,7 @@ import fcntl
 import logging
 import sys
 import time
-from datetime import date, datetime, timedelta
+from datetime import date
 from contextlib import contextmanager
 from logging.handlers import RotatingFileHandler
 
@@ -264,61 +264,19 @@ def cmd_review(a) -> None:
 def cmd_pick(a) -> int:
     """Interactively list unapplied postings since last apply and apply to selected ones."""
     import json
-    from . import prior_apps, application_history
     from .runner import apply_batch
 
     start_date, end_date = getattr(a, "from_date", None), getattr(a, "to_date", None)
     if start_date and end_date and start_date > end_date:
         print("Start date must be on or before end date.", file=sys.stderr)
         return 2
-    email_check = getattr(a, "email_check", None)
-    if email_check is None:
-        email_check = db.kv_get("pick_email_check") != "false"
-    email_check = email_check and not a.include_applied
-    application_history.initialize_from_records()
-    if email_check:
-        from . import mail
-        if mail.available():
-            print("Checking recent email for prior applications (up to 50 messages)…")
-            try:
-                prior_apps.sync_email_confirmations(max_results=50, raise_errors=True)
-            except Exception:
-                print("Email sync failed; checking cached application confirmations only.")
-        else:
-            print("Gmail unavailable; checking cached application confirmations only.")
-        imported = application_history.initialize_from_cached_emails()
-        if imported['unlinked']:
-            print(f"{imported['unlinked']} email confirmation(s) lack an exact posting identity; retained for review.")
-
+    from .job_search import find_jobs
     last_apply_val = db.kv_get("last_apply")
     since_ts = (float(last_apply_val) if last_apply_val and not a.all
                 and not (start_date or end_date) else None)
-    clauses, params = ["status='new'"], []
-    posted = "CASE WHEN date_posted>0 THEN date_posted ELSE first_seen END"
-    if since_ts:
-        clauses.append("first_seen>=?")
-        params.append(since_ts)
-    if start_date:
-        clauses.append(f"{posted}>=?")
-        params.append(datetime.combine(start_date, datetime.min.time()).timestamp())
-    if end_date:
-        clauses.append(f"{posted}<?")
-        params.append(datetime.combine(end_date + timedelta(days=1), datetime.min.time()).timestamp())
-    with db.connect() as c:
-        candidates = c.execute(
-            "SELECT * FROM jobs WHERE "
-            + " AND ".join(clauses) + f" ORDER BY {posted} DESC,company ASC", params,
-        ).fetchall()
-
-    rows = []
-    excluded_count = 0
-    for cand in candidates:
-        if not a.include_applied and application_history.find_application(db._row_to_job(cand)):
-            excluded_count += 1
-            continue
-        rows.append(cand)
-        if len(rows) >= a.limit:
-            break
+    rows, excluded_count = find_jobs(start_date=start_date, end_date=end_date, since_ts=since_ts,
+                                     email_check=getattr(a, "email_check", None),
+                                     include_applied=a.include_applied, limit=a.limit)
 
     if not rows:
         msg = "No new unapplied postings found"

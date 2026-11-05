@@ -127,25 +127,30 @@ def _run_one(job: Job, ctx_browser, config: dict, profile: dict, submit_mode: st
 
 
 def _worker(wid: int, jobs: "queue.Queue[Job]", stats: BatchStats, config: dict, profile: dict,
-            submit_mode: str, dry_run: bool, cap: list[int], visible: bool) -> None:
+            submit_mode: str, dry_run: bool, cap: list[int], visible: bool,
+            stop_event: threading.Event | None = None) -> None:
     gap = float(config.get("seconds_between_applications", 20))
     suffix = "" if wid == 0 else f"-w{wid}"
     job_timeout = parse_duration(str(config.get("schedule", {}).get("job_timeout", "15m")))
     user_dir = profile_dir(config, suffix)
     restarts = 0
-    while not jobs.empty() and restarts <= 3:
+    while not jobs.empty() and restarts <= 3 and not (stop_event and stop_event.is_set()):
         restarts += 1
         try:
             with open_browser(config, visible=visible, profile_suffix=suffix) as browser:
                 while True:
                     with stats.lock:
-                        if cap[0] <= 0:
+                        if cap[0] <= 0 or (stop_event and stop_event.is_set()):
                             return
                         try:
                             job = jobs.get_nowait()
                         except queue.Empty:
                             return
                         cap[0] -= 1  # reserve a slot so parallel workers can't overshoot the cap
+                    if stop_event and stop_event.is_set():
+                        with stats.lock:
+                            cap[0] += 1
+                        return
                     prev = getattr(job, "_runner_expected_status", None)
                     if prev is None:
                         prev = getattr(job, "_db_status", None) or db.get_job_status(job.id) or "new"
@@ -236,15 +241,22 @@ def _worker(wid: int, jobs: "queue.Queue[Job]", stats: BatchStats, config: dict,
                     if timed_out.is_set():
                         raise RuntimeError("browser killed by job watchdog")
                     if not jobs.empty():
-                        time.sleep(gap)
+                        if stop_event:
+                            stop_event.wait(gap)
+                        else:
+                            time.sleep(gap)
         except Exception as e:
             log.error("worker %d browser error: %s", wid, type(e).__name__)
-            time.sleep(5)
+            if stop_event:
+                stop_event.wait(5)
+            else:
+                time.sleep(5)
 
 
 def apply_batch(config: dict, profile: dict, *, limit: int | None = None, dry_run: bool = False,
                 submit_mode: str | None = None, job_ids: list[str] | None = None,
-                ats: list[str] | None = None, visible: bool = False, force: bool = False) -> BatchStats:
+                ats: list[str] | None = None, visible: bool = False, force: bool = False,
+                stop_event: threading.Event | None = None) -> BatchStats:
     """One apply batch. Batches are serialized with a file lock: they share the browser profile, and
     reset_stuck_jobs is only safe when no other batch has jobs in flight."""
     lock_path = db.DB_PATH.with_name("apply.lock")
@@ -256,11 +268,12 @@ def apply_batch(config: dict, profile: dict, *, limit: int | None = None, dry_ru
             log.warning("another apply run is in progress; skipping this one")
             return BatchStats(run_id=0)
         return _apply_batch_locked(config, profile, limit=limit, dry_run=dry_run, submit_mode=submit_mode,
-                                   job_ids=job_ids, ats=ats, visible=visible, force=force)
+                                   job_ids=job_ids, ats=ats, visible=visible, force=force, stop_event=stop_event)
 
 
 def _apply_batch_locked(config: dict, profile: dict, *, limit: int | None, dry_run: bool, submit_mode: str | None,
-                        job_ids: list[str] | None, ats: list[str] | None, visible: bool, force: bool) -> BatchStats:
+                        job_ids: list[str] | None, ats: list[str] | None, visible: bool, force: bool,
+                        stop_event: threading.Event | None = None) -> BatchStats:
     submit_mode = submit_mode or config.get("submit_mode", "hybrid")
     since = db.night_start()
     night_left = (int(config.get("max_submissions_per_night", 120))
@@ -296,11 +309,12 @@ def _apply_batch_locked(config: dict, profile: dict, *, limit: int | None, dry_r
     for j in jobs:
         q.put(j)
     n = max(1, min(int(config.get("schedule", {}).get("concurrency", 1)), 3, len(jobs) or 1))
-    threads = [threading.Thread(target=_worker, args=(i, q, stats, config, profile, submit_mode, dry_run, cap, visible),
+    threads = [threading.Thread(target=_worker, args=(i, q, stats, config, profile, submit_mode, dry_run, cap, visible, stop_event),
                                 daemon=True, name=f"apply-w{i}") for i in range(n)]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
-    db.end_run(run_id, submitted=stats.submitted, queued=stats.queued, failed=stats.failed)
+    db.end_run(run_id, submitted=stats.submitted, queued=stats.queued, failed=stats.failed,
+               note="cancelled" if stop_event and stop_event.is_set() else "")
     return stats
