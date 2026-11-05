@@ -82,6 +82,13 @@ File logging continues and console handlers are restored afterward.
 Cache verification after the change: `./.venv/bin/python -m pytest -q tests/test_tui.py tests/test_sources.py tests/test_db_flow.py`
 passed 89 tests, including fresh, expired, and missing-fetch-time cases with local SQLite fixtures.
 
+Applicant preferences can set `confirm_attestations: true` to affirm required non-factual agreements and
+acknowledgments. Claims about personal facts still require profile/RAG evidence; SMS and marketing opt-ins
+remain separate preferences. `willing_to_relocate` and `relocation_scope` answer both willingness and
+destination prompts. Workday retries fields rejected by step validation before holding the job for review.
+Verification: focused Workday attestation/repair tests passed 35 cases; all 67 answer/RAG tests passed,
+and the consent-specific form and messaging tests passed.
+
 The append-only application WAL snapshots confirmed receipts in the same SQLite transaction, including
 flow confirmations, manual marks, and resolved submissions. Search consults it even with email disabled.
 Posting URLs and tenant-qualified requisitions identify matches; company/title alone never does.

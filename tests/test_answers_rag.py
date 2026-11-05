@@ -45,6 +45,44 @@ def test_empty_profile_leaves_personal_facts_unknown(isolated_evidence, monkeypa
     assert all(got[field.key].source == "unknown" and got[field.key].value is None for field in fields)
 
 
+def test_attestation_confirmation_keeps_personal_claims_evidence_gated(isolated_evidence):
+    profile = {"preferences": {"confirm_attestations": True}}
+    acknowledgement = Field(
+        "ack", "I understand that a positive declaration does not mean I would be disqualified from employment. "
+        "I understand that a false declaration may constitute a conflict of interest. "
+        "Please enter today's date on your acknowledgement.",
+        "radio", True, ["Yes", "No"])
+    personal_claim = Field("criminal", "I certify that I have no criminal convictions.",
+                           "checkbox", True)
+    conflict_claim = Field("conflict", "I attest that I have no conflicts of interest.",
+                           "checkbox", True)
+
+    assert answers._confirmed_attestation(acknowledgement, profile).value == "Yes"
+    short_acknowledgement = Field("short_ack", "I acknowledge the privacy policy", "radio", True,
+                                  ["Acknowledge", "Decline"])
+    assert answers._confirmed_attestation(short_acknowledgement, profile).value == "Acknowledge"
+    assert answers._confirmed_attestation(personal_claim, profile) is None
+    assert answers._attestation_requires_fact_evidence(personal_claim)
+    assert answers._needs_fact_evidence(personal_claim)
+    assert answers._deterministic(personal_claim, profile) is None
+    assert answers._confirmed_attestation(conflict_claim, profile) is None
+    assert answers._needs_fact_evidence(conflict_claim)
+
+    sms = Field("sms", "I consent to receive SMS messages", "radio", True, ["Yes", "No"])
+    sms_answer = answers._deterministic(sms, profile)
+    assert sms_answer.value == "No"
+
+
+def test_relocation_scope_fills_combined_yes_where_prompt(isolated_evidence):
+    field = Field("relocation", "Are you interested in relocating? If so, where?", "text", True)
+    profile = {"preferences": {"willing_to_relocate": "Yes", "relocation_scope": "Anywhere"}}
+
+    answer = answers._deterministic(field, profile)
+
+    assert answer.value == "Yes, I am open to relocating anywhere."
+    assert answer.source == "profile"
+
+
 def test_shortcuts_require_matching_profile_facts(isolated_evidence, monkeypatch):
     def unavailable(*args, **kwargs):
         raise answers.llm.LLMUnavailable("offline")

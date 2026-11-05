@@ -385,7 +385,7 @@ def _unqualified_response_index(options: list[str], value) -> int | None:
 
 
 _LEGAL_AGREEMENT_RE = re.compile(
-    r"\b(?:consent|agree|agreement|accept|certify|attest|acknowledge|terms|privacy|"
+    r"\b(?:consent|agree|agreement|accept|certify|attest|affirm|acknowledge|terms|privacy|"
     r"arbitration|waiver|waive|release|binding|signature|e-signature|policy)\b", re.I
 )
 
@@ -1220,6 +1220,10 @@ class _Run:
                     elif value is not None and (isinstance(value, str) or isinstance(value, bool)):
                         return Answer(f.key, value, "bank", "company agreement explicitly confirmed")
                     return Answer(f.key, None, "unknown", "company agreement choice needs explicit confirmation")
+            if confirmed := answers_mod._confirmed_attestation(f, self.ctx.profile):
+                return confirmed
+            if answers_mod._attestation_requires_fact_evidence(f):
+                return None
             return Answer(f.key, None, "unknown", "legal agreement needs company-specific confirmation")
         company_ans = answers_mod._company_confirmed_answer(f, self.job, self.ctx.profile, _match_option)
         if company_ans is not None:
@@ -1268,7 +1272,8 @@ class _Run:
             if re.fullmatch(r"(?:country|country\s*/\s*territory)[*✱\s]*", short, re.I):
                 country = personal.get("country")
                 return Answer(f.key, country or None, "profile" if country else "unknown", "country from profile")
-        if re.search(r"\b(?:date\s*signed|signature\s*date|signed\s*on)\b", lab + ' ' + (f.name or ''), re.I) or (
+        if (re.search(r"\b(?:date\s*signed|signature\s*date|signed\s*on)\b", lab + ' ' + (f.name or ''), re.I)
+                or re.search(r"\b(?:today'?s )?date\b.{0,60}\b(?:acknowledg|attest|certif)", lab, re.I)) or (
             re.search(r"self.?identif", self.furthest, re.I) and re.fullmatch(r"date", lab.strip(), re.I)
         ):
             today = time.strftime("%m/%d/%Y")

@@ -1624,6 +1624,101 @@ def test_workday_broad_consent_does_not_check_a_legal_agreement(page, monkeypatc
     assert run.review().unanswered_required == [agreement]
 
 
+def test_workday_user_preference_confirms_nonfactual_attestations(page):
+    page.set_content('<div></div>')
+    ctx = _Ctx(page)
+    ctx.profile = {'preferences': {'confirm_attestations': True}}
+    run = workday._Run(_job(), ctx)
+
+    checkbox = workday.Field('ack', 'I certify that my application is accurate', 'checkbox', True)
+    checkbox_answer = run._profile_widget_answer(checkbox)
+    assert checkbox_answer.value is True and checkbox_answer.source == 'profile'
+
+    qualified = workday.Field(
+        'arbitration', 'I consent to arbitration', 'radio', True,
+        ['Yes, I accept binding arbitration', 'No, I decline'])
+    qualified_answer = run._profile_widget_answer(qualified)
+    assert qualified_answer.value == 'Yes, I accept binding arbitration'
+    assert qualified_answer.source == 'profile'
+
+    factual = workday.Field('criminal', 'I certify that I have no criminal convictions', 'checkbox', True)
+    assert run._profile_widget_answer(factual) is None
+
+
+def test_workday_user_preference_checks_acknowledgement_control(page):
+    question = 'I certify that my application is accurate'
+    page.set_content(f'''<div data-automation-id="applyFlowPage">
+      <div data-automation-id="formField-ack"><label for="ack" data-automation-id="formLabel">{question}*</label>
+      <input id="ack" type="checkbox" required></div></div>''')
+    ctx = _Ctx(page)
+    ctx.profile = {'preferences': {'confirm_attestations': True}}
+    run = workday._Run(_job(), ctx)
+
+    run.fill_step('Voluntary Disclosures')
+
+    assert page.locator('#ack').is_checked()
+    field = next(iter(run.fields.values()))
+    assert run.answers[field.key].value is True
+    assert run.answers[field.key].source == 'profile'
+
+
+@pytest.mark.parametrize('kind', ['native', 'prompt', 'radio'])
+def test_workday_user_preference_selects_qualified_affirmative(workday_choice, kind):
+    question = 'I consent to binding arbitration'
+    choice = 'Yes, I accept binding arbitration'
+    page = workday_choice(question, [choice, 'No, I decline'], kind=kind)
+    ctx = _Ctx(page)
+    ctx.profile = {'preferences': {'confirm_attestations': True}}
+    run = workday._Run(_job(), ctx)
+
+    run.fill_step('Application Questions')
+
+    field = next(f for f in run.fields.values() if f.kind in ('select', 'radio'))
+    assert run.answers[field.key].source == 'profile'
+    if kind == 'radio':
+        assert page.locator('input:checked').input_value() == choice
+    elif kind == 'native':
+        assert page.locator('#choice').input_value() == choice
+    else:
+        assert page.locator('#choice').inner_text() == choice
+
+
+def test_workday_acknowledgement_date_uses_today(page):
+    page.set_content('<div></div>')
+    run = workday._Run(_job(), _Ctx(page))
+    field = workday.Field('date', "Please enter today's date on your acknowledgement", 'date', True)
+
+    answer = run._profile_widget_answer(field)
+
+    assert answer.value == time.strftime('%m/%d/%Y')
+
+
+def test_workday_repairs_relocation_field_after_validation_error(page, monkeypatch):
+    page.set_content(f'''<div data-automation-id="applyFlowPage">{_progress("Application Questions", ("Application Questions", "Review"))}
+      <div data-automation-id="formField-relocation">
+        <label data-automation-id="formLabel" for="relocation">Are you interested in relocating? If so, where?*</label>
+        <input id="relocation" data-aa-key="aa-relocation" required>
+        <div id="relocation-error" data-automation-id="errorMessage" style="display:none">Relocation response is required</div>
+      </div>
+      <button data-automation-id="bottom-navigation-next-button" onclick="
+        const input = document.querySelector('#relocation');
+        const error = document.querySelector('#relocation-error');
+        if (!input.value) error.style.display = 'block';
+        else {{ error.remove(); document.querySelector('[data-automation-id=progressBar]').innerHTML =
+          '<li data-automation-id=progressBarActiveStep>current step 2 of 2<br>Review</li>'; }}
+      ">Save and Continue</button></div>''')
+    ctx = _Ctx(page)
+    ctx.profile = {'preferences': {'willing_to_relocate': 'Yes', 'relocation_scope': 'Anywhere'}}
+    run = workday._Run(_job(), ctx)
+    monkeypatch.setattr(workday, 'human_pause', lambda: None)
+    monkeypatch.setattr(run, 'settle', lambda *args, **kwargs: None)
+
+    run.advance('Application Questions')
+
+    assert page.locator('#relocation').input_value() == 'Yes, I am open to relocating anywhere.'
+    assert workday.step_name(page) == 'Review'
+
+
 def test_workday_confirmation_for_one_agreement_cannot_approve_another(page, monkeypatch):
     terms = 'I have read and agree to the terms'
     arbitration = 'I consent to binding arbitration'

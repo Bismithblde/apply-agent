@@ -22,7 +22,26 @@ _DECLINE = re.compile(
     r"decline|prefer not|don.?t wish|do not wish|not wish|choose not|rather not|not to (say|answer|disclose|self)"
     r"|do not want|don.?t want|wish not|not specified|i don.?t know|undeclared", re.I)
 _AFFIRM = re.compile(r"^\s*(yes|i consent|i agree|i acknowledge|i accept|i understand|i certify|agree|accept|confirm\w*|i confirm)\b", re.I)
-_CONSENT = re.compile(r"\b(agree|consent|acknowledge|certify|attest|accept|privacy|terms|understand|confirm|arbitration)\b", re.I)
+_ATTESTATION_AFFIRM = re.compile(
+    r"^\s*(?:yes|i\s+(?:consent|agree|acknowledge|accept|understand|certify|attest|affirm|confirm)|"
+    r"(?:agree|acknowledge|accept|consent|understand|certify|attest|affirm|confirm\w*))\b", re.I)
+_CONSENT = re.compile(r"\b(agree|consent|acknowledge|certify|attest|affirm|accept|privacy|terms|understand|confirm|arbitration)\b", re.I)
+_ATTESTATION_FACT = re.compile(
+    r"\b(?:citizen(?:ship)?|work authori[sz]ation|authori[sz]ed to work|right to work|visa|"
+    r"sponsor(?:ship)?|conflicts? of interests?|criminal|convict\w*|veteran|disabilit\w*|"
+    r"race|ethnic\w*|gender|sexual orientation|transgender|relocat\w*|relatives?|family members?|spouses?|partners?|"
+    r"related to|relationships? with|non-?compete|non-?solicit|restrictive covenant|"
+    r"worked|work(?:ing)?\s+(?:for|at|with)|employ(?:ed|ee)|(?:previous|prior) employment|salary|compensation|gpa|grade point|"
+    r"degree|major|school|graduat\w*|"
+    r"city|state|province|country|residen\w*|address|postal|clearance|license|availability)\b", re.I)
+_ATTESTATION_CLAIM = re.compile(
+    r"\b(?:(?:do|does|did|are|is|was|were|have|has|had|will|can|would)\s+(?:you|the applicant)\b|"
+    r"(?:i|we)\s+(?:am|are|have|had|was|were|do|did|will|can|work|worked)\b|"
+    r"i\s+would\s+(?:need|require|hold|work|relocate)\b|"
+    r"i\s+(?:certify|attest|declare|affirm|confirm)\b|"
+    r"(?:what|which)\s+is\s+(?:your|the applicant's)\b|"
+    r"(?:your|my)\s+(?:citizenship|work authorization|visa status|conflict of interest|spouse|partner|"
+    r"criminal history|employment history|race|ethnicity|gender|disability status)\b)", re.I)
 _SMS_PERMISSION = re.compile(
     r"\b(?:would you like to receive|may we use (?:this|your)(?: phone)? number to send|"
     r"(?:can|may) we (?:send|text|contact) you|do you (?:wish|want|agree|consent) to (?:receive|be contacted)|"
@@ -551,10 +570,17 @@ def _work_mode(path: str, mode: str) -> Resolver:
 
 def _relocation(f: Field, p: dict) -> Any:
     label = f.label or f.name
-    if (_HISTORICAL.search(label) or re.search(r"\b(where|which city|what city)\b", label, re.I)
-            or not re.search(r"\b(willing|open|able|prepared|would|will|living in the country)\b", label, re.I)):
+    if _HISTORICAL.search(label):
         return None
-    return _get(p, "preferences.willing_to_relocate")
+    willing = _get(p, "preferences.willing_to_relocate")
+    if re.search(r"\b(where|which city|what city)\b", label, re.I):
+        scope = _get(p, "preferences.relocation_scope")
+        if _yes_no(willing) == "yes" and scope:
+            return f"Yes, I am open to relocating {str(scope).lower()}." if f.kind in ("text", "textarea") else willing
+        return None
+    if not re.search(r"\b(willing|open|able|prepared|would|will|living in the country)\b", label, re.I):
+        return None
+    return willing
 
 
 SKIP = object()
@@ -611,6 +637,30 @@ def _yes_no(value: Any) -> str | None:
     if normalized in {"no", "false", "0"} or normalized.startswith("no, "):
         return "no"
     return None
+
+
+def _attestation_requires_fact_evidence(field: Field) -> bool:
+    """Keep personal claims evidence-backed even when an attestation is otherwise authorized."""
+    label = re.sub(r"https?://\S+", " ", field.label or field.name)
+    return bool(_ATTESTATION_CLAIM.search(label) and _ATTESTATION_FACT.search(label))
+
+
+def _confirmed_attestation(field: Field, profile: dict) -> Answer | None:
+    """Apply the user's explicit default to non-factual acknowledgments and agreements."""
+    preferences = profile.get("preferences") or {}
+    label = field.label or field.name
+    if (preferences.get("confirm_attestations") is not True or not _CONSENT.search(label)
+            or _attestation_requires_fact_evidence(field) or _SMS_PERMISSION.search(label)
+            or re.search(r"\b(?:sms|text messages?|marketing|promotional|opt[- ]?in|opt[- ]?out)\b", label, re.I)):
+        return None
+    if field.kind == "checkbox" and not field.options:
+        return Answer(field.key, True, "profile", "user authorized attestation")
+    affirmative = next((option for option in field.options or []
+                        if _ATTESTATION_AFFIRM.search(option) and not _DECLINE.search(option)), None)
+    if affirmative is None:
+        return None
+    value = [affirmative] if field.kind == "checkbox" else affirmative
+    return Answer(field.key, value, "profile", "user authorized attestation")
 
 
 def _eeo(path: str) -> Resolver:
@@ -922,6 +972,8 @@ def _coerce(field: Field, value: Any, option_matcher: Callable[[list[str], str],
 
 def _deterministic(field: Field, profile: dict, option_matcher: Callable[[list[str], str], int | None] | None = None) -> Answer | None:
     label = re.sub(r"https?://\S+", " ", field.label or field.name).strip()
+    if attestation := _confirmed_attestation(field, profile):
+        return attestation
     if re.search(r"\bcity\b.*\bstate\b.*\b(?:zip|postal)\b", label, re.I):
         values = [_get(profile, f"personal.{key}") for key in ("city", "state_abbr", "postal_code")]
         value = f"{values[0]}, {values[1]} {values[2]}" if all(values) else None
@@ -961,10 +1013,12 @@ def _deterministic(field: Field, profile: dict, option_matcher: Callable[[list[s
         return Answer(field.key, None, "unknown", "date has no education or employment context")
     if option_matcher and re.search(r"\bphone\b.*(device )?type|\bdevice type\b", label, re.I) and not _get(profile, "personal.phone_device_type"):
         return Answer(field.key, None, "unknown", "phone device type not supplied")
-    if field.kind == "checkbox" and not field.options and _CONSENT.search(label):
+    if (field.kind == "checkbox" and not field.options and _CONSENT.search(label)
+            and not _attestation_requires_fact_evidence(field)):
         if not re.search(r"\b(?:text messages?|sms|marketing|promotional)\b", label, re.I):
             return Answer(field.key, True, "profile", "consent")
-    if field.required and field.kind in ("radio", "select", "combobox") and _CONSENT.search(label):
+    if (field.required and field.kind in ("radio", "select", "combobox") and _CONSENT.search(label)
+            and not _attestation_requires_fact_evidence(field)):
         aff = [o for o in field.options if _AFFIRM.search(o)]
         if aff and not re.search(r"sponsor|authori|citizen|relocat|veteran|disab", label, re.I):
             return Answer(field.key, aff[0], "profile", "required consent")
@@ -1384,7 +1438,7 @@ _FACTUAL = re.compile(
     r"|criminal|convicted|\brelatives?\b|\bfamily members?\b|currently employed|notice period"
     r"|\b(?:work|residen(?:t|cy|ce)) permits?\b|non-?compete|non-?solicit|restrictive covenant"
     r"|\b(?:veteran|disabilit\w*|hispanic|latino|ethnicity|race|gender|sexual orientation|transgender)\b"
-    r"|\b(?:worked|employed|employee|team member|employment)\b"
+    r"|\b(?:worked|employed|employee|team member|employment|conflicts? of interests?|related to|relationships? with|spouses?|partners?)\b"
     r"|\b(?:school|university|college|institution|degree|major|field of study|gpa|grade point|graduat(?:e|ion)|class year)\b"
     r"|\b(?:city|state|province|country|location|residence|relocat(?:e|ion)|availability|available|start date|end date)\b"
     r"|\b(?:student|enroll(?:ed|ment)?|protocols?|tools?|frameworks?|technolog(?:y|ies)|experience|used|using)\b", re.I)
@@ -1437,6 +1491,8 @@ def _is_preference_or_survey(field: Field) -> bool:
 
 def _needs_fact_evidence(field: Field) -> bool:
     label = re.sub(r"https?://\S+", " ", field.label or field.name)
+    if _attestation_requires_fact_evidence(field):
+        return True
     if re.search(r"\b(?:work|residen(?:t|cy|ce)) permits?\b|non-?compete|non-?solicit|restrictive covenant|"
                  r"\b(?:veteran|disabilit\w*|hispanic|latino|ethnicity|race|gender|sexual orientation|transgender|"
                  r"worked|employed|employee|team member|employment)\b", label, re.I):

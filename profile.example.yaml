@@ -49,6 +49,8 @@ work_authorization:
   citizenship_country: ''
 preferences:
   willing_to_relocate: ''
+  relocation_scope: '' # e.g. Anywhere
+  confirm_attestations: false # fact-specific attestations still require profile/RAG evidence
   open_to_remote: ''
   open_to_hybrid: ''
   open_to_onsite: ''
