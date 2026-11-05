@@ -41,6 +41,34 @@ Testing-mode tokens expire after 7 days. Re-run `auth gmail` when `doctor` says 
 
 ## Daily use
 
+Run `.venv/bin/python -m agent tui` (or run without arguments in a terminal) for the keyboard menu.
+Use arrows or j/k to move, Enter to select, and Esc/q to go back. Search saved jobs by an inclusive
+posting-date range; jobs without a posting date use their discovery date. Fetch latest jobs first
+when you want fresh listings. Application mode starts on Dry run and real submissions require
+choosing Submit real applications.
+
+Settings persist the recent-email check, visible browser, and maximum list size. Email checking
+is on by default, matching the existing CLI behavior. The application WAL is always checked even
+when email checking is off. It uses exact posting identities and known posting cycles, rather than
+company/title similarity, so distinct requisitions can appear separately. Confirmation emails without
+an exact posting identity are retained as unlinked evidence and do not hide jobs. A reused URL with
+no posting date cannot reliably distinguish a repost; exact history is retained conservatively.
+A posting timestamp later than a receipt is treated as a later posting cycle;
+that distinction depends on the source timestamp being accurate.
+
+Choose Initialize application WAL to import saved application records, Gmail confirmations, or both.
+Email initialization scans all confirmation pages unless `--max-emails` is set. This can take time;
+Gmail authorization is required. Normal list checks scan up to 50 recent confirmations and report
+when only cached results are available. No email is accessed during search while the setting is off, and cached
+WAL entries imported earlier still apply. Explicit email initialization still runs when selected.
+
+```bash
+.venv/bin/python -m agent pick --from-date 2026-10-01 --to-date 2026-10-31 --list-only
+.venv/bin/python -m agent pick --no-email-check --list-only
+.venv/bin/python -m agent init-wal --source records
+.venv/bin/python -m agent init-wal --source both
+```
+
 ```bash
 .venv/bin/python -m agent doctor                 # is everything set up?
 .venv/bin/python -m agent pick                   # interactively review & select new jobs to apply for

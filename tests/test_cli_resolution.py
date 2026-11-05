@@ -14,6 +14,7 @@ from agent.models import ApplyResult, ApplyStatus, Job
 def cli_db(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "data" / "apply.db")
     monkeypatch.setattr(cli, "_setup_logging", lambda _verbose: None)
+    monkeypatch.setattr("agent.mail.available", lambda: False)
     db.DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     db.init()
     return tmp_path

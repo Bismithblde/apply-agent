@@ -210,12 +210,7 @@ def upsert_jobs(jobs: list[Job]) -> int:
             nu, dk = normalize_url(j.url), dedupe_key(j.company, j.title)
             if c.execute("SELECT 1 FROM jobs WHERE norm_url=? OR id=?", (nu, j.id)).fetchone():
                 continue
-            # Two postings on one ATS board may share an identical title while
-            # having separate requisition IDs and application forms. Preserve both.
-            direct_ats = j.source == "ats_boards" and j.ats in {"greenhouse", "lever", "ashby"} \
-                and j.id.startswith(f"{j.ats}:") and len(j.id.split(":")) == 3
-            if not direct_ats and c.execute("SELECT 1 FROM jobs WHERE dedupe_key=?", (dk,)).fetchone():
-                continue
+            # Company/title is descriptive, not a posting identity: preserve distinct requisitions.
             c.execute(
                 "INSERT INTO jobs (id, source, company, title, url, norm_url, dedupe_key, ats, locations,"
                 " category, date_posted, first_seen) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -382,6 +377,16 @@ def has_uncertain_flow_action(job_id: str) -> bool:
         return _unresolved_flow_action(c, job_id)
 
 
+def _journal_receipt(c: sqlite3.Connection, application_id: int) -> None:
+    from . import application_history
+    row = c.execute(
+        "SELECT j.*,COALESCE(a.submitted_at,a.created_at) AS receipt_at FROM applications a "
+        "JOIN jobs j ON j.id=a.job_id WHERE a.id=? AND a.status='submitted'", (application_id,),
+    ).fetchone()
+    if row is not None:
+        application_history.record_receipt(c, _row_to_job(row), application_id, row["receipt_at"])
+
+
 def _flow_receipt(c: sqlite3.Connection, job_id: str, run_id: int) -> None:
     c.execute(
         "INSERT INTO applications (job_id,run_id,status,reason,created_at,submitted_at) "
@@ -391,6 +396,9 @@ def _flow_receipt(c: sqlite3.Connection, job_id: str, run_id: int) -> None:
     )
     c.execute("UPDATE flow_actions SET state='confirmed',updated_at=? WHERE job_id=? AND run_id=?",
               (time.time(), job_id, run_id))
+    receipt = c.execute("SELECT id FROM applications WHERE job_id=? AND run_id=? AND status='submitted'",
+                        (job_id, run_id)).fetchone()
+    _journal_receipt(c, receipt["id"])
 
 
 def _flow_fingerprint(value: str) -> str:
@@ -681,6 +689,7 @@ def record_application(job: Job, result: ApplyResult, run_id: int | None) -> int
                  json.dumps(result.generated_answers), json.dumps(result.unanswered_required),
                  json.dumps([asdict(e) for e in result.layer_trace]), synthetic["id"]),
             )
+            _journal_receipt(c, synthetic["id"])
             return int(synthetic["id"])
         cur = c.execute(
             "INSERT INTO applications (job_id, run_id, status, reason, screenshot, final_url, answers_json,"
@@ -695,6 +704,8 @@ def record_application(job: Job, result: ApplyResult, run_id: int | None) -> int
         if result.status == ApplyStatus.SUBMITTED and run_id is not None:
             c.execute("UPDATE flow_actions SET state='confirmed',updated_at=? WHERE job_id=? AND run_id=?",
                       (now, job.id, run_id))
+        if result.status == ApplyStatus.SUBMITTED:
+            _journal_receipt(c, int(cur.lastrowid))
         return int(cur.lastrowid)
 
 
@@ -933,6 +944,9 @@ def resolve_submit_intents(job_id: str, outcome: str) -> int:
             "UPDATE jobs SET status=?, active_run_id=NULL, active_run_previous_status=NULL WHERE id=?",
             (status, job_id),
         )
+        if outcome == "submitted":
+            for receipt in c.execute("SELECT id FROM applications WHERE job_id=? AND status='submitted'", (job_id,)).fetchall():
+                _journal_receipt(c, receipt["id"])
         return len(intents) + len(flows)
 
 

@@ -65,6 +65,29 @@ Every attempt should make it possible to determine which layer handled the page,
 
 **Verification evidence:** The combined DB-flow, CLI-resolution, runner, and Generic suite passed 245 tests. After final runner accounting and authentication-journal refinements, the DB/CLI/runner rerun passed 88 tests and the focused Generic account/OTP/wizard/crash rerun passed 64 tests. The broad suite was not repeated after those final refinements. Crash fixtures cover death after POST acceptance, after checkpoint persistence, and after durable confirmation before runner recording; receipt enrichment prevents duplicate submission counts. Tests use local fixtures; no live application was submitted.
 
+## Terminal workflow and application history
+
+The standard-library curses menu (`python -m agent tui`, or no arguments in an interactive terminal)
+launches existing CLI modes. Search accepts inclusive local calendar dates, with discovery-date fallback
+for missing posting dates. Settings persist the email precheck, visible browser, and maximum list size;
+application mode defaults to dry run. `pick --email-check/--no-email-check` overrides the saved preference.
+
+The append-only application WAL snapshots confirmed receipts in the same SQLite transaction, including
+flow confirmations, manual marks, and resolved submissions. Search consults it even with email disabled.
+Posting URLs and tenant-qualified requisitions identify matches; company/title alone never does.
+Distinct same-title URLs are preserved during ingestion. `init-wal --source records|emails|both` bootstraps
+existing confirmed applications and/or paginated Gmail confirmations. Emails without exact posting
+identity remain unlinked and do not hide jobs. A reused identity with a known posting timestamp
+after the old receipt is treated as a later cycle; missing or inaccurate timestamps limit that
+inference. Previously discarded source listings can return on the next fetch.
+
+Verification: the final TUI/history/prior-email/source/CLI/flow-journal/runner/scheduler run passed
+187 tests. An additional focused Generic receipt-flow run passed 14 tests. Synthetic SQLite/Gmail
+fixtures cover exact identities, repost dates, atomic receipts, pagination, malformed messages,
+ambiguous recommendations, settings, dates, and launch safeguards. A temporary-database PTY session
+verified keyboard navigation, settings, initialization-menu cancellation, and terminal restoration.
+No live application or Gmail import was run; diff checks and Python compilation passed.
+
 ## Operating workflow
 
 For each phase, the main agent reads this plan and the relevant code/tests, then prepares a bounded phase task with objective, files, acceptance criteria, risks, and verification commands. It can delegate independent read-only inspections in parallel. Implementation delegation is allowed only after interfaces are stable and write scopes do not overlap. The main agent integrates the result, runs relevant checks, reviews the diff, records evidence here, and continues to the next clear phase without asking for approval at every boundary.

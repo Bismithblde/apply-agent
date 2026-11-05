@@ -105,6 +105,7 @@ def test_pick_continues_when_email_sync_fails(temp_db, monkeypatch, capsys):
     def fail_sync(**kwargs):
         raise RuntimeError("mail service temporarily unavailable")
 
+    monkeypatch.setattr("agent.mail.available", lambda: True)
     monkeypatch.setattr(prior_apps, "sync_email_confirmations", fail_sync)
     result = cli.cmd_pick(SimpleNamespace(all=True, limit=10, include_applied=False,
                                            export=False, list_only=True))

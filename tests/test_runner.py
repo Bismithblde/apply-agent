@@ -97,10 +97,10 @@ def test_upsert_preserves_distinct_direct_ats_requisitions(tmp_db):
         assert {row[0] for row in c.execute("SELECT id FROM jobs")} == {j.id for j in jobs}
 
 
-def test_upsert_still_dedupes_aggregator_title_collision(tmp_db):
+def test_upsert_preserves_distinct_aggregator_postings_with_same_title(tmp_db):
     first, second = _jobs(2)
     second.company, second.title = first.company, first.title
-    assert db.upsert_jobs([first, second]) == 1
+    assert db.upsert_jobs([first, second]) == 2
 
 
 def _run(monkeypatch, results, delay=0.0, **kw):

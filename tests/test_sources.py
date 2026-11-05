@@ -326,17 +326,17 @@ def temp_db(tmp_path, monkeypatch):
     return tmp_path / "test.db"
 
 
-def test_upsert_dedupes_by_url_and_company_title(temp_db):
+def test_upsert_dedupes_urls_but_preserves_same_title_postings(temp_db):
     a = job("Software Engineer Intern", url="https://boards.greenhouse.io/acme/jobs/1", source="simplify")
     same_url = job("SWE Intern (renamed)", url="https://boards.greenhouse.io/acme/jobs/1/?utm_source=x",
                    source="vanshb03")
     same_title = job("software engineer  intern", url="https://acme.com/careers/1", source="speedyapply",
                      company="ACME")
     other = job("Backend Intern", url="https://boards.greenhouse.io/acme/jobs/2", source="simplify")
-    assert db.upsert_jobs([a, same_url, same_title, other]) == 2
+    assert db.upsert_jobs([a, same_url, same_title, other]) == 3
     assert db.upsert_jobs([a, other]) == 0
     with db.connect() as c:
-        assert c.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 2
+        assert c.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 3
 
 
 def test_fetch_all_isolates_failures(temp_db, monkeypatch):
@@ -450,11 +450,11 @@ def test_verified_us_posting_cannot_promote_same_title_at_different_url(temp_db,
 
     assert db.get_job_status(foreign_unknown.id) == "needs_review"
     assert db.latest_application(foreign_unknown.id)["reason"] == previous_reason
-    assert db.get_job_status(verified_us.id) is None
-    assert stats["by_source"]["new-source"]["unrepresented_verified"] == 1
+    assert db.get_job_status(verified_us.id) == "new"
+    assert stats["by_source"]["new-source"]["unrepresented_verified"] == 0
     with db.connect() as c:
         assert c.execute("SELECT 1 FROM kv WHERE key=?", (f"filter_policy:{foreign_unknown.id}",)).fetchone() is None
-        assert c.execute("SELECT 1 FROM kv WHERE key=?", (f"filter_attestation_orphan:{verified_us.id}",)).fetchone()
+        assert c.execute("SELECT 1 FROM kv WHERE key=?", (f"filter_attestation_orphan:{verified_us.id}",)).fetchone() is None
 
 
 def test_same_url_verified_source_wins_over_unknown_duplicate_regardless_of_order(temp_db, monkeypatch):
