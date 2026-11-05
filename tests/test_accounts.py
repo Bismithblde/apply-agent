@@ -409,6 +409,7 @@ def test_workday_account_creation_refreshes_vps_page_without_resubmitting(page, 
         assert vault.get(run.tenant).creation_attempted
     finally:
         page.unroute("https://workday.test/**", respond)
+        page.goto("about:blank")
 
 
 def test_workday_review_signin_refreshes_vps_error_and_rechecks_state(page, tmp_db, monkeypatch):
@@ -440,6 +441,7 @@ def test_workday_review_signin_refreshes_vps_error_and_rechecks_state(page, tmp_
         assert vault.get(run.tenant).email == acct.email
     finally:
         page.unroute("https://workday.test/**", respond)
+        page.goto("about:blank")
 
 
 def test_workday_persistent_vps_error_stops_with_review_screenshot(page, tmp_db, monkeypatch):
@@ -467,9 +469,53 @@ def test_workday_persistent_vps_error_stops_with_review_screenshot(page, tmp_db,
         assert run.ctx.screenshots == ["auth_failed"]
     finally:
         page.unroute("https://workday.test/**", respond)
+        page.goto("about:blank")
+
+
+def test_workday_wizard_refreshes_vps_error_appearing_during_form_wait(page, tmp_db, monkeypatch):
+    url = "https://workday.test/apply"
+    visits = []
+
+    def respond(route):
+        visits.append(route.request.url)
+        route.fulfill(status=200, content_type="text/html",
+                      body=f"<html><body>{FIXTURES['wizard']}</body></html>")
+
+    page.route("https://workday.test/**", respond)
+    try:
+        page.goto(url)
+        run = workday._Run(_job(), _Ctx(page))
+        monkeypatch.setattr(run, "settle", lambda *args, **kwargs: None)
+        wait_calls, fill_states = [], []
+
+        def wait_form(*args, **kwargs):
+            wait_calls.append(True)
+            if len(wait_calls) == 1:
+                page.evaluate("document.body.insertAdjacentHTML('beforeend', "
+                              "'<div>VPS Error. Please refresh the page.</div>')")
+
+        def fill_step(name):
+            fill_states.append(page.locator("body").inner_text())
+            raise run.stop(workday.ApplyStatus.NEEDS_REVIEW, "test stopped after recovery", "test")
+
+        monkeypatch.setattr(run, "wait_form", wait_form)
+        monkeypatch.setattr(run, "fill_step", fill_step)
+        monkeypatch.setattr(run, "advance", lambda *args: pytest.fail("advanced while VPS error was visible"))
+
+        with pytest.raises(workday._Stop) as exc:
+            run.wizard()
+
+        assert "test stopped after recovery" in exc.value.result.reason
+        assert len(visits) == 2
+        assert len(wait_calls) == 2
+        assert len(fill_states) == 1 and "VPS Error" not in fill_states[0]
+    finally:
+        page.unroute("https://workday.test/**", respond)
+        page.goto("about:blank")
 
 
 def test_workday_does_not_recreate_an_attempted_account_after_bad_signin(page, tmp_db, monkeypatch):
+    page.set_content("<body></body>")
     run = workday._Run(_job(), _Ctx(page))
     vault.create(run.tenant, "KLA", "https://kla.wd1.myworkdayjobs.com/UR")
     vault.mark_creation_attempted(run.tenant)

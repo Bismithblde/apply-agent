@@ -582,6 +582,17 @@ class _Run:
         except Exception:
             return None
 
+    def _has_transient_error(self) -> bool:
+        if _OOPS_RE.search(_text(self.page, "body")):
+            return True
+        for frame in self.page.frames[1:]:
+            try:
+                if not frame.is_detached() and _OOPS_RE.search(_text(frame, "body")):
+                    return True
+            except Exception:
+                continue
+        return False
+
     def left(self) -> float:
         return self.deadline - time.monotonic()
 
@@ -754,7 +765,7 @@ class _Run:
         self.page.wait_for_timeout(1500)
         while time.monotonic() < end:
             body = _text(self.page, "body")
-            if _OOPS_RE.search(body):
+            if self._has_transient_error():
                 if refreshed:
                     self.ctx.record_layer("page_recovery", "needs_review", "workday_error_persisted_after_refresh")
                     return "error: Workday error persisted after one refresh"
@@ -868,14 +879,14 @@ class _Run:
         for _ in range(MAX_STEPS):
             self.check_budget()
             self.settle()
-            while _OOPS_RE.search(_text(self.page, ROOT)) and reloads < 2:
+            while self._has_transient_error() and reloads < 2:
                 reloads += 1
                 log.info("Workday error page; reloading (%d)", reloads)
                 self.page.wait_for_timeout(2000)
                 refresh_page(self.page)
                 self.settle()
-            if _OOPS_RE.search(_text(self.page, ROOT)):
-                raise self.stop(ApplyStatus.NEEDS_REVIEW, "Workday 'Something went wrong' page", "oops")
+            if self._has_transient_error():
+                raise self.stop(ApplyStatus.NEEDS_REVIEW, "Workday transient error page persisted after refresh", "oops")
             state = self.wait_state({"wizard", "review", "submitted"}, 30)
             if state == "submitted":
                 if _APPLIED_RE.search(_text(self.page, "body")):
@@ -885,6 +896,8 @@ class _Run:
             if state not in ("wizard", "review"):
                 raise self.stop(ApplyStatus.NEEDS_REVIEW, f"lost the application wizard (state={state})", "lost")
             self.wait_form()
+            if self._has_transient_error():
+                continue
             name = step_name(self.page) or "unknown step"
             self.furthest = name
             if state == "review":
@@ -896,6 +909,8 @@ class _Run:
             if re.search(r"assessment", name, re.I):
                 raise self.stop(ApplyStatus.NEEDS_REVIEW, "Workday assessment step needs a human", "assessment")
             self.fill_step(name)
+            if self._has_transient_error():
+                continue
             self.advance(name)
         raise self.stop(ApplyStatus.NEEDS_REVIEW, f"more than {MAX_STEPS} wizard steps", "too_many_steps")
 
@@ -2562,10 +2577,12 @@ class _Run:
         return self.click(NEXT)
 
     def advance(self, name: str) -> None:
+        if self._has_transient_error():
+            return
         if _is_submit_action(next_button_text(self.page)):
             return
         if not self.click_next():
-            if _OOPS_RE.search(_text(self.page, ROOT)):
+            if self._has_transient_error():
                 return
             raise self.stop(ApplyStatus.NEEDS_REVIEW, f"could not click Next on '{name}'", "next")
         self.settle()

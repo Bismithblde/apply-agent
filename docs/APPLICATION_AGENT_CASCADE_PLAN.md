@@ -53,9 +53,9 @@ Every attempt should make it possible to determine which layer handled the page,
 
 **Delivered:** Screenshot and field context guide text and dropdown repairs. Text actions must match the requested action and land on the DOM-identified field. Dropdown actions must land on the requested control or an option owned by its listbox; submit/navigation controls and options in other fields are rejected. The approved answer supplies the text, and the field is re-read after the action. The existing Generic vision loop continues to handle page-level navigation.
 
-**Transient-page recovery:** Generic can choose `refresh_page` after inspecting a blocker screenshot; the next loop captures a fresh screenshot, and an unchanged VPS/server error stops with a review screenshot. Workday recognizes its refresh/VPS error during account sign-in (including fill-only review), refreshes once, and rechecks the resulting state. The vault records that account creation was attempted so a later retry cannot submit the same account-creation form again.
+**Transient-page recovery:** Generic can choose `refresh_page` after inspecting a blocker screenshot; the next loop captures a fresh screenshot, and an unchanged VPS/server error stops with a review screenshot. Workday checks the page body and frames, including banners outside `applyFlowPage`, before and after form interaction. It refreshes a recognized error and rechecks the state; a persistent blocker returns with a review screenshot. The vault records that account creation was attempted so a later retry cannot submit the same account-creation form again.
 
-**Verification:** Eleven focused account-recovery, refresh-tool, persistent-error, and submit-guard tests passed; all four `tests/test_review.py` tests passed. Tests use local pages and synthetic accounts; no live account or application was run.
+**Verification:** Twelve focused account-recovery, refresh-tool, persistent-error, and submit-guard tests passed; all four `tests/test_review.py` tests passed. Tests use local pages and synthetic accounts; no live account or application was run.
 
 ### Phase 4 — End-to-end submission and evaluation
 
