@@ -178,12 +178,19 @@ def _dates(screen):
 def _load_jobs(emit, stop, *, dates=None, latest=False):
     from .config import load_config
     from .job_search import find_jobs
-    from .scheduler import fetch_once
-    emit('Refreshing job sources…')
-    fetch_once(load_config())
+    from . import scheduler
+    config = load_config()
+    fetch_every = config.get('schedule', {}).get('fetch_every', '30m')
+    notes = []
+    cache_note = ''
+    if scheduler._due('last_fetch', fetch_every):
+        emit('Refreshing job sources…')
+        scheduler.fetch_once(config)
+    else:
+        cache_note = 'Using cached job listings'
+        emit(cache_note)
     if stop.is_set():
         raise CancelledError()
-    notes = []
 
     def progress(message):
         notes.append(message)
@@ -193,7 +200,7 @@ def _load_jobs(emit, stop, *, dates=None, latest=False):
                         since_last_application=latest, emit=progress)
     if stop.is_set():
         raise CancelledError()
-    return rows, notes[-1] if notes else ''
+    return rows, ' · '.join(note for note in (cache_note, notes[-1] if notes else '') if note)
 
 
 def _select_jobs(screen, rows, note='', *, queue_view=False):

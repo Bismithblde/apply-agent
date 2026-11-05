@@ -44,10 +44,11 @@ Testing-mode tokens expire after 7 days. Re-run `auth gmail` when `doctor` says 
 Run `.venv/bin/python -m agent tui` (or run without arguments in a terminal).
 The menu has three actions:
 
-- **Get latest jobs** refreshes listings and shows jobs discovered since the last confirmed application.
-  If no application has been recorded, it shows all eligible jobs.
-- **Search by date** refreshes listings and filters by an inclusive posting-date range. Missing posting
-  dates use the discovery date. Leave a boundary blank for no boundary.
+- **Get latest jobs** shows jobs discovered since the last confirmed application. If no application has
+  been recorded, it shows all eligible jobs. Both search actions reuse saved listings until the configured
+  fetch interval expires, then refresh sources.
+- **Search by date** filters by an inclusive posting-date range. Missing posting dates use the discovery
+  date. Leave a boundary blank for no boundary.
 - **Apply to queued jobs** processes the saved selection as one real application batch, after confirmation.
   Existing verification, queue locks, and submission caps still apply. Unprocessed, failed, and review jobs stay visible in the queue; only ready jobs are applied.
 

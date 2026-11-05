@@ -171,6 +171,35 @@ def test_latest_uses_last_confirmed_application_not_last_attempt(local_db, monke
     assert {row['id'] for row in rows} == {'new', *(f'additional-{i}' for i in range(60))}
 
 
+@pytest.mark.parametrize(('last_fetch_age', 'should_fetch'), [(60, False), (1801, True), (None, True)])
+def test_load_jobs_respects_fetch_interval_and_returns_cached_rows(local_db, monkeypatch,
+                                                                    last_fetch_age, should_fetch):
+    from agent import job_search
+
+    add_job('cached', 1, 1)
+    db.kv_set('pick_email_check', 'false')
+    if last_fetch_age is not None:
+        db.kv_set('last_fetch', str(tui.time.time() - last_fetch_age))
+
+    config = {'schedule': {'fetch_every': '30m'}}
+    fetch_calls, search_calls = [], []
+    monkeypatch.setattr('agent.config.load_config', lambda: config)
+    monkeypatch.setattr('agent.scheduler.fetch_once', lambda loaded: fetch_calls.append(loaded))
+    real_find_jobs = job_search.find_jobs
+
+    def find_jobs_spy(**kwargs):
+        search_calls.append(kwargs)
+        return real_find_jobs(**kwargs)
+
+    monkeypatch.setattr(job_search, 'find_jobs', find_jobs_spy)
+    rows, note = tui._load_jobs(lambda _: None, threading.Event())
+
+    assert fetch_calls == ([config] if should_fetch else [])
+    assert len(search_calls) == 1
+    assert [row['id'] for row in rows] == ['cached']
+    assert note == ('Using cached job listings' if last_fetch_age is not None and last_fetch_age < 1800 else '')
+
+
 def test_apply_processes_entire_queue_and_keeps_retryable_jobs(local_db, monkeypatch):
     import json
     for name in ('one', 'two', 'retry'):

@@ -68,9 +68,10 @@ Every attempt should make it possible to determine which layer handled the page,
 ## Terminal workflow and application history
 
 The standard-library curses menu (`python -m agent tui`, or no arguments in an interactive terminal)
-has Get latest jobs, Search by date, and Apply to queued jobs. Latest refreshes sources and filters by
-discovery time since the last confirmed application, not a failed attempt. Date search refreshes sources
-and uses inclusive posting dates with discovery-date fallback. Results support individual toggles,
+has Get latest jobs, Search by date, and Apply to queued jobs. Latest filters by discovery time since
+the last confirmed application, not a failed attempt. Both search actions reuse saved listings until
+`schedule.fetch_every` expires, then refresh sources; date search uses inclusive posting dates with
+discovery-date fallback. Results support individual toggles,
 select all, deselect all, and persistent queuing across searches. Apply shows the saved queue with status labels. Enter submits selected ready jobs while review/failed
 items remain visible and cannot be automatically retried; shared safeguards and caps still apply.
 The main-menu `e` key retains the email preference; other CLI modes remain available separately.
@@ -78,6 +79,8 @@ Finite fetch/apply operations run outside the curses thread while a cog/rotating
 message animate on the main thread. Buffered keys are consumed/discarded before the next screen.
 Cancellation stops new claims while in-flight applications finish, retaining pending selections.
 File logging continues and console handlers are restored afterward.
+Cache verification after the change: `./.venv/bin/python -m pytest -q tests/test_tui.py tests/test_sources.py tests/test_db_flow.py`
+passed 89 tests, including fresh, expired, and missing-fetch-time cases with local SQLite fixtures.
 
 The append-only application WAL snapshots confirmed receipts in the same SQLite transaction, including
 flow confirmations, manual marks, and resolved submissions. Search consults it even with email disabled.
