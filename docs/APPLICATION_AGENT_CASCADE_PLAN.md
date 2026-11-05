@@ -73,6 +73,8 @@ Every attempt should make it possible to determine which layer handled the page,
 
 **Verification:** `tests/test_accounts.py` passed 235 tests, `tests/test_answers_rag.py` passed 67, and `tests/test_review.py` passed 5. All use local fixtures; no live application was run.
 
+**Cross-field dropdown isolation (2026-11-05):** Workday multiselect tags stay in the target field's own search input. The page-wide popup-search fallback is limited to non-multiselect controls, preventing a still-open Field of Study menu from receiving Skills text. A local regression keeps the Field of Study menu open while processing Skills and verifies that the major input remains unchanged. Verification: `.venv/bin/pytest tests/test_accounts.py -k workday -q` passed 130 tests; no live application was run.
+
 ## Terminal workflow and application history
 
 The standard-library curses menu (`python -m agent tui`, or no arguments in an interactive terminal)

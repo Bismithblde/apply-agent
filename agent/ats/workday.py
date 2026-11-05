@@ -2163,7 +2163,8 @@ class _Run:
                 search_val = ""
             elif re.search(r"\(\+\d+\)", search_val):
                 search_val = re.sub(r"\s*\(\+\d+\)", "", search_val).strip()
-            if search_val:
+            # A multiselect has its own search input; a page-wide popup query may hit another open field.
+            if search_val and not is_multiselect:
                 try:
                     popup_inp = self.page.locator('[role="dialog"] input:visible, [role="listbox"] input:visible, input[data-automation-id="searchBox"]:visible, input[placeholder*="Search" i]:visible')
                     if popup_inp.count() and popup_inp.first.is_visible():

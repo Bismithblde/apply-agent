@@ -847,6 +847,25 @@ def test_workday_multiselect_splits_delimited_tags_and_selects_each_suggestion(p
     assert run._value_matches(field, answer.value, ['Java', 'Python'])
 
 
+def test_workday_multiselect_does_not_type_into_another_open_dropdown(page):
+    page.set_content('''<div data-automation-id="applyFlowPage">
+      <div data-automation-id="formField-fieldOfStudy"><label>Field of Study*</label>
+        <div data-automation-id="multiselectInputContainer"><input id="major" placeholder="Search"></div>
+        <div id="major-options" role="listbox"><div role="option">Computer Science</div></div>
+      </div>
+      <div data-automation-id="formField-skills"><label>Skills*</label>
+        <div data-automation-id="multiselectInputContainer">
+          <input id="skills" data-aa-key="skills" data-uxi-widget-type="selectinput">
+        </div>
+      </div></div>''')
+    run = workday._Run(_job(), _Ctx(page))
+    field = workday.Field('skills', 'Skills', 'combobox', True, name='formField-skills')
+
+    assert not run.choose_option(page.locator('#skills'), 'React', multi=True, field=field)
+    assert page.locator('#major').input_value() == ''
+    assert page.locator('#skills').input_value() == 'React'
+
+
 def test_workday_multiselect_commits_free_entry_only_when_no_suggestion_exists(page):
     page.set_content('''<div data-automation-id="formField-skills"><label>Skills*</label>
       <div data-automation-id="multiselectInputContainer">
