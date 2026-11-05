@@ -1379,7 +1379,7 @@ def test_submit_email_security_code_multi_box_otp(page, monkeypatch):
     assert res.reason == "submitted"
 
 
-def test_verification_code_never_clicks_final_submit_button(page, monkeypatch):
+def test_verification_code_does_not_click_unassociated_final_submit_button(page, monkeypatch):
     from agent import mail
     monkeypatch.setattr(db, "record_submit_intent", lambda *args, **kwargs: None)
     page.set_content("""
@@ -1409,5 +1409,56 @@ def test_verification_code_never_clicks_final_submit_button(page, monkeypatch):
     assert res.reason == "verification control not found"
     assert page.evaluate("window.finalClicks") == 0
     assert page.locator('input[name="security_code"]').input_value() == "123456"
+
+
+def test_greenhouse_same_form_security_code_resubmits_application(page, monkeypatch):
+    from agent import mail
+    monkeypatch.setattr(db, "record_submit_intent", lambda *args, **kwargs: None)
+    page.set_content("""
+      <form id="application">
+        <label>Email <input type="email" name="email" value="ryan@example.com" /></label>
+        <button type="submit" id="submit">Submit application</button>
+      </form>
+      <script>
+        const form = document.getElementById('application');
+        const submit = document.getElementById('submit');
+        window.submitCount = 0;
+        window.finalSubmission = false;
+        form.addEventListener('submit', event => {
+          event.preventDefault();
+          window.submitCount++;
+          let code = form.querySelector('input[name="security_code"]');
+          if (!code) {
+            const section = document.createElement('section');
+            section.innerHTML = `
+              <h3>Security code</h3>
+              <p>A verification code was sent. Enter the code to submit your application.</p>
+              <input type="text" name="security_code" maxlength="8" autocomplete="one-time-code" />
+            `;
+            form.appendChild(section);
+            submit.disabled = true;
+            code = section.querySelector('input');
+            code.addEventListener('input', () => { submit.disabled = code.value.length !== 8; });
+          } else if (code.value === '87654321') {
+            window.finalSubmission = true;
+            document.body.innerHTML = '<h2>Thank you for applying! Your application has been submitted.</h2>';
+          }
+        });
+      </script>
+    """)
+    monkeypatch.setattr(mail, "wait_for_verification", lambda after_ts, timeout=30, want="any": mail.Verification(
+        code="87654321", link=None, message_id="msg1", subject="Code", sender="hr@example.com"
+    ))
+    fields = form.extract_fields(page)
+    ans = [Answer(fields[0].key, "ryan@example.com", "profile")]
+    form.fill_fields(page, fields, ans)
+    res = form.finish_application(
+        JOB, _ctx(page, submit_mode="full", run_id=1), page, fields, ans, [],
+        submit_texts=["Submit application"],
+    )
+    assert res.status == ApplyStatus.SUBMITTED
+    assert res.reason == "submitted"
+    assert page.evaluate("window.finalSubmission") is True
+    assert page.evaluate("window.submitCount") == 2
 
 

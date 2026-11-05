@@ -1146,8 +1146,8 @@ def _result(status: ApplyStatus, reason: str, fields: list[Field], answers: list
     )
 
 
-def _click_code_confirmation(scope, code_input) -> bool:
-    """Only activate a button associated with the code entry, never another application submit."""
+def _click_code_confirmation(scope, code_input, *, allow_application_submit: bool = False) -> bool:
+    """Activate a code control, or the same-form final submit after a verified OTP was entered."""
     names = ["Verify", "Verify code", "Verify email", "Confirm code", "Confirm verification",
              "Confirm email", "Submit code", "Complete verification", "Confirm", "Submit"]
     for name in names:
@@ -1188,6 +1188,31 @@ def _click_code_confirmation(scope, code_input) -> bool:
                     return True
         except Exception:
             continue
+
+    # Some ATSes (including Greenhouse) append the OTP fields to the application form and
+    # require the applicant to press its final "Submit application" button again. Allow
+    # that only after the caller has entered and checked a fresh code, and only when the
+    # code input and exact final button belong to the same form that contains the prompt.
+    if allow_application_submit:
+        try:
+            buttons = scope.get_by_role("button", name=re.compile(r"^submit application$", re.I))
+            for button in buttons.all()[:5]:
+                if not button.is_visible():
+                    continue
+                associated = button.evaluate("""(button, input) => {
+                    if (!input || button.ownerDocument !== input.ownerDocument) return false;
+                    const form = button.closest('form');
+                    if (!form || !form.contains(input) || button.form !== form || button.disabled) return false;
+                    if ((button.type || '').toLowerCase() !== 'submit') return false;
+                    if (!/security code|verification code|one.time code|otp/i.test(form.innerText || ''))
+                        return false;
+                    return true;
+                }""", code_input.element_handle())
+                if associated:
+                    button.click(timeout=5000)
+                    return True
+        except Exception:
+            pass
     return False
 
 
@@ -1302,9 +1327,17 @@ def finish_application(job: Job, ctx, scope, fields: list[Field], answers: list[
                         return _result(ApplyStatus.NEEDS_REVIEW, "could not enter verification code",
                                        fields, answers, shot, page.url)
 
-                confirmed = _click_code_confirmation(page, boxes[0])
+                try:
+                    entered = "".join(box.input_value() for box in boxes)
+                except Exception:
+                    entered = ""
+                if entered != code:
+                    return _result(ApplyStatus.NEEDS_REVIEW, "verification code entry could not be confirmed",
+                                   fields, answers, shot, page.url)
+
+                confirmed = _click_code_confirmation(page, boxes[0], allow_application_submit=True)
                 if not confirmed and scope is not page:
-                    confirmed = _click_code_confirmation(scope, boxes[0])
+                    confirmed = _click_code_confirmation(scope, boxes[0], allow_application_submit=True)
                 if not confirmed:
                     return _result(ApplyStatus.NEEDS_REVIEW, "verification control not found",
                                    fields, answers, shot, page.url)
