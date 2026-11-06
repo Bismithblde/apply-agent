@@ -875,7 +875,7 @@ def test_workday_multiselect_enters_to_open_and_semantically_match_suggestion(pa
     </script>''')
     run = workday._Run(_job(), _Ctx(page))
     field = workday.Field('skills', 'Type to Add Skills', 'combobox', True, name='formField-skills')
-    answer = workday.Answer('skills', 'JS', 'bank')
+    answer = workday.Answer('skills', 'JS', 'generated', 'Evidence: resume#1')
     run.answers['skills'] = answer
     run.expected_answers['skills'] = answer
     prompts = []

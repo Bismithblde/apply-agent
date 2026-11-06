@@ -2284,7 +2284,7 @@ class _Run:
             semantic_match = False
             if i is None and is_tag_entry and is_skills:
                 source = self.answers.get(key) if key else None
-                if source and source.source in ("profile", "bank"):
+                if source and source.source in ("profile", "bank", "generated"):
                     i = _ai_pick_option(label, texts, {"skills": value}, value)
                     semantic_match = i is not None
             if i is None and is_major and value:
