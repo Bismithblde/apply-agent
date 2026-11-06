@@ -2017,6 +2017,7 @@ class _Run:
                 return True
 
             ok = True
+            selected_values: list[str] = []
             for v in values:
                 if isinstance(v, bool):
                     v = "Yes" if v else "No"
@@ -2030,16 +2031,22 @@ class _Run:
                     log.info("fill_workday_widget: existing selection matched for %r (key=%r)", f.label, f.key)
                     self.answers[f.key] = Answer(f.key, matched_val, a.source, f"already matched: {matched_val}")
                     f.current_value = matched_val
+                    selected_values.append(matched_val)
                     continue
-                cands = [v]
-                ok = any(self.choose_option(el, c, multi=f.kind == "combobox", field=f, required=f.required) for c in cands) and ok
+                chosen = self.choose_option(el, v, multi=f.kind == "combobox", field=f, required=f.required)
+                ok = chosen and ok
+                selected = self.answers.get(f.key)
+                if chosen and selected and isinstance(selected.value, str):
+                    selected_values.append(selected.value)
             if is_multiselect:
                 actual = self._control_values(el)
-                if not ok or not all(_exact_option(actual, str(value)) is not None for value in values):
+                if not ok or not all(_exact_option(actual, value) is not None for value in selected_values):
                     return False
-                self.answers[f.key] = Answer(f.key, [str(value) for value in values], a.source,
+                self.answers[f.key] = Answer(f.key, selected_values, a.source,
                                              "selected tags verified")
-                f.current_value = " | ".join(str(value) for value in values)
+                self.expected_answers[f.key] = Answer(f.key, selected_values, a.source,
+                                                      "selected Workday options verified")
+                f.current_value = " | ".join(selected_values)
             return ok
         except Exception as e:
             log.warning("workday widget fill failed for %r (error_type=%s)", f.label, type(e).__name__)
@@ -2118,6 +2125,7 @@ class _Run:
             except Exception:
                 pass
 
+        tag_entered = False
         try:
             self.page.keyboard.press("Escape")
             self.page.wait_for_timeout(200)
@@ -2154,6 +2162,13 @@ class _Run:
                     target_inp.type(value, delay=20)
                 except Exception:
                     pass
+
+        if is_tag_entry and value:
+            try:
+                target_inp.press("Enter")
+                tag_entered = True
+            except Exception:
+                pass
 
         self.page.wait_for_timeout(1000)
         search_val = ""
@@ -2217,7 +2232,11 @@ class _Run:
                     if is_tag_entry and value and not expanded:
                         choices = self.page.locator('[role="option"]:visible, ' + A("promptOption") + ':visible')
                         before = self._control_values(el)
-                        if not choices.count():
+                        committed = _exact_option(before, value) if len(before) > selected_before else None
+                        if committed is not None:
+                            picked = True
+                            chosen_text = before[committed]
+                        elif not choices.count() and not tag_entered:
                             try:
                                 target_inp.press("Enter")
                                 for _ in range(5):
@@ -2262,6 +2281,12 @@ class _Run:
                                                          exact=is_referral or is_tag_entry)
                 if scrolled:
                     opts, texts, i = scrolled
+            semantic_match = False
+            if i is None and is_tag_entry and is_skills:
+                source = self.answers.get(key) if key else None
+                if source and source.source in ("profile", "bank"):
+                    i = _ai_pick_option(label, texts, {"skills": value}, value)
+                    semantic_match = i is not None
             if i is None and is_major and value:
                 for alias in _major_aliases(value):
                     idx = _match_option(texts, alias)
@@ -2342,7 +2367,7 @@ class _Run:
             is_target_match = False
             if value:
                 if (_exact_option([chosen_text], value) if is_tag_entry
-                        else _match_option([chosen_text], value)) is not None:
+                        else _match_option([chosen_text], value)) is not None or semantic_match:
                     is_target_match = True
                 elif is_major and any(_match_option([chosen_text], a) is not None for a in _major_aliases(value)):
                     is_target_match = True

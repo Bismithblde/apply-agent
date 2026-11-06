@@ -75,6 +75,8 @@ Every attempt should make it possible to determine which layer handled the page,
 
 **Cross-field dropdown isolation (2026-11-05):** Workday multiselect tags stay in the target field's own search input. The page-wide popup-search fallback is limited to non-multiselect controls, preventing a still-open Field of Study menu from receiving Skills text. A local regression keeps the Field of Study menu open while processing Skills and verifies that the major input remains unchanged. Verification: `.venv/bin/pytest tests/test_accounts.py -k workday -q` passed 130 tests; no live application was run.
 
+**Workday optioned skill tags (2026-11-05):** The Skills control presses Enter after typing to reveal suggestions and selects an exact displayed option first. When a confirmed profile or answer-bank skill differs semantically from the displayed label, the grounded option matcher may choose only an exact item from that list. Free-entry remains supported when Enter creates and verifies a chip; review records the selected Workday labels. Verification: `.venv/bin/pytest tests/test_accounts.py -k 'workday_multiselect or workday_major or ai_pick_option' -q` passed 20 tests; no live application was run.
+
 ## Terminal workflow and application history
 
 The standard-library curses menu (`python -m agent tui`, or no arguments in an interactive terminal)

@@ -847,6 +847,54 @@ def test_workday_multiselect_splits_delimited_tags_and_selects_each_suggestion(p
     assert run._value_matches(field, answer.value, ['Java', 'Python'])
 
 
+def test_workday_multiselect_enters_to_open_and_semantically_match_suggestion(page, monkeypatch):
+    page.goto('about:blank')
+    page.set_content('''<div data-automation-id="formField-skills"><label>Skills*</label>
+      <div data-automation-id="multiselectInputContainer">
+        <input id="skills" data-aa-key="skills" data-uxi-widget-type="selectinput">
+      </div><div id="suggestions" role="listbox" style="display:none"></div>
+    </div><script>
+      const input = document.querySelector('#skills');
+      const menu = document.querySelector('#suggestions');
+      window.enterCount = 0;
+      input.addEventListener('keydown', event => {
+        if (event.key !== 'Enter') return;
+        event.preventDefault();
+        window.enterCount++;
+        menu.innerHTML = '<div role="option">JavaScript</div>';
+        menu.style.display = 'block';
+        menu.firstElementChild.onclick = () => {
+          const chip = document.createElement('span');
+          chip.dataset.automationId = 'selectedItem';
+          chip.innerHTML = '<span data-automation-id="selectedItemText">JavaScript</span>';
+          document.querySelector('[data-automation-id="formField-skills"]').append(chip);
+          input.value = '';
+          menu.style.display = 'none';
+        };
+      });
+    </script>''')
+    run = workday._Run(_job(), _Ctx(page))
+    field = workday.Field('skills', 'Type to Add Skills', 'combobox', True, name='formField-skills')
+    answer = workday.Answer('skills', 'JS', 'bank')
+    run.answers['skills'] = answer
+    run.expected_answers['skills'] = answer
+    prompts = []
+
+    def semantic_match(prompt, schema):
+        prompts.append(prompt)
+        return {'chosen_option': 'JavaScript'}
+
+    monkeypatch.setattr(llm, 'generate_json', semantic_match)
+
+    assert run.fill_workday_widget(field, answer)
+    assert page.evaluate('window.enterCount') == 1
+    assert page.locator('[data-automation-id="selectedItemText"]').inner_text() == 'JavaScript'
+    assert run.answers['skills'].value == ['JavaScript']
+    assert run.expected_answers['skills'].value == ['JavaScript']
+    assert run._value_matches(field, run.expected_answers['skills'].value, ['JavaScript'])
+    assert len(prompts) == 1 and '"JS"' in prompts[0] and '"JavaScript"' in prompts[0]
+
+
 def test_workday_multiselect_does_not_type_into_another_open_dropdown(page):
     page.set_content('''<div data-automation-id="applyFlowPage">
       <div data-automation-id="formField-fieldOfStudy"><label>Field of Study*</label>
