@@ -476,7 +476,8 @@ def _ai_pick_option(label: str, texts: list[str], info: dict, wanted: str = "") 
         (r"skills?", "skills"),
         (r"location|\bcity\b|\bstate\b|\bcountry\b|residen", "location"),
     )
-    fact_key = next((key for pattern, key in field_facts if re.search(pattern, label, re.I)), None)
+    fact_key = ("relocation_scope" if re.search(r"relocat", label, re.I) and _yes_no(wanted) is None else
+                next((key for pattern, key in field_facts if re.search(pattern, label, re.I)), None))
     if fact_key is None or fact_key not in facts:
         return None
     if fact_key in ("us_citizen", "authorized_us", "needs_sponsorship", "willing_to_relocate"):
@@ -2030,6 +2031,9 @@ class _Run:
                     matched_val = c_vals[matched_idx]
                     log.info("fill_workday_widget: existing selection matched for %r (key=%r)", f.label, f.key)
                     self.answers[f.key] = Answer(f.key, matched_val, a.source, f"already matched: {matched_val}")
+                    if re.search(r"relocat", f.label + " " + f.name, re.I):
+                        self.expected_answers[f.key] = Answer(f.key, matched_val, a.source,
+                                                             "verified semantic Workday relocation option")
                     f.current_value = matched_val
                     selected_values.append(matched_val)
                     continue
@@ -2108,6 +2112,7 @@ class _Run:
         )
         is_major = bool(re.search(r"field\s*of\s*study|fieldOfStudy|major|area\s*of\s*study", label + " " + fid, re.I))
         is_skills = bool(re.search(r"\bskills?\b", label + " " + fid, re.I))
+        is_relocation = bool(re.search(r"relocat", label + " " + fid, re.I))
         is_degree = bool(re.search(r"\bdegree\b", label + " " + fid, re.I) and not is_major)
         is_tag_entry = is_multiselect and not (is_school or is_major or is_degree or is_referral or is_phone_device)
 
@@ -2190,6 +2195,7 @@ class _Run:
                 except Exception:
                     pass
         picked = False
+        semantic_match = False
         chosen_text: str | None = None
         last_texts: list[str] = []
 
@@ -2260,6 +2266,27 @@ class _Run:
             if not texts:
                 break
 
+            if is_tag_entry and value and not any(_is_reasonable(text) for text in texts):
+                before = self._control_values(el)
+                committed = _exact_option(before, value) if len(before) > selected_before else None
+                if committed is not None:
+                    picked = True
+                    chosen_text = before[committed]
+                elif tag_entered:
+                    try:
+                        target_inp.press("Enter")
+                        for _ in range(5):
+                            self.page.wait_for_timeout(200)
+                            current = self._control_values(el)
+                            committed = _exact_option(current, value) if len(current) > selected_before else None
+                            if committed is not None:
+                                picked = True
+                                chosen_text = current[committed]
+                                break
+                    except Exception:
+                        pass
+                break
+
             if key:
                 opts.evaluate_all("""(options, key) => options.forEach(o => {
                     o.setAttribute('data-aa-dropdown-owner', key);
@@ -2317,7 +2344,10 @@ class _Run:
                     if t.strip().lower() in ("all", "search by category", "partial list (first 500 entries)", "search by location"):
                         i = idx
                         break
-            if i is None and not is_tag_entry and (is_degree or is_school or is_major or is_skills or (is_referral and value.strip().casefold() in ("simplify", "job board", ""))):
+            if i is None and not is_tag_entry and (
+                is_degree or is_school or is_major or is_skills or is_relocation or
+                (is_referral and value.strip().casefold() in ("simplify", "job board", ""))
+            ):
                 edu = (self.ctx.profile.get("education") or {}) if hasattr(self, "ctx") else {}
                 pers = (self.ctx.profile.get("personal") or {}) if hasattr(self, "ctx") else {}
                 pref = (self.ctx.profile.get("preferences") or {}) if hasattr(self, "ctx") else {}
@@ -2332,11 +2362,13 @@ class _Run:
                     "authorized_us": auth.get("authorized_us"),
                     "needs_sponsorship": auth.get("needs_sponsorship_now"),
                     "willing_to_relocate": pref.get("willing_to_relocate"),
+                    "relocation_scope": pref.get("relocation_scope"),
                 }
                 source = self.answers.get(key) if key else None
                 if is_skills and source and source.source in ("profile", "bank"):
                     info["skills"] = value
                 i = _ai_pick_option(label, texts, info, value)
+                semantic_match = i is not None
             if i is None:
                 log.info("workday option not matched for %r (options=%d)", label, len(texts))
                 break
@@ -2458,6 +2490,9 @@ class _Run:
             old_ans = self.answers.get(key)
             src = old_ans.source if (old_ans and old_ans.source != "unknown") else "generated"
             self.answers[key] = Answer(key, chosen_text, src, f"selected: {chosen_text}")
+            if semantic_match and is_relocation:
+                self.expected_answers[key] = Answer(key, chosen_text, src,
+                                                    "verified semantic Workday relocation option")
             if f:
                 f.current_value = chosen_text
 
@@ -2823,7 +2858,9 @@ class _Run:
         normalize = lambda text: re.sub(r"[\s*✱:]+$", "", " ".join(str(text).casefold().split()))
         for f in list(self.fields.values()):
             grounded = self._profile_widget_answer(f)
-            expected = grounded or self.expected_answers.get(f.key) or self.answers.get(f.key)
+            saved = self.expected_answers.get(f.key)
+            expected = (saved if saved and saved.note == "verified semantic Workday relocation option"
+                        else grounded or saved or self.answers.get(f.key))
             if _missing(expected):
                 if grounded is not None:
                     self.answers[f.key] = grounded
