@@ -834,7 +834,7 @@ class GenericAdapter:
                                 f"could not persist submit intent: {type(e).__name__}: {e}"[:300])
         run.submit_attempted = True
         _note_application_action(run)
-        clicked = _click(run, target, allow_dom_fallback=False)
+        clicked = _click(run, target, allow_dom_fallback=False, scroll_into_view=False)
         if not clicked:
             _settle(run.page, idle_ms=8000)
             if _new_confirmation(run, _page_text(run.page)):
@@ -1728,7 +1728,8 @@ def _adopt_popup(run: Run) -> bool:
         return False
 
 
-def _click(run: Run, target: Clickable, *, allow_dom_fallback: bool = True) -> bool:
+def _click(run: Run, target: Clickable, *, allow_dom_fallback: bool = True,
+           scroll_into_view: bool = True) -> bool:
     browser = run.ctx.browser
     before = list(browser.pages) if browser is not None else []
     source, source_url = run.page, _safe_url(run.page)
@@ -1738,7 +1739,8 @@ def _click(run: Run, target: Clickable, *, allow_dom_fallback: bool = True) -> b
     requesting_code = explicit_request or (not has_code and any(
         ACCOUNT_ACTION_RE.fullmatch(label) for label in (target.text, target.aria)))
     try:
-        loc.scroll_into_view_if_needed(timeout=5000)
+        if scroll_into_view:
+            loc.scroll_into_view_if_needed(timeout=5000)
         requested_ts = time.time()
         loc.click(timeout=10000)
     except Exception as click_error:

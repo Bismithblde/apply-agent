@@ -14,7 +14,7 @@ from types import SimpleNamespace
 from urllib.parse import urlparse
 
 import pytest
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import Locator, sync_playwright
 
 # Sibling modules are built in parallel; stub any that do not exist yet so this module imports.
 for _name in ("form", "answers", "captcha", "mail", "vault"):
@@ -1830,7 +1830,7 @@ def test_terminal_continue_without_confirmation_is_uncertain_and_never_retried(s
 def test_final_click_exception_after_dispatch_does_not_retry(site, monkeypatch):
     click_attempts = []
 
-    def dispatch_then_report_uncertain(run_state, target, *, allow_dom_fallback=True):
+    def dispatch_then_report_uncertain(run_state, target, *, allow_dom_fallback=True, scroll_into_view=True):
         click_attempts.append(allow_dom_fallback)
         target.frame.locator(f'[data-aa-click="{target.index}"]').first.evaluate("el => el.click()")
         return False
@@ -1843,6 +1843,59 @@ def test_final_click_exception_after_dispatch_does_not_retry(site, monkeypatch):
     assert sum(method == "POST" and path == "/thanks" for method, path, _ in site.hits) == 1
     with db.connect() as conn:
         assert conn.execute("SELECT COUNT(*) FROM submit_intents").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("fail_before_intent", [False, True])
+def test_final_submit_visibility_check_precedes_intent_and_click(site, monkeypatch, fail_before_intent):
+    monkeypatch.setitem(PAGES, "/nested_scroll_submit", """<h1>Application</h1>
+        <form method="post" action="/thanks">
+          <label for="fn">First name</label><input id="fn" name="first_name" required>
+          <label for="em">Email</label><input id="em" type="email" name="email" required>
+          <div id="scrollbox" style="height:120px;overflow:auto">
+            <div style="height:500px"></div><button type="submit">Submit application</button>
+          </div>
+        </form>""")
+    scroll = Locator.scroll_into_view_if_needed
+    scroll_intents = []
+    nested_offsets = []
+
+    def fail_after_submit_intent(locator, **kwargs):
+        with db.connect() as conn:
+            intent_count = conn.execute("SELECT COUNT(*) FROM submit_intents").fetchone()[0]
+        scroll_intents.append(intent_count)
+        if fail_before_intent or intent_count:
+            raise RuntimeError("synthetic scroll failure")
+        result = scroll(locator, **kwargs)
+        nested_offsets.append(locator.evaluate("el => el.closest('#scrollbox').scrollTop"))
+        return result
+
+    monkeypatch.setattr(Locator, "scroll_into_view_if_needed", fail_after_submit_intent)
+    real_click = generic._click
+    clicks = []
+
+    def track_click(*args, **kwargs):
+        clicks.append(kwargs)
+        return real_click(*args, **kwargs)
+
+    monkeypatch.setattr(generic, "_click", track_click)
+    result, _ = run(site, monkeypatch, [act("fill_form"), click("Submit application", action="submit")],
+                    path="/nested_scroll_submit")
+
+    assert scroll_intents == [0]
+    if fail_before_intent:
+        assert result.status == ApplyStatus.NEEDS_REVIEW
+        assert "could not be brought into view" in result.reason
+        assert clicks == []
+        assert not posted_thanks(site)
+        with db.connect() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM submit_intents").fetchone()[0] == 0
+    else:
+        assert nested_offsets[0] > 0
+        assert result.status == ApplyStatus.SUBMITTED, result.reason
+        assert clicks == [{"allow_dom_fallback": False, "scroll_into_view": False}]
+        assert posted_thanks(site)
+        with db.connect() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM submit_intents").fetchone()[0] == 1
 
 
 def test_review_page_continue_is_navigation_until_confirmation(site, monkeypatch):
