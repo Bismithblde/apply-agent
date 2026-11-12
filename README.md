@@ -129,6 +129,7 @@ was sent; use `not_submitted` only after confirming it was not.
 - Caps: `max_submissions_per_run`, `max_submissions_per_night` (resets at 6 PM), `seconds_between_applications`.
 - `captcha.max_spend_per_night_usd`, `email.plus_alias` (uses `you+company@gmail.com` per site), `auto_ats`.
 - `accounts.create_in_dry_run`: dry runs stop at "account required" instead of registering on the site (default false).
+- `computer_use.enabled`: after verified DOM/ATS filling fails, try screenshot-based actions for supported text and dropdown fields. Applicant answers and submit checks remain shared.
 - Personal knowledge: add private `.md` or `.txt` files to `data/knowledge/`. For questions without a direct
   profile match, the agent retrieves relevant passages from your profile, resume, answer bank, and these files.
   Keep credentials and secrets out of this folder; unsupported factual answers are intended to be queued.
@@ -144,9 +145,12 @@ answer. Unsupported factual answers are intended to be queued for review, so rev
 ## How it works
 
 `fetch` loads sources into `data/apply.db`. The runner then routes each job by ATS: Greenhouse, Lever, Ashby,
-and Workday have dedicated adapters, and everything else goes to a Gemini vision agent. Each adapter extracts
-the form fields and answers them, first from your profile and then with Gemini. It solves a CAPTCHA if one is
-present, submits according to `submit_mode`, and records the result and a screenshot.
+and Workday have dedicated adapters, and everything else goes to a Gemini vision agent. Each adapter resolves
+answers from your profile and answer bank before asking Gemini. ATS/DOM handlers fill supported text and dropdown
+fields first. With `computer_use.enabled`, a failed fill can escalate to a fresh screenshot and a constrained
+computer-use action; the action can only enter an approved answer or choose an option in that field, and the
+resulting control is re-read. Generic also uses screenshot-grounded decisions for page navigation. The
+agent solves a CAPTCHA if one is present, submits according to `submit_mode`, and records the result and a screenshot.
 
 Network note: on eduroam, Google APIs only work over HTTP/2 from some front-end IPs. `agent/config.py`
 handles this automatically (`GOOGLEAPIS_PIN=0` disables it).

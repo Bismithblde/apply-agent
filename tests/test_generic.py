@@ -61,6 +61,15 @@ PAGES = {
           document.getElementById('resume-name').textContent = e.target.files[0].name;
         });
         </script>""",
+    "/async_resume": """<h1>Application</h1><section><h3>Resume</h3>
+        <label for="resume-file">Upload resume</label>
+        <input id="resume-file" type="file" style="display:none"><p id="status"></p><p id="resume-name"></p></section>
+        <script>document.getElementById('resume-file').addEventListener('change', e => {
+          const filename = e.target.files[0].name, status = document.getElementById('status');
+          status.setAttribute('aria-busy', 'true');
+          setTimeout(() => { status.removeAttribute('aria-busy');
+            document.getElementById('resume-name').textContent = filename; }, 5500);
+        });</script>""",
     "/clearcompany_sms": """<h1>Contact information</h1><form method="post" action="/thanks">
         <label for="email">Email</label><input id="email" type="email">
         <fieldset><legend>May we use this number to send you text messages from ETC that pertain to your job application?</legend>
@@ -1302,6 +1311,18 @@ def test_resume_menu_upload_is_scoped(site, monkeypatch, tmp_path, host):
     assert site.page.locator("#cover-file").evaluate("el => el.files.length") == 0
     assert site.page.locator("#extra-file").evaluate("el => el.files.length") == 0
     assert len(fake.prompts) == 2
+
+
+def test_resume_upload_waits_for_async_completion(site, monkeypatch, tmp_path):
+    resume = tmp_path / "candidate_resume.pdf"
+    resume.write_bytes(b"%PDF-1.4\n")
+    result, _ = run(site, monkeypatch,
+                    [click("Upload resume"), act("give_up", "test reached after resume")],
+                    path="/async_resume", profile_override={"resume_path": str(resume)}, dry_run=True)
+
+    assert result.status == ApplyStatus.NEEDS_REVIEW
+    assert "test reached after resume" in result.reason
+    assert site.page.locator("#resume-name").inner_text() == resume.name
 
 
 def test_hidden_resume_file_input_is_labeled_from_its_section(site, monkeypatch, tmp_path):

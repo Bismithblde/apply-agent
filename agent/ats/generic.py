@@ -667,7 +667,10 @@ class GenericAdapter:
                                 try:
                                     from .. import vision_agent
                                     el = scope.locator(f'[data-aa-key="{f.key}"]')
-                                    if vision_agent.vision_choose_option(run.page, el, f.label, str(a.value)):
+                                    if vision_agent.vision_choose_option(
+                                            run.page, el, f.label, str(a.value),
+                                            context=f"{f.context}\nJob: {run.job.title} at {run.job.company}\n"
+                                                    f"Available choices: {', '.join(f.options)}"):
                                         scope_failed.discard(f.key)
                                     else:
                                         scope_failed.add(f.key)
@@ -1124,7 +1127,9 @@ def _verified_choice(scope: Page | Frame, f: Field, answer: Answer) -> bool:
             selected = [text for text, checked in got.get("states", []) if checked]
             wanted = answer.value if isinstance(answer.value, list) else [str(answer.value)]
             return len(selected) == len(wanted) and all(
-                form.option_matches(value, shown) for value, shown in zip(sorted(wanted), sorted(selected)))
+                form.option_matches(value, shown) or
+                (form._is_state_field(f) and form.state_option_matches(value, shown))
+                for value, shown in zip(sorted(wanted), sorted(selected)))
         verify = getattr(form, "_verify", None)
         if verify and verify(scope, f, str(answer.value)):
             return True
@@ -1348,7 +1353,8 @@ def _review_summary_matches(field: Field, answer: Answer, shown: str) -> bool:
     if isinstance(answer.value, list):
         values = [value.strip() for value in re.split(r"[,;]", shown) if value.strip()]
         return len(values) == len(answer.value) and all(
-            form.option_matches(wanted, actual)
+            form.option_matches(wanted, actual) or
+            (form._is_state_field(field) and form.state_option_matches(wanted, actual))
             for wanted, actual in zip(sorted(answer.value), sorted(values)))
     expected = str(answer.value)
     if field.kind == "file":
@@ -1358,7 +1364,8 @@ def _review_summary_matches(field: Field, answer: Answer, shown: str) -> bool:
         left, right = re.sub(r"\D", "", expected), re.sub(r"\D", "", shown)
         return bool(left and right and (left.endswith(right) or right.endswith(left)))
     matcher = getattr(form, "option_matches", None)
-    return ((callable(matcher) and matcher(expected, shown))
+    return ((callable(matcher) and (matcher(expected, shown) or
+                                    (form._is_state_field(field) and form.state_option_matches(expected, shown))))
             or " ".join(expected.casefold().split()) == " ".join(shown.casefold().split()))
 
 
@@ -1674,12 +1681,27 @@ def _upload_resume(run: Run, target: Clickable) -> tuple[bool, str]:
         except Exception as e:
             return False, f"resume upload blocked: Resume file input failed ({type(e).__name__})"
 
-    for _ in range(8):
+    for _ in range(30):
         try:
             attached = scope.evaluate("""filename =>
               [...document.querySelectorAll('input[type=file]')].some(el =>
                 [...(el.files || [])].some(f => f.name === filename))
             """, path.name)
+            pending = scope.evaluate("""filename => {
+              const inputs = [...document.querySelectorAll('input[type=file]')]
+                .filter(el => [...(el.files || [])].some(f => f.name === filename));
+              return inputs.some(el => {
+                for (let node = el, depth = 0; node && depth < 4; node = node.parentElement, depth++) {
+                  if (node.getAttribute('aria-busy') === 'true' ||
+                      node.matches('[role="progressbar"], [data-uploading="true"]') ||
+                      node.querySelector('[aria-busy="true"], [role="progressbar"], [data-uploading="true"]'))
+                    return true;
+                  if (/\\b(?:uploading|processing|scanning)\\b/i.test(node.innerText || '')) return true;
+                }
+                return false;
+              });
+            }""", path.name)
+            attached = attached and not pending
             if not attached:
                 names = scope.get_by_text(path.name, exact=True)
                 attached = any(names.nth(i).is_visible()

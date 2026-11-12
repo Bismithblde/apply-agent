@@ -22,7 +22,7 @@ def _answer_map(fields, profile, **kwargs):
     return {answer.key: answer for answer in answers.answer_fields(fields, JOB, profile, **kwargs)}
 
 
-def test_empty_profile_leaves_personal_facts_unknown(isolated_evidence, monkeypatch):
+def test_empty_profile_leaves_personal_facts_unknown_and_uses_authorized_referral(isolated_evidence, monkeypatch):
     def unexpected_llm(*args, **kwargs):
         raise AssertionError("an empty evidence set must not trigger generation")
 
@@ -42,7 +42,266 @@ def test_empty_profile_leaves_personal_facts_unknown(isolated_evidence, monkeypa
 
     got = _answer_map(fields, {})
 
-    assert all(got[field.key].source == "unknown" and got[field.key].value is None for field in fields)
+    assert all(got[field.key].source == "unknown" and got[field.key].value is None
+               for field in fields if field.key != "heard")
+    assert (got["heard"].value, got["heard"].source) == ("Other", "generated")
+    assert got["heard"].note == "user-authorized referral choice"
+
+
+def test_unknown_project_answer_reuses_grounded_answer_bank(isolated_evidence, monkeypatch):
+    field = Field("project", "Describe the most impressive and complex project you have worked on.",
+                  "textarea", True)
+    value = "Built a synthetic inventory service with Python and SQLite."
+    monkeypatch.setattr(answers.llm, "generate_json", lambda *a, **k: {
+        "answers": [{"key": field.key, "value": "", "source": "unknown", "evidence_ids": []}]
+    })
+
+    answer = answers.answer_fields([field], JOB, {"answer_bank": {"proudest_project": value}})[0]
+
+    assert (answer.value, answer.source) == (value, "bank")
+
+
+def test_unknown_project_answer_stays_unknown_without_grounded_project_evidence(isolated_evidence, monkeypatch):
+    field = Field("project", "Describe the most impressive and complex project you have worked on.",
+                  "textarea", True)
+    monkeypatch.setattr(answers.llm, "generate_json", lambda *a, **k: {
+        "answers": [{"key": field.key, "value": "", "source": "unknown", "evidence_ids": []}]
+    })
+
+    answer = answers.answer_fields([field], JOB, {})[0]
+
+    assert answer.value is None and answer.source == "unknown"
+
+
+@pytest.mark.parametrize("question", [
+    "Why do you want to work for Example?",
+    "Why are you interested in this company?",
+])
+def test_unknown_why_company_answer_uses_only_existing_answer_bank(isolated_evidence, monkeypatch, question):
+    field = Field("why", question, "textarea", True)
+    value = "I want to learn from a team building reliable software."
+    monkeypatch.setattr(answers.llm, "generate_json", lambda *a, **k: {
+        "answers": [{"key": field.key, "value": "", "source": "unknown", "evidence_ids": []}]
+    })
+
+    answer = answers.answer_fields([field], JOB, {"answer_bank": {"why_company": value}})[0]
+    missing = answers.answer_fields([field], JOB, {})[0]
+
+    assert (answer.value, answer.source) == (value, "bank")
+    assert missing.value is None and missing.source == "unknown"
+
+
+def test_position_type_uses_job_title_or_category_and_offered_choices(isolated_evidence, monkeypatch):
+    monkeypatch.setattr(answers.llm, "generate_json", lambda *a, **k: pytest.fail("job metadata is sufficient"))
+    field = Field("position_type", "What type of position are you applying for?", "combobox", True,
+                  ["Internship", "Co-op", "Full-time"])
+    category_field = Field("category_type", "What type of position are you applying for?", "select", True,
+                           ["Internship", "Full-time"])
+    category_job = Job(id="test:category", company="Example", title="Software Engineering",
+                       url="https://example.test/job", locations=[], category="Internship", date_posted=0)
+
+    title_answer = answers.answer_fields([field], JOB, {})[0]
+    category_answer = answers.answer_fields([category_field], category_job, {})[0]
+
+    assert (title_answer.value, title_answer.source) == ("Internship", "profile")
+    assert (category_answer.value, category_answer.source) == ("Internship", "profile")
+
+
+def test_position_type_stays_unknown_when_job_metadata_is_not_offered(isolated_evidence, monkeypatch):
+    field = Field("position_type", "What type of position are you applying for?", "select", True,
+                  ["Full-time", "Temporary"])
+    monkeypatch.setattr(answers.llm, "generate_json", lambda *a, **k: {
+        "answers": [{"key": field.key, "value": "", "source": "unknown", "evidence_ids": []}]
+    })
+
+    answer = answers.answer_fields([field], JOB, {})[0]
+
+    assert answer.value is None and answer.source == "unknown"
+
+
+@pytest.mark.parametrize(("end", "expected"), [("August 2027", "May 2027"), ("June 2027", None), (None, None)])
+def test_able_to_join_uses_profile_window_and_validates_minimum_duration(isolated_evidence, monkeypatch, end, expected):
+    field = Field("join_date", "When are you able to join for an internship? (12-week minimum)", "text", True)
+    monkeypatch.setattr(answers.llm, "generate_json", lambda *a, **k: pytest.fail("availability window decides this"))
+    preferences = {"available_start": "May 2027"}
+    if end:
+        preferences["available_end"] = end
+
+    answer = answers.answer_fields([field], JOB, {"preferences": preferences})[0]
+
+    if expected:
+        assert (answer.value, answer.source) == (expected, "profile")
+    else:
+        assert answer.value is None and answer.source == "unknown"
+
+
+def test_export_control_us_person_answer_uses_llm_and_cited_citizenship(isolated_evidence, monkeypatch):
+    field = Field(
+        "work_authorization", "Work Authorization", "select", True, ["Yes", "No"],
+        context=("This position requires ITAR and EAR compliance. A U.S. person according to the ITAR "
+                 "definition is a U.S. citizen, lawful permanent resident, or protected individual."),
+    )
+    seen = {}
+
+    def answer_from_evidence(prompt, schema, **kwargs):
+        payload = json.loads(prompt.split("\n", 1)[1])
+        item = payload["fields"][0]
+        seen["context"] = item["context"]
+        seen["evidence"] = item["evidence"]
+        citizenship = next(e for e in item["evidence"] if "us_citizen: Yes" in e["text"])
+        return {"answers": [{"key": item["key"], "value": "Yes", "source": "bank",
+                             "evidence_ids": [citizenship["id"]]}]}
+
+    monkeypatch.setattr(answers.llm, "generate_json", answer_from_evidence)
+    answer = answers.answer_fields(
+        [field], JOB, {"work_authorization": {"us_citizen": "Yes"}}
+    )[0]
+
+    assert answer.value == "Yes" and answer.source == "bank"
+    assert "ITAR" in seen["context"] and any("us_citizen: Yes" in e["text"] for e in seen["evidence"])
+
+
+def test_export_control_definition_does_not_replace_missing_citizenship_evidence(isolated_evidence, monkeypatch):
+    field = Field(
+        "work_authorization", "Work Authorization", "select", True, ["Yes", "No"],
+        context=("A U.S. person according to the ITAR definition is a U.S. citizen, lawful permanent "
+                 "resident, or protected individual."),
+    )
+    definition = answers._Evidence(
+        "E1", "knowledge", "export-control", "ITAR defines a U.S. person to include a U.S. citizen."
+    )
+    monkeypatch.setattr(answers, "_evidence_corpus", lambda profile: [definition])
+    monkeypatch.setattr(answers.llm, "generate_json", lambda *a, **k: {
+        "answers": [{"key": field.key, "value": "Yes", "source": "bank", "evidence_ids": ["E1"]}]
+    })
+
+    answer = answers.answer_fields(
+        [field], JOB, {"work_authorization": {"us_citizen": "Unknown"}}
+    )[0]
+
+    assert answer.value is None and answer.source == "unknown"
+
+
+def test_us_citizenship_answers_explicit_us_work_authorization_without_llm(monkeypatch):
+    field = Field("authorization", "Are you legally authorized to work in the United States?",
+                  "select", True, ["Yes", "No"])
+    monkeypatch.setattr(answers.llm, "generate_json", lambda *a, **k: pytest.fail("profile fact is sufficient"))
+
+    answer = answers.answer_fields(
+        [field], JOB, {"work_authorization": {"us_citizen": "Yes"}}
+    )[0]
+
+    assert answer.value == "Yes" and answer.source == "profile"
+
+
+def test_us_citizenship_does_not_imply_authorization_outside_us(isolated_evidence, monkeypatch):
+    field = Field("authorization", "Are you authorized to work in Canada?", "select", True, ["Yes", "No"])
+    monkeypatch.setattr(answers.llm, "generate_json", lambda *a, **k: (_ for _ in ()).throw(
+        answers.llm.LLMUnavailable("offline")))
+
+    answer = answers.answer_fields(
+        [field], JOB, {"work_authorization": {"us_citizen": "Yes"}}
+    )[0]
+
+    assert answer.value is None and answer.source == "unknown"
+
+
+def test_citizenship_only_resolves_us_scoped_sponsorship(isolated_evidence, monkeypatch):
+    fields = [
+        Field("us", "Will you need sponsorship to work in the United States?", "radio", True, ["Yes", "No"]),
+        Field("unspecified", "Will you need sponsorship?", "radio", True, ["Yes", "No"]),
+    ]
+    monkeypatch.setattr(answers.llm, "generate_json", lambda *a, **k: (_ for _ in ()).throw(
+        answers.llm.LLMUnavailable("offline")))
+
+    got = _answer_map(fields, {"work_authorization": {"us_citizen": "Yes"}})
+
+    assert got["us"].value == "No" and got["us"].source == "profile"
+    assert got["unspecified"].value is None and got["unspecified"].source == "unknown"
+
+
+def test_explicit_us_person_definition_fills_authorization_when_llm_unavailable(isolated_evidence, monkeypatch):
+    field = Field(
+        "work_authorization", "Work Authorization", "select", True, ["Yes", "No"],
+        context=("A U.S. person according to the ITAR definition is a U.S. citizen, lawful permanent "
+                 "resident, or protected individual."),
+    )
+    monkeypatch.setattr(answers.llm, "generate_json", lambda *a, **k: (_ for _ in ()).throw(
+        answers.llm.LLMUnavailable("HTTP 402")))
+
+    answer = answers.answer_fields(
+        [field], JOB, {"work_authorization": {"us_citizen": "Yes"}}
+    )[0]
+
+    assert answer.value == "Yes" and answer.source == "profile"
+
+
+def test_us_person_fallback_requires_explicit_definition_and_unique_affirmative_option(isolated_evidence, monkeypatch):
+    monkeypatch.setattr(answers.llm, "generate_json", lambda *a, **k: (_ for _ in ()).throw(
+        answers.llm.LLMUnavailable("offline")))
+    profile = {"work_authorization": {"us_citizen": "Yes"}}
+    vague = Field("auth", "Work Authorization", "select", True, ["Yes", "No"],
+                  context="This role involves export-controlled technology.")
+    ambiguous = Field("auth", "Work Authorization", "select", True, ["Yes", "U.S. Person", "No"],
+                      context="A U.S. person includes a U.S. citizen.")
+
+    assert answers.answer_fields([vague], JOB, profile)[0].source == "unknown"
+    assert answers.answer_fields([ambiguous], JOB, profile)[0].source == "unknown"
+
+
+@pytest.mark.parametrize(("decision", "verification_ids", "expected"), [
+    ("supported", ["E1"], True),
+    ("supported", ["FOREIGN"], False),
+    ("supported", ["E1", None], False),
+    ("uncertain", ["E1"], False),
+    ("unavailable", ["E1"], False),
+])
+def test_context_defined_option_requires_cited_llm_support(isolated_evidence, monkeypatch,
+                                                            decision, verification_ids, expected):
+    field = Field(
+        "work_authorization", "Work Authorization", "select", True,
+        ["U.S. Person", "Non-U.S. Person"],
+        context=("A U.S. person under the ITAR definition is a U.S. citizen, lawful permanent resident, "
+                 "or protected individual."),
+    )
+    evidence = answers._Evidence(
+        "E1", "profile", "work_authorization.us_citizen", "work_authorization.us_citizen: Yes"
+    )
+    monkeypatch.setattr(answers, "_evidence_corpus", lambda profile: [evidence])
+    verification_prompts = []
+
+    def verify(prompt, schema, **kwargs):
+        payload = json.loads(prompt)
+        verification_prompts.append(payload)
+        if decision == "unavailable":
+            raise answers.llm.LLMUnavailable("test outage")
+        return {"decision": decision, "evidence_ids": verification_ids}
+
+    monkeypatch.setattr(answers.llm, "generate_json", verify)
+    supported = answers._contextually_supported("U.S. Person", field, [evidence])
+
+    assert supported is expected
+    assert len(verification_prompts) == 1
+    assert verification_prompts[0]["field"]["context"] == field.context
+    assert verification_prompts[0]["field"]["options"] == field.options
+
+
+def test_factual_dropdown_requires_exact_option_from_llm(isolated_evidence, monkeypatch):
+    field = Field("work_authorization", "Work Authorization", "select", True,
+                  ["U.S. Person", "Non-U.S. Person"],
+                  context="A U.S. person under ITAR includes a U.S. citizen.")
+    evidence = answers._Evidence(
+        "E1", "profile", "work_authorization.us_citizen", "work_authorization.us_citizen: Yes"
+    )
+    monkeypatch.setattr(answers.llm, "generate_json", lambda *a, **k: pytest.fail("must not coerce a paraphrase"))
+
+    answer = answers._validate(
+        field,
+        {"value": "I am a U.S. citizen", "source": "bank", "evidence_ids": ["E1"]},
+        [evidence],
+    )
+
+    assert answer.value is None and answer.source == "unknown"
 
 
 def test_attestation_confirmation_keeps_personal_claims_evidence_gated(isolated_evidence):
@@ -286,6 +545,45 @@ def test_mach_discrete_gpa_and_source_are_grounded(isolated_evidence, monkeypatc
     assert (got["details"].value, got["details"].source) == ("Simplify", "profile")
     assert got["unrelated"].source == "profile" and got["unrelated"].value == "Other"
     assert _answer_map([fields[0]], {"education": {"gpa": "3.75"}})["gpa"].value == "3.8 out of 4.0"
+
+
+def test_gpa_maps_to_unambiguous_numeric_band(isolated_evidence, monkeypatch):
+    monkeypatch.setattr(answers.llm, "generate_json", lambda *a, **k: pytest.fail("profile GPA should map directly"))
+    field = Field("gpa", "What is your current GPA?", "select", True,
+                  ["Select One", "3.50 - 4.00", "3.00 - 3.49", "Below 3.00"])
+
+    answer = answers.answer_fields([field], JOB, {"education": {"gpa": "3.74"}})[0]
+
+    assert answer.value == "3.50 - 4.00" and answer.source == "profile"
+
+
+def test_gpa_does_not_choose_between_overlapping_bands(isolated_evidence, monkeypatch):
+    field = Field("gpa", "What is your current GPA?", "select", True,
+                  ["3.00 - 3.75", "3.74 - 4.00"])
+
+    answer = answers.answer_fields([field], JOB, {"education": {"gpa": "3.74"}})[0]
+
+    assert answer.value is None and answer.source == "unknown"
+
+
+def test_explicit_full_time_preference_and_dates_answer_duration_question(isolated_evidence, monkeypatch):
+    field = Field("availability", "Are you available to work full-time (40 hours/week) for 8-12 weeks this summer?",
+                  "select", True, ["Yes", "No"])
+
+    answer = answers.answer_fields([field], JOB, {"preferences": {
+        "full_time": "Yes", "available_start": "May 2027", "available_end": "August 2027",
+    }})[0]
+
+    assert answer.value == "Yes" and answer.source == "profile"
+
+
+def test_schedule_answer_abstains_without_duration_evidence(isolated_evidence, monkeypatch):
+    field = Field("availability", "Are you available to work full-time for 8-12 weeks this summer?",
+                  "select", True, ["Yes", "No"])
+
+    answer = answers.answer_fields([field], JOB, {"preferences": {"full_time": "Yes"}})[0]
+
+    assert answer.value is None and answer.source == "unknown"
 
 
 def test_nisc_source_is_grounded_but_membership_and_office_choices_need_confirmation(isolated_evidence, monkeypatch):
@@ -739,10 +1037,53 @@ def test_conflicting_education_date_components_stay_unknown(isolated_evidence, m
 
 
 @pytest.mark.parametrize("option", ["Billboard", "Career Fair", "School Career Website"])
-def test_required_referral_does_not_select_an_unrelated_source(isolated_evidence, option):
+def test_required_referral_uses_user_authorized_offered_choice(isolated_evidence, monkeypatch, option):
+    monkeypatch.setattr(answers.llm, "pick_option", lambda options, value, label, **kwargs: 0)
     field = Field("source", "How did you hear about us?", "combobox", True, [option])
     got = _answer_map([field], {"preferences": {"how_did_you_hear": "Simplify"}})["source"]
-    assert got.value is None and got.source == "unknown"
+    assert (got.value, got.source) == (option, "generated")
+    assert got.note == "user-authorized referral choice"
+
+
+def test_dynamic_option_matching_receives_field_context(monkeypatch):
+    seen = []
+
+    def choose(options, value, label, *, context=""):
+        seen.append((options, value, label, context))
+        return 1
+
+    monkeypatch.setattr(answers.llm, "pick_option", choose)
+    field = Field("workstyle", "Preferred working arrangement", "select", True,
+                  ["On-site", "Hybrid", "Remote"], context="The team works across office and home days.")
+
+    assert answers._coerce(field, "Split time between office and home") == "Hybrid"
+    assert seen == [(["On-site", "Hybrid", "Remote"], "Split time between office and home",
+                     "Preferred working arrangement", field.context)]
+
+
+def test_option_choice_cache_includes_field_context(monkeypatch):
+    monkeypatch.setattr(answers.llm, "_OPTION_PICK_CACHE", {})
+    prompts = []
+
+    def choose(prompt, schema, **kwargs):
+        prompts.append(prompt)
+        return {"index": 0 if "remote-first" in prompt else 1}
+
+    monkeypatch.setattr(answers.llm, "generate_json", choose)
+    options = ["Remote", "On-site"]
+
+    first = answers.llm.pick_option(options, "Flexible", "Work arrangement", context="remote-first role")
+    second = answers.llm.pick_option(options, "Flexible", "Work arrangement", context="office-first role")
+
+    assert (first, second) == (0, 1)
+    assert len(prompts) == 2
+
+
+def test_field_payload_keeps_all_observed_choices():
+    field = Field("location", "Preferred location", "select", True,
+                  [f"Location {index}" for index in range(75)])
+
+    assert answers._field_payload(field)["options"] == field.options
 
 
 @pytest.mark.parametrize(("question", "options"), [

@@ -247,6 +247,8 @@ def test_review_does_not_open_browser_when_apply_lock_is_busy(review_env, monkey
 
 
 def test_review_prefills_local_greenhouse_form_without_submitting(tmp_path, monkeypatch, capsys):
+    from playwright.sync_api import Locator
+
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "data" / "apply.db")
     db.DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     db.init()
@@ -271,6 +273,16 @@ def test_review_prefills_local_greenhouse_form_without_submitting(tmp_path, monk
     monkeypatch.setattr(cli, "load_profile", lambda: profile)
     monkeypatch.setattr(ApplyContext, "screenshot", lambda self, job, tag: None)
     monkeypatch.setattr("agent.ats.greenhouse.human_pause", lambda *args: None)
+    original_scroll = Locator.scroll_into_view_if_needed
+    scroll = {"failed": False}
+
+    def fail_initial_form_scroll(locator, *args, **kwargs):
+        if not scroll["failed"]:
+            scroll["failed"] = True
+            raise TimeoutError("synthetic form scroll timeout")
+        return original_scroll(locator, *args, **kwargs)
+
+    monkeypatch.setattr(Locator, "scroll_into_view_if_needed", fail_initial_form_scroll)
 
     values = {
         "First Name": "Ada",
@@ -351,6 +363,7 @@ def test_review_prefills_local_greenhouse_form_without_submitting(tmp_path, monk
     assert "adapter: greenhouse" in output
     assert "result: needs_review: fill_only mode" in output
     assert "filled fields: 13" in output
+    assert scroll["failed"]
     assert observed["pages_at_prompt"] == 1
     assert "inspection_error" not in observed
     assert observed["url"] == job.url

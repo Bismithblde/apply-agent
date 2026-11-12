@@ -6,7 +6,7 @@ import re
 import time
 
 from ..browser import human_pause
-from ..form import fill_form, finish_application, page_text
+from ..form import _location_option_matches, fill_form, finish_application, page_text
 from ..models import ApplyResult, ApplyStatus, Job
 from .base import ApplyContext
 
@@ -28,6 +28,14 @@ def _pick_location(page, fields, answers) -> None:
     try:
         if page.locator("#selected-location").count() and page.locator("#selected-location").input_value():
             return
+        field = next((f for f in fields if re.search(
+            r"\b(?:location|city)\b", f"{f.label or ''} {f.name or ''}", re.I)), None)
+        answer = next((a for a in answers if field and a.key == field.key), None)
+        expected = answer.value if answer else None
+        if isinstance(expected, list):
+            expected = expected[0] if expected else None
+        if not isinstance(expected, str) or not expected.strip():
+            return
         text = loc.input_value()
         if not text:
             return
@@ -35,10 +43,13 @@ def _pick_location(page, fields, answers) -> None:
         loc.press("End")
         loc.press("Backspace")
         loc.press_sequentially(text[-1], delay=60)
-        opt = page.locator(".dropdown-results > div, .dropdown-location").first
-        opt.wait_for(state="visible", timeout=6000)
-        opt.click(timeout=3000)
-        time.sleep(0.3)
+        options = page.locator(".dropdown-results > div:visible, .dropdown-location:visible")
+        options.first.wait_for(state="visible", timeout=6000)
+        matches = [options.nth(i) for i in range(options.count())
+                   if _location_option_matches(expected, options.nth(i).inner_text().strip())]
+        if len(matches) == 1:
+            matches[0].click(timeout=3000)
+            time.sleep(0.3)
     except Exception as e:
         log.info("lever location pick failed: %s", str(e).splitlines()[0][:120])
 

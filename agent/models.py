@@ -79,6 +79,7 @@ class Field:
     name: str = ""
     placeholder: str = ""
     current_value: str = ""
+    context: str = ""
 
 
 @dataclass

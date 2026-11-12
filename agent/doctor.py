@@ -38,9 +38,10 @@ def run() -> list[tuple[str, str, str, str]]:
     try:
         from . import llm
         reply = llm.generate_text("Reply with just: ok")
-        out.append(_check("Gemini", OK, f"replied {reply.strip()[:20]!r}"))
+        out.append(_check("LLM", OK, f"replied {reply.strip()[:20]!r}"))
     except Exception as e:
-        out.append(_check("Gemini", FAIL, str(e)[:160], "check GEMINI_API_KEY in .env (or set OPENROUTER_API_KEY)"))
+        out.append(_check("LLM", FAIL, str(e)[:160],
+                          "restore Gemini quota or configure OPENROUTER_API_KEY/OPENAI_API_KEY as fallback"))
 
     key = os.environ.get("CAPSOLVER_API_KEY", "")
     if not key:

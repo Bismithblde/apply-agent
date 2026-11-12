@@ -110,6 +110,21 @@ _EXTRACT_JS = r"""
     return out;
   };
 
+  const fieldContext = el => {
+    const parts = [];
+    const add = node => {
+      if (!node || node.closest('[role=alert], [class*="error" i], [data-automation-id*="error" i]')) return;
+      const text = textOf(node);
+      if (text && !parts.includes(text)) parts.push(text);
+    };
+    for (const id of (el.getAttribute('aria-describedby') || '').split(/\s+/)) add(document.getElementById(id));
+    const box = el.closest('[data-automation-id^="formField-"]');
+    if (box) box.querySelectorAll('[data-automation-id*="instruction" i], [data-automation-id*="help" i], '
+      + '[data-automation-id*="description" i], [role="note"], [class*="instruction" i], '
+      + '[class*="helpText" i], [class*="help-text" i], [class*="description" i]').forEach(add);
+    return clean(parts.join(' ')).slice(0, 3000);
+  };
+
   // Returns [text, labelElement|null].
   const rawLabel = (el, isGroup) => {
     // If it's a group, check if el itself contains a formLabel, legend, or question heading
@@ -186,7 +201,7 @@ _EXTRACT_JS = r"""
     out.push(Object.assign({
       key: stamp(el), label, kind, required: isRequired(el, raw, lblEl),
       options: opts || [], name: el.getAttribute('name') || el.id || '',
-      placeholder: clean(el.getAttribute('placeholder')), current_value: '',
+      placeholder: clean(el.getAttribute('placeholder')), current_value: '', context: fieldContext(el),
     }, extra || {}));
   };
 
@@ -278,6 +293,7 @@ _EXTRACT_JS = r"""
       continue;
     }
     const isCombo = el.getAttribute('role') === 'combobox'
+      || el.getAttribute('data-uxi-widget-type') === 'selectinput'
       || /^(?:list|both|inline)$/i.test(el.getAttribute('aria-autocomplete') || '');
     if (!visible(el, isCombo ? 1 : 4)) continue;
     if (isCombo) {
@@ -442,6 +458,48 @@ def _norm(s: str) -> str:
     return " ".join(re.sub(r"[^a-z0-9+]+", " ", str(s).lower()).split())
 
 
+_STATE_CODES = "AL AK AZ AR CA CO CT DE FL GA HI ID IL IN IA KS KY LA ME MD MA MI MN MS MO MT NE NV NH NJ NM NY NC ND OH OK OR PA RI SC SD TN TX UT VT VA WA WV WI WY DC".split()
+_STATE_NAMES = "Alabama|Alaska|Arizona|Arkansas|California|Colorado|Connecticut|Delaware|Florida|Georgia|Hawaii|Idaho|Illinois|Indiana|Iowa|Kansas|Kentucky|Louisiana|Maine|Maryland|Massachusetts|Michigan|Minnesota|Mississippi|Missouri|Montana|Nebraska|Nevada|New Hampshire|New Jersey|New Mexico|New York|North Carolina|North Dakota|Ohio|Oklahoma|Oregon|Pennsylvania|Rhode Island|South Carolina|South Dakota|Tennessee|Texas|Utah|Vermont|Virginia|Washington|West Virginia|Wisconsin|Wyoming|District of Columbia".split("|")
+_STATE_ALIASES = {alias.casefold(): name.casefold() for name, code in zip(_STATE_NAMES, _STATE_CODES)
+                  for alias in (name, code)}
+
+
+def _state_identity(value: str) -> str | None:
+    text = _norm(re.sub(r"\([^)]*\)", "", str(value)))
+    text = re.sub(r"^(?:state of)\s+|\s+state$", "", text)
+    return _STATE_ALIASES.get(text)
+
+
+def state_option_matches(value: str, option: str) -> bool:
+    return bool((state := _state_identity(value)) and state == _state_identity(option))
+
+
+def _is_state_field(field: Field) -> bool:
+    label = (field.label or field.name).split(" - ")[-1].strip()
+    return bool(re.fullmatch(r"(?:state|province|state\s*/\s*province)(?:\s+of\s+residence)?[*✱\s]*", label, re.I))
+
+
+def _location_option_matches(value: str, option: str) -> bool:
+    """Allow city/state display variants while requiring the same city and state."""
+    countries = {"us", "u s", "usa", "u s a", "united states", "united states of america"}
+
+    def identity(text: str) -> tuple[str, str] | None:
+        parts = [_norm(part) for part in str(text).split(",") if part.strip()]
+        if len(parts) < 2:
+            return None
+        state_idx = next((i for i, part in enumerate(parts[1:], 1) if _state_identity(part)), None)
+        if state_idx is None or any(part not in countries for part in parts[state_idx + 1:]):
+            return None
+        return parts[0], _state_identity(parts[state_idx])
+
+    wanted, shown = identity(value), identity(option)
+    return bool(wanted and shown and wanted == shown)
+
+
+def _is_location_field(field: Field) -> bool:
+    return bool(re.search(r"\b(?:location|city)\b", f"{field.label or ''} {field.name or ''}", re.I))
+
+
 def option_score(value: str, option: str) -> float:
     """0..1 similarity between a wanted value and an option label."""
     v, o = _norm(value), _norm(option)
@@ -532,7 +590,16 @@ def option_matches(value: Any, option: str) -> bool:
                 and offered.startswith(wanted + " "))
 
 
-def matching_option(value: Any, options: list[str]) -> str | None:
+def matching_option(value: Any, options: list[str], *, state: bool = False,
+                    location: bool = False) -> str | None:
+    if state:
+        matches = [option for option in options if state_option_matches(str(value), option)]
+        if matches:
+            return matches[0] if len({_norm(option) for option in matches}) == 1 else None
+    if location:
+        matches = [option for option in options if _location_option_matches(str(value), option)]
+        if matches:
+            return matches[0] if len({_norm(option) for option in matches}) == 1 else None
     matches = [option for option in options if option_matches(value, option)]
     exact = [option for option in matches if _norm(str(value)) == _norm(option)]
     if not exact and len({_norm(option) for option in matches}) > 1:
@@ -559,7 +626,8 @@ def extract_fields(scope, root: str | None = None, *, probe_options: bool = True
         return []
     fields = [Field(key=r["key"], label=r["label"][:2000], kind=r["kind"], required=bool(r["required"]),
                     options=[o for o in r["options"] if o][:3000], name=r["name"] or "",
-                    placeholder=r["placeholder"] or "", current_value=str(r["current_value"] or ""))
+                    placeholder=r["placeholder"] or "", current_value=str(r["current_value"] or ""),
+                    context=str(r.get("context") or "")[:3000])
               for r in raw]
     if probe_options:
         for f in [f for f in fields if f.kind == "combobox" and not f.options][:30]:
@@ -657,8 +725,12 @@ def _computer_use_fill(scope, page, f: Field, answer: Answer) -> bool:
 
     expected = str(answer.value)
     locator = scope.locator(f'[data-aa-key="{f.key}"]').first
+    context = f"Field kind: {f.kind}. Required: {f.required}. Target label: {f.label[:200]}. Field context: {f.context}"
     if f.kind in ("select", "combobox"):
-        ok = vision_agent.vision_choose_option(page, locator, f.label, expected)
+        ok = vision_agent.vision_choose_option(
+            page, locator, f.label, expected,
+            context=f"{context}\nAvailable choices: {', '.join(f.options)}",
+        )
     else:
         ok = vision_agent.locate_and_act(
             page,
@@ -666,7 +738,7 @@ def _computer_use_fill(scope, page, f: Field, answer: Answer) -> bool:
             target_value=expected,
             action_hint="type",
             locator=locator,
-            context=f"Field kind: {f.kind}. Required: {f.required}. Target label: {f.label[:200]}.",
+            context=context,
             allow_locator_fallback=False,
         )
     return bool(ok and _verify(scope, f, expected))
@@ -685,19 +757,19 @@ def fill_fields(scope, fields: list[Field], answers: list[Answer], *, page=None,
             continue
         if f.kind == "checkbox" and not f.options and a.value is False and f.current_value != "true":
             continue
+        computer_use = (page is not None and layer_context is not None
+                        and layer_context.config.get("computer_use", {}).get("enabled", False))
+        ok = False
         try:
             ok = _fill_one(scope, f, a.value)
         except Exception as e:
             log.info("fill %s (%s, %s) failed (%s)", f.key, f.label[:60], f.kind, type(e).__name__)
-            ok = False
-        if not ok and page is not None and layer_context is not None \
-                and layer_context.config.get("computer_use", {}).get("enabled", False):
+        if not ok and computer_use and f.kind in _COMPUTER_USE_TEXT_KINDS | {"select", "combobox"}:
             visual_attempts += 1
             try:
                 ok = _computer_use_fill(scope, page, f, a)
             except Exception as e:
-                log.info("computer-use field repair failed (%s)", type(e).__name__)
-                ok = False
+                log.info("computer-use field action failed (%s)", type(e).__name__)
             if ok:
                 visual_verified += 1
         if not ok:
@@ -735,7 +807,7 @@ def _fill_one(scope, f: Field, value: Any) -> bool:
         return _verify(scope, f, str(value))
     if f.kind == "select":
         opts = loc.evaluate("e => [...e.options].filter(o => !o.disabled && !o.parentElement.disabled).map(o => o.text.trim())")
-        target = matching_option(value, opts)
+        target = matching_option(value, opts, state=_is_state_field(f), location=_is_location_field(f))
         if not target:
             return False
         loc.select_option(label=target, timeout=5000)
@@ -858,7 +930,7 @@ def _fill_combo(scope, loc, f: Field, value: str) -> bool:
     _open_combo(loc, 4000)
     time.sleep(0.3)
     live = loc.evaluate(_COMBO_OPTIONS_JS)
-    target = matching_option(value, live)
+    target = matching_option(value, live, state=_is_state_field(f), location=_is_location_field(f))
     if not target:
         # Typing filters local options and triggers async searches (location, school).
         typed = (value.split(",")[0].strip() if "," in value else value)[:40]
@@ -875,7 +947,7 @@ def _fill_combo(scope, loc, f: Field, value: str) -> bool:
         while time.time() < deadline:
             time.sleep(0.5)
             live = loc.evaluate(_COMBO_OPTIONS_JS)
-            target = matching_option(value, live)
+            target = matching_option(value, live, state=_is_state_field(f), location=_is_location_field(f))
             if target:
                 break
     if not target:
@@ -933,7 +1005,7 @@ def _fill_choices(scope, loc, f: Field, wanted: list[str]) -> bool:
     labels = [s[0] for s in states] or f.options
     targets: set[str] = set()
     for w in wanted:
-        target = matching_option(w, labels)
+        target = matching_option(w, labels, state=_is_state_field(f))
         if target is None:
             return False
         targets.add(target)
@@ -972,18 +1044,26 @@ def _verify(scope, f: Field, expected: str) -> bool:
             return False
         shown = (got.get("single") if got.get("hasDisplay") else
                  got.get("value") or got.get("ownText")) or ""
-        if option_matches(expected, shown):
+        if _is_location_field(f) and _location_option_matches(expected, shown):
             return True
-        if any(option_matches(expected, part.strip()) for part in shown.split(",")):
+        if option_matches(expected, shown) or (_is_state_field(f) and state_option_matches(expected, shown)):
+            return True
+        if any(option_matches(expected, part.strip()) or
+               (_is_state_field(f) and state_option_matches(expected, part.strip()))
+               for part in shown.split(",")):
             return True
         metadata = got.get("metadata") or ""
-        if metadata and option_matches(expected, f"{metadata} {shown}"):
+        if metadata and (option_matches(expected, f"{metadata} {shown}") or
+                         (_is_state_field(f) and state_option_matches(expected, f"{metadata} {shown}"))):
             return True
         # A control explicitly asking for a calling code may display that code alone.
         return bool(re.search(r"\b(?:country code|calling code|dial(?:ing)? code)\b", f.label, re.I)
                     and re.fullmatch(r"\+\d+", shown.strip()) and shown.strip() in re.findall(r"\+\d+", expected))
     if f.kind == "select":
-        return option_matches(expected, got.get("value") or "")
+        value = got.get("value") or ""
+        if _is_location_field(f) and _location_option_matches(expected, value):
+            return True
+        return option_matches(expected, value) or (_is_state_field(f) and state_option_matches(expected, value))
     val = str(got.get("value") or "")
     if f.kind == "tel":
         d1, d2 = re.sub(r"\D", "", val), re.sub(r"\D", "", expected)
@@ -1000,7 +1080,9 @@ def verify_answer_value(scope, f: Field, answer: Answer) -> bool:
         selected = {text for text, checked in states if checked}
         wanted = answer.value if isinstance(answer.value, list) else [str(answer.value)]
         return len(selected) == len(wanted) and all(
-            any(option_matches(str(value), shown) for shown in selected) for value in wanted
+            any(option_matches(str(value), shown) or
+                (_is_state_field(f) and state_option_matches(str(value), shown)) for shown in selected)
+            for value in wanted
         )
     if f.kind == "checkbox":
         checked = bool(scope.evaluate(_READ_JS, [f.key, "checkbox"]).get("checked"))

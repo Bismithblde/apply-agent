@@ -1,4 +1,5 @@
 import base64
+import json
 import logging
 import time
 
@@ -6,7 +7,7 @@ import pytest
 from cryptography.fernet import Fernet
 
 from agent import db, llm, mail, vault
-from agent.ats import workday
+from agent.ats import lever, workday
 
 
 @pytest.fixture
@@ -296,6 +297,21 @@ def test_detect_state(page, state):
     assert workday.detect_state(page) == state
 
 
+def test_continue_application_button_is_a_posting_entry(page, monkeypatch):
+    from types import SimpleNamespace
+    page.set_content('<button id="continue" onclick="this.dataset.clicked=\'yes\'">Continue Application</button>')
+    assert workday.detect_state(page) == 'posting'
+    monkeypatch.setattr(workday, 'human_pause', lambda *a, **k: None)
+    ctx = _Ctx(page)
+    ctx.browser = SimpleNamespace(pages=[page])
+    run = workday._Run(_job(), ctx)
+    run.wait_state = lambda *a, **k: 'wizard'
+
+    run.start_application()
+
+    assert page.locator('#continue').get_attribute('data-clicked') == 'yes'
+
+
 def test_step_name_and_review(page):
     page.set_content(FIXTURES["wizard"])
     assert workday.step_name(page) == "My Information"
@@ -308,6 +324,107 @@ def test_step_name_and_review(page):
     page.set_content('<div data-automation-id="applyFlowPage">' + _progress("Summary", ("Summary",)) +
                      '<button data-automation-id="bottom-navigation-next-button">Submit</button></div>')
     assert workday.is_review(page) and workday.detect_state(page) == "review"
+
+
+def test_resumed_workday_draft_rewinds_to_first_application_step(page, monkeypatch):
+    steps = ("Create Account/Sign In", "My Information", "My Experience", "Application Questions")
+    page.set_content(f'''<div data-automation-id="applyFlowPage">{_progress("My Experience", steps)}
+      <button id="back" onclick="moveBack()">Back</button>
+      <button data-automation-id="bottom-navigation-next-button">Save and Continue</button></div>
+      <script>
+        const labels = {list(steps)!r}; let current = 2;
+        function render() {{
+          const bar = document.querySelector('[data-automation-id="progressBar"]');
+          bar.innerHTML = labels.map((name, i) => `<li data-automation-id="${{i === current ? 'progressBarActiveStep' : 'progressBarInactiveStep'}}"><span>${{i === current ? 'current step' : 'step'}} ${{i + 1}} of ${{labels.length}}</span><br>${{name}}</li>`).join('');
+          document.querySelector('#back').disabled = current <= 1;
+        }}
+        function moveBack() {{ current--; render(); }}
+        render();
+      </script>''')
+    run = workday._Run(_job(), _Ctx(page))
+    monkeypatch.setattr(run, 'settle', lambda *a, **k: None)
+    monkeypatch.setattr(run, 'wait_form', lambda *a, **k: None)
+
+    run._rewind_to_first_application_step()
+
+    assert workday.step_name(page) == "My Information"
+    assert page.locator('#back').is_disabled()
+
+
+def test_workday_next_rechecks_button_label_after_pause(page, monkeypatch):
+    page.set_content('<button data-automation-id="bottom-navigation-next-button" '
+                     'onclick="this.dataset.clicked=\'true\'">Save and Continue</button>')
+    ctx = _Ctx(page)
+    ctx.dry_run = False
+    run = workday._Run(_job(), ctx)
+
+    def turn_next_into_submit():
+        page.locator(workday.NEXT).evaluate("el => el.innerText = 'Submit'")
+
+    monkeypatch.setattr(workday, "human_pause", turn_next_into_submit)
+
+    assert run.click_next() is False
+    assert page.locator(workday.NEXT).get_attribute("data-clicked") is None
+
+
+def test_workday_next_locator_cannot_turn_into_submit_during_click(page, monkeypatch):
+    from playwright.sync_api import Locator
+
+    page.set_content('<button data-automation-id="bottom-navigation-next-button" '
+                     'onclick="this.dataset.clicked=\'true\'">Save and Continue</button>')
+    run = workday._Run(_job(), _Ctx(page))
+    monkeypatch.setattr(workday, "human_pause", lambda *a, **k: None)
+    monkeypatch.setattr(run, "settle", lambda *a, **k: None)
+    original_click = run.click
+    monkeypatch.setattr(run, "click", lambda *a, **k: original_click(*a, timeout=200, **k))
+    monkeypatch.setattr(Locator, "scroll_into_view_if_needed",
+                        lambda locator, *a, **k: locator.evaluate("el => { el.innerText = 'Submit'; }"))
+
+    assert run.click_next() is False
+    assert page.locator(workday.NEXT).get_attribute("data-clicked") is None
+
+
+def test_workday_next_supports_aria_labeled_navigation_button(page, monkeypatch):
+    page.set_content('<button data-automation-id="bottom-navigation-next-button" aria-label="Continue" '
+                     'onclick="this.dataset.clicked=\'true\'"></button>')
+    run = workday._Run(_job(), _Ctx(page))
+    monkeypatch.setattr(workday, "human_pause", lambda *a, **k: None)
+
+    assert run.click_next() is True
+    assert page.locator(workday.NEXT).get_attribute("data-clicked") == "true"
+
+
+def test_workday_refreshes_blank_required_step_once(page, monkeypatch):
+    shell = '''<div data-automation-id="progressBar"><li data-automation-id="progressBarActiveStep">My Information</li></div>
+      <div data-automation-id="applyFlowPage"><button data-automation-id="bottom-navigation-next-button" disabled>Save and Continue</button></div>'''
+    page.set_content(shell)
+    run = workday._Run(_job(), _Ctx(page))
+    monkeypatch.setattr(run, "settle", lambda *a, **k: None)
+    monkeypatch.setattr(run, "wait_form", lambda *a, **k: None)
+    calls = []
+
+    def refresh(current_page):
+        calls.append(True)
+        current_page.set_content(shell.replace('</button></div>', '</button><input aria-label="Email"></div>'))
+
+    monkeypatch.setattr(workday, "refresh_page", refresh)
+
+    run._recover_blank_form("My Information")
+
+    assert calls == [True]
+    assert run._has_fillable_controls()
+
+
+def test_workday_stops_when_form_remains_blank_after_refresh(page, monkeypatch):
+    page.set_content('''<div data-automation-id="progressBar"><li data-automation-id="progressBarActiveStep">My Information</li></div>
+      <div data-automation-id="applyFlowPage"><button data-automation-id="bottom-navigation-next-button" disabled>Save and Continue</button></div>''')
+    run = workday._Run(_job(), _Ctx(page))
+    monkeypatch.setattr(run, "settle", lambda *a, **k: None)
+    monkeypatch.setattr(run, "wait_form", lambda *a, **k: None)
+    monkeypatch.setattr(workday, "refresh_page", lambda page: None)
+
+    with pytest.raises(workday._Stop, match="remained blank"):
+        run._recover_blank_form("My Information")
 
 
 def test_error_texts(page):
@@ -472,6 +589,34 @@ def test_workday_persistent_vps_error_stops_with_review_screenshot(page, tmp_db,
         page.goto("about:blank")
 
 
+def test_workday_auth_no_response_refreshes_once_without_resubmitting_credentials(page, monkeypatch):
+    url = "https://workday.test/apply"
+    visits = []
+
+    def respond(route):
+        visits.append(route.request.method)
+        body = ('<div data-automation-id="applyFlowPage">'
+                + _progress("My Information") + '<button data-automation-id="bottom-navigation-next-button">Save and Continue</button></div>'
+                if len(visits) == 2 else
+                '<div data-automation-id="applyFlowPage">'
+                + _progress("Create Account/Sign In")
+                + '<div data-automation-id="signInContent"></div></div>')
+        route.fulfill(status=200, content_type="text/html", body=f"<html><body>{body}</body></html>")
+
+    page.route("https://workday.test/**", respond)
+    try:
+        page.goto(url)
+        run = workday._Run(_job(), _Ctx(page))
+        monkeypatch.setattr(run, "settle", lambda *args, **kwargs: None)
+
+        assert run.auth_outcome(timeout=1) == "signed_in"
+        assert visits == ["GET", "GET"]
+        assert run.ctx.layers[0][0] == ("page_recovery", "attempted", "workday_auth_no_response")
+    finally:
+        page.unroute("https://workday.test/**", respond)
+        page.goto("about:blank")
+
+
 def test_workday_wizard_refreshes_vps_error_appearing_during_form_wait(page, tmp_db, monkeypatch):
     url = "https://workday.test/apply"
     visits = []
@@ -612,6 +757,62 @@ def test_ai_pick_option_uses_only_confirmed_facts(monkeypatch):
     assert '"school"' not in prompts[0]
 
 
+def test_ai_pick_option_uses_grounded_answer_and_field_context(monkeypatch):
+    prompts = []
+
+    def fake_generate_json(prompt, schema):
+        prompts.append(prompt)
+        return {'chosen_option': 'Evening'}
+
+    monkeypatch.setattr(llm, 'generate_json', fake_generate_json)
+    assert workday._ai_pick_option(
+        'Preferred shift', ['Select One', 'Morning', 'Evening'], {}, 'Evenings',
+        answer_source='profile', field_context='Question asks which shift the applicant prefers.',
+        job_context='Software Engineering Intern at ExampleCo') == 2
+    assert 'Approved answer for this field: "Evenings"' in prompts[0]
+    assert 'Question asks which shift the applicant prefers.' in prompts[0]
+    assert 'Software Engineering Intern at ExampleCo' in prompts[0]
+
+
+def test_ai_pick_option_can_follow_user_authorized_referral_policy(monkeypatch):
+    prompts = []
+
+    def fake_generate_json(prompt, schema):
+        prompts.append(prompt)
+        return {'chosen_option': 'Employee Referral'}
+
+    monkeypatch.setattr(llm, 'generate_json', fake_generate_json)
+    assert workday._ai_pick_option(
+        'How Did You Hear About Us?', ['Select One', 'Employee Referral', 'Career Site'],
+        {}, '', allow_any=True) == 1
+    assert 'user explicitly authorized any referral choice' in prompts[0]
+
+
+def test_workday_uses_dom_option_before_computer_use(workday_choice, monkeypatch):
+    from agent import vision_agent
+
+    page = workday_choice('Preferred shift', ['Morning', 'Evening'])
+    ctx = _Ctx(page)
+    ctx.config['computer_use'] = {'enabled': True}
+    run = workday._Run(_job(), ctx)
+    field = workday.Field('shift', 'Preferred shift', 'select', True, ['Morning', 'Evening'])
+    vision_calls = []
+
+    monkeypatch.setattr(vision_agent, 'vision_choose_option', lambda *a, **k: vision_calls.append(True))
+
+    assert run.choose_option(page.locator('#choice'), 'Evening', field=field)
+    assert page.locator('#choice').inner_text() == 'Evening'
+    assert vision_calls == []
+
+
+def test_ai_pick_option_does_not_guess_generic_fields_without_grounding(monkeypatch):
+    def should_not_call_llm(*args, **kwargs):
+        pytest.fail('AI must not be invoked without a grounded answer or explicit policy')
+
+    monkeypatch.setattr(llm, 'generate_json', should_not_call_llm)
+    assert workday._ai_pick_option('Preferred shift', ['Morning', 'Evening'], {}, 'Evenings') is None
+
+
 def test_unmatched_required_options_are_not_guessed():
     for texts in (["Select One", "Accounting", "Other"], ["Select One", "Morning", "Evening"]):
         assert workday._pick_option_index(texts, "Computer Science", is_required=True) is None
@@ -750,13 +951,16 @@ def test_choose_option_ai_caller_passes_only_profile_facts(page, monkeypatch):
     </div>''')
     captured = []
 
-    def record_ai_call(label, texts, info, wanted):
+    def record_ai_call(label, texts, info, wanted, **kwargs):
         captured.append(info)
         return None
 
     monkeypatch.setattr(workday, '_ai_pick_option', record_ai_call)
-    run = workday._Run(_job(), _Ctx(page))
+    ctx = _Ctx(page)
+    ctx.profile = {'education': {'degree_full': "Associate's"}}
+    run = workday._Run(_job(), ctx)
     field = workday.Field('aa-degree', 'Degree', 'select', True)
+    run.answers[field.key] = workday.Answer(field.key, 'Unlisted Qualification', 'profile')
     assert not run.choose_option(page.locator('#degree'), 'Unlisted Qualification', field=field)
     assert captured
     for fact in ('us_citizen', 'authorized_us', 'needs_sponsorship', 'willing_to_relocate'):
@@ -895,6 +1099,59 @@ def test_workday_multiselect_enters_to_open_and_semantically_match_suggestion(pa
     assert len(prompts) == 1 and '"JS"' in prompts[0] and '"JavaScript"' in prompts[0]
 
 
+@pytest.mark.parametrize(('mode', 'answer'), [
+    ('optioned', 'JavaScript'), ('free_entry', 'Rust'), ('unselected', 'Rust'),
+])
+def test_workday_fill_step_verifies_skill_tags_from_extracted_selectinput(page, monkeypatch, mode, answer):
+    from agent import answers as answers_mod
+
+    page.set_content('''<div data-automation-id="applyFlowPage">
+      <div data-automation-id="formField-skills" aria-required="true">
+        <div data-automation-id="formLabel">Skills*</div>
+        <div data-automation-id="multiselectInputContainer">
+          <input id="skills" data-aa-key="skills" data-uxi-widget-type="selectinput" style="width:240px">
+        </div>
+        <div id="suggestions" role="listbox" style="display:none"></div>
+      </div></div>''')
+    page.evaluate('''({mode, answer}) => {
+      const input = document.querySelector('#skills');
+      const menu = document.querySelector('#suggestions');
+      const addChip = text => {
+        const chip = document.createElement('span');
+        chip.dataset.automationId = 'selectedItem';
+        chip.innerHTML = `<span data-automation-id="selectedItemText">${text}</span>`;
+        document.querySelector('[data-automation-id="formField-skills"]').append(chip);
+        input.value = '';
+      };
+      input.addEventListener('keydown', event => {
+        if (event.key !== 'Enter') return;
+        event.preventDefault();
+        if (mode === 'unselected') return;
+        if (mode === 'free_entry') { addChip(answer); return; }
+        menu.innerHTML = `<div role="option">${answer}</div>`;
+        menu.style.display = 'block';
+        menu.firstElementChild.onclick = () => { addChip(answer); menu.style.display = 'none'; };
+      });
+    }''', {'mode': mode, 'answer': answer})
+    monkeypatch.setattr(answers_mod, 'answer_fields', lambda fields, *a, **k: [
+        workday.Answer(field.key, answer, 'profile') for field in fields])
+    run = workday._Run(_job(), _Ctx(page))
+
+    run.fill_step('Application Questions')
+
+    field = next(iter(run.fields.values()))
+    assert field.kind == 'combobox'
+    chips = page.locator('[data-automation-id="selectedItemText"]').all_inner_texts()
+    if mode == 'unselected':
+        assert chips == []
+        assert page.locator('#skills').input_value() == answer
+        assert run.answers[field.key].source == 'unknown'
+    else:
+        assert chips == [answer]
+        assert page.locator('#skills').input_value() == ''
+        assert run.answers[field.key].value == [answer]
+
+
 def test_workday_multiselect_does_not_type_into_another_open_dropdown(page):
     page.set_content('''<div data-automation-id="applyFlowPage">
       <div data-automation-id="formField-fieldOfStudy"><label>Field of Study*</label>
@@ -989,6 +1246,47 @@ def test_workday_major_scrolls_lazy_options_to_exact_match(page):
     assert page.locator('#cs').count() == 1
     assert page.locator('#majors [data-incorrectly-selected]').count() == 0
     assert run.answers['major'].value == 'Computer Science'
+
+
+def test_workday_state_scrolls_lazy_options_to_semantic_match(page):
+    page.set_content('''<div data-automation-id="formField-state"><label>State*</label>
+      <button id="state" data-aa-key="state" aria-controls="states" aria-expanded="false"
+        onclick="document.querySelector('#states').style.display='block'">Select One</button>
+      <div id="states" role="listbox" style="max-height:60px;overflow-y:auto;display:none">
+        <div role="option">Alabama</div><div role="option">Alaska</div>
+        <div role="option">Arizona</div><div role="option">Arkansas</div>
+      </div></div><script>
+      const state = document.querySelector('#state'), states = document.querySelector('#states');
+      for (let i = 0; i < 20; i++) states.insertAdjacentHTML('beforeend', `<div role="option">Other ${i}</div>`);
+      states.onscroll = () => {
+        if (states.scrollTop > 100 && !document.querySelector('#ny')) {
+          states.insertAdjacentHTML('beforeend', '<div role="option" id="ny">New York</div>');
+          document.querySelector('#ny').onclick = () => {
+            state.textContent = 'New York'; states.style.display = 'none'; state.setAttribute('aria-expanded', 'false');
+          };
+        }
+      };
+    </script>''')
+    run = workday._Run(_job(), _Ctx(page))
+    field = workday.Field('state', 'State', 'select', True, name='formField-state')
+
+    assert run.choose_option(page.locator('#state'), 'NY', field=field)
+    assert page.locator('#state').inner_text() == 'New York'
+
+
+def test_lever_location_picker_selects_only_matching_city_and_state(page):
+    page.set_content('''<input id="location-input" name="location" value="San Francisco, CA"
+      oninput="document.querySelector('.dropdown-results').style.display='block'">
+      <input id="selected-location" type="hidden" value="">
+      <div class="dropdown-results" style="display:none">
+        <div onclick="document.querySelector('#selected-location').value='wrong'">San Jose, California, United States</div>
+        <div onclick="document.querySelector('#selected-location').value=this.textContent">San Francisco, California, United States</div>
+      </div>''')
+    field = workday.Field('location', 'Location', 'combobox', True, name='location')
+
+    lever._pick_location(page, [field], [workday.Answer('location', 'San Francisco, CA', 'profile')])
+
+    assert page.locator('#selected-location').input_value() == 'San Francisco, California, United States'
 
 
 def test_workday_education_years_use_profile_and_fill_year_only_fields(page, monkeypatch):
@@ -1120,7 +1418,7 @@ def test_plain_date_rejects_truncation_and_invalid_input(page):
     assert page.locator('input').input_value() == ''
 
 
-def test_profile_major_is_not_fuzzily_coerced_before_workday_selection(page):
+def test_profile_major_is_not_fuzzily_coerced_before_workday_selection(page, monkeypatch):
     page.set_content('''<div data-automation-id="applyFlowPage"><div data-automation-id="formField-major">
       <label>Field of Study*</label><button id="major" aria-haspopup="listbox" onclick="document.querySelector('[role=listbox]').style.display='block'">Select One</button></div>
       <div role="listbox" style="display:none"><div role="option" onclick="document.querySelector('#major').innerText=this.innerText">Computer Science Education</div></div></div>
@@ -1128,9 +1426,80 @@ def test_profile_major_is_not_fuzzily_coerced_before_workday_selection(page):
     ctx = _Ctx(page)
     ctx.profile = {'education': {'major': 'Computer Science'}}
     run = workday._Run(_job(), ctx)
+    prompts = []
+
+    def return_no_equivalent(prompt, schema):
+        prompts.append(prompt)
+        return {'chosen_option': None}
+
+    monkeypatch.setattr(llm, 'generate_json', return_no_equivalent)
     run.fill_step('My Information')
     assert page.locator('#major').inner_text() == 'Select One'
     assert any(f.required and run.answers[f.key].source == 'unknown' for f in run.fields.values())
+    assert any('Computer Science and Computer Engineering are distinct' in prompt for prompt in prompts)
+
+
+def test_workday_major_does_not_substitute_computer_engineering_for_computer_science(page, monkeypatch):
+    page.set_content('''<div data-automation-id="applyFlowPage">
+          <div data-automation-id="formField-fieldOfStudy"><label>Field of Study*</label>
+        <button id="major" data-aa-key="major" aria-haspopup="listbox" onclick="document.querySelector('[role=listbox]').style.display='block'">Select One</button>
+      </div><div role="listbox" style="display:none"><div role="option" id="engineering"
+        onclick="this.dataset.clicked='yes'; document.querySelector('#major').innerText=this.innerText">Computer Engineering</div></div></div>''')
+    prompts = []
+
+    def return_no_equivalent(prompt, schema):
+        prompts.append(prompt)
+        return {'chosen_option': None}
+
+    monkeypatch.setattr(llm, 'generate_json', return_no_equivalent)
+    run = workday._Run(_job(), _Ctx(page))
+    field = workday.Field('major', 'Field of Study', 'select', True, name='formField-fieldOfStudy')
+    run.answers[field.key] = workday.Answer(field.key, 'Computer Science', 'profile')
+
+    assert not run.choose_option(page.locator('#major'), 'Computer Science', field=field)
+    assert page.locator('#major').inner_text() == 'Select One'
+    assert page.locator('#engineering').get_attribute('data-clicked') is None
+    assert 'major' not in run.expected_answers
+    assert any('Computer Science and Computer Engineering are distinct' in prompt for prompt in prompts)
+
+
+def test_workday_major_replaces_saved_computer_engineering_with_computer_science(page):
+    page.set_content('''<div data-automation-id="applyFlowPage"><div data-automation-id="formField-fieldOfStudy">
+      <label>Field of Study*</label><div data-automation-id="multiselectInputContainer">
+        <input id="major" data-aa-key="major" onclick="document.querySelector('[role=listbox]').style.display='block'"></div>
+      <span data-automation-id="selectedItem"><span data-automation-id="selectedItemText">Computer Engineering</span>
+        <button aria-label="Remove Computer Engineering" onclick="this.closest('[data-automation-id=selectedItem]').remove()">x</button></span>
+      <div role="listbox" style="display:none"><div role="option" id="cs" onclick="this.closest('[role=listbox]').style.display='none';
+        document.querySelector('[data-automation-id=multiselectInputContainer]').insertAdjacentHTML('afterend',
+        '<span data-automation-id=selectedItem><span data-automation-id=selectedItemText>Computer Science</span></span>')">Computer Science</div></div>
+      </div></div>''')
+    run = workday._Run(_job(), _Ctx(page))
+    field = workday.Field('major', 'Field of Study', 'combobox', True, name='formField-fieldOfStudy')
+
+    assert run.choose_option(page.locator('#major'), 'Computer Science', multi=True, field=field)
+    chips = page.locator('[data-automation-id="selectedItemText"]').all_inner_texts()
+    assert chips == ['Computer Science']
+
+
+def test_workday_maps_profile_gpa_to_listed_dropdown_band(page, monkeypatch):
+    monkeypatch.setattr(workday, 'human_pause', lambda *a, **k: None)
+    page.set_content('''<div data-automation-id="applyFlowPage"><div data-automation-id="formField-gpa">
+      <div data-automation-id="formLabel">What is your current GPA?*</div>
+      <button id="gpa" data-automation-id="promptButton" aria-haspopup="listbox"
+        onclick="document.querySelector('#gpa-options').style.display='block'">Select One</button>
+      <div id="gpa-options" role="listbox" style="display:none">
+        <div role="option" onclick="const b=document.querySelector('#gpa'); b.innerText=this.innerText; this.parentElement.style.display='none'">3.50 - 4.00</div>
+        <div role="option" onclick="const b=document.querySelector('#gpa'); b.innerText=this.innerText; this.parentElement.style.display='none'">3.00 - 3.49</div>
+      </div></div></div>''')
+    ctx = _Ctx(page)
+    ctx.profile = {'education': {'gpa': '3.74'}}
+    run = workday._Run(_job(), ctx)
+
+    run.fill_step('Application Questions')
+
+    field = next(f for f in run.fields.values() if 'gpa' in f.label.lower())
+    assert page.locator('#gpa').inner_text() == '3.50 - 4.00'
+    assert run.answers[field.key].value == '3.50 - 4.00'
 
 
 @pytest.mark.parametrize('label,profile,option,selected', [
@@ -1246,6 +1615,65 @@ def test_native_phone_full_step_does_not_invent_mobile(page):
 ])
 def test_workday_exact_phone_country_alias_and_no_fuzzy_matching(requested, options, expected):
     assert workday._match_option(options, requested) == expected
+
+
+def test_workday_single_selected_chip_uses_country_alias_matching(page):
+    page.set_content('''<div data-automation-id="formField-countryPhoneCode">
+      <label>Country Phone Code*</label><div data-automation-id="multiselectInputContainer">
+        <input id="code" data-aa-key="code" data-uxi-widget-type="selectinput"></div>
+      <span data-automation-id="selectedItem">United States of America (+1)</span></div>''')
+    run = workday._Run(_job(), _Ctx(page))
+    field = workday.Field('code', 'Country Phone Code', 'combobox', True,
+                          name='formField-countryPhoneCode')
+
+    assert run._is_multiselect_input(page.locator('#code'))
+    assert run.fill_workday_widget(field, workday.Answer('code', 'United States (+1)', 'profile'))
+    assert run.answers['code'].value == 'United States of America (+1)'
+
+
+def test_workday_review_does_not_verify_country_code_from_phone_number_row(page):
+    run = workday._Run(_job(), _Ctx(page))
+    field = workday.Field('phone_code', 'Country Phone Code', 'select', True,
+                          name='formField-countryPhoneCode')
+    run.fields[field.key] = field
+    run.answers[field.key] = workday.Answer(field.key, 'United States (+1)', 'profile')
+    run._review_rows = lambda: [{
+        'label': 'Phone Number', 'value': '+1 555 0100', 'name': 'formField-phoneNumber', 'context': 'Phone',
+    }]
+
+    assert run.verify_review() == ['Country Phone Code']
+    assert run.answers[field.key].source == 'unknown'
+
+
+@pytest.mark.parametrize('field,expected,actual', [
+    (workday.Field('state', 'State', 'select', True), 'NY', ['New York']),
+    (workday.Field('phone_code', 'Country Phone Code', 'select', True),
+     'United States (+1)', ['United States of America (+1)']),
+    (workday.Field('location', 'Current Location', 'combobox', True),
+     'San Francisco, CA', ['San Francisco, California, United States']),
+])
+def test_workday_review_accepts_verified_state_phone_and_location_aliases(page, field, expected, actual):
+    run = workday._Run(_job(), _Ctx(page))
+    assert run._value_matches(field, expected, actual)
+
+
+@pytest.mark.parametrize('note', [
+    'verified semantic Workday referral option',
+    'user-authorized Workday referral choice',
+])
+def test_workday_review_uses_saved_referral_option(page, note):
+    run = workday._Run(_job(), _Ctx(page))
+    field = workday.Field('referral', 'How Did You Hear About Us?', 'select', True,
+                          name='formField-howDidYouHear')
+    run.fields[field.key] = field
+    run.answers[field.key] = workday.Answer(field.key, 'Simplify', 'profile')
+    run.expected_answers[field.key] = workday.Answer(
+        field.key, 'Online Platform', 'generated', note)
+    run._profile_widget_answer = lambda _: workday.Answer(field.key, 'Simplify', 'profile')
+    run._review_rows = lambda: [{
+        'label': field.label, 'value': 'Online Platform', 'name': field.name, 'context': ''}]
+
+    assert run.verify_review() == []
 
 
 @pytest.mark.parametrize('options,expected', [
@@ -1471,6 +1899,74 @@ def test_workday_prompt_buttons_fill_grounded_yes_no_and_hold_broad_relationship
     assert relationship.required
     assert run.answers[relationship.key].source == 'unknown'
     assert not workday.submit_decision(list(run.fields.values()), list(run.answers.values()), 'full', False)[0]
+
+
+def test_workday_attaches_adjacent_export_control_definition_to_field(page, monkeypatch):
+    from agent import answers as answers_mod
+
+    monkeypatch.setattr(workday, 'human_pause', lambda *a, **k: None)
+
+    def answer_from_evidence(prompt, schema, **kwargs):
+        payload = json.loads(prompt.split("\n", 1)[1])
+        field = next(row for row in payload["fields"] if row["label"] == "Work Authorization")
+        evidence = next(item for item in field["evidence"] if "us_citizen: Yes" in item["text"])
+        return {'answers': [{'key': field['key'], 'value': 'Yes', 'source': 'bank',
+                            'evidence_ids': [evidence['id']]}]}
+
+    monkeypatch.setattr(answers_mod.llm, 'generate_json', answer_from_evidence)
+    instruction = '''<p>This position requires access to ITAR and EAR information. A “U.S. person” according to
+      the ITAR definition is a U.S. citizen, permanent resident, or protected individual.</p>'''
+    for placement in ('inside', 'between', 'next_field', 'unlabeled_field', 'zero_rect_unlabeled_field'):
+        inner = instruction if placement == 'inside' else ''
+        adjacent = instruction if placement == 'between' else ''
+        next_field_instruction = instruction if placement == 'next_field' else ''
+        unlabeled_instruction = instruction if placement in ('unlabeled_field', 'zero_rect_unlabeled_field') else ''
+        if placement == 'zero_rect_unlabeled_field':
+            unlabeled_instruction = ('General export compliance details. ' * 70) + instruction
+        style = 'style="display: contents"' if placement == 'zero_rect_unlabeled_field' else ''
+        page.set_content(f'''<div data-automation-id="applyFlowPage">
+          <div data-automation-id="formField-workAuthorization">
+            <div data-automation-id="formLabel">Work Authorization*</div>
+            <button id="workAuth" type="button" data-automation-id="promptButton" aria-haspopup="listbox"
+              onclick="document.querySelector('#auth-options').style.display='block'">Select One</button>
+            <div id="auth-options" role="listbox" style="display:none">
+              <div role="option" onclick="const b=document.querySelector('#workAuth'); b.innerText=this.innerText; this.parentElement.style.display='none'">Yes</div>
+              <div role="option" onclick="const b=document.querySelector('#workAuth'); b.innerText=this.innerText; this.parentElement.style.display='none'">No</div>
+            </div>
+            {inner}
+          </div>
+          {adjacent}
+          <div data-automation-id="formField-instructions" {style}>{unlabeled_instruction}</div>
+          <div data-automation-id="formField-documentation">
+            <div data-automation-id="formLabel">Can you provide documentation for the ITAR and EAR requirement above?*</div>
+            <button id="documentation" type="button" data-automation-id="promptButton" aria-haspopup="listbox"
+              onclick="document.querySelector('#documentation-options').style.display='block'">Select One</button>
+            <div id="documentation-options" role="listbox" style="display:none">
+              <div role="option" onclick="const b=document.querySelector('#documentation'); b.innerText=this.innerText; this.parentElement.style.display='none'">Yes</div>
+              <div role="option" onclick="const b=document.querySelector('#documentation'); b.innerText=this.innerText; this.parentElement.style.display='none'">No</div>
+            </div>
+            {next_field_instruction}
+          </div>
+        </div>''')
+        ctx = _Ctx(page)
+        ctx.profile = {'work_authorization': {'us_citizen': 'Yes'}}
+        run = workday._Run(_job(), ctx)
+
+        run.fill_step('Application Questions')
+
+        auth = next(f for f in run.fields.values() if f.label == 'Work Authorization')
+        documentation = next(f for f in run.fields.values() if 'documentation' in f.label.lower())
+        if placement == 'next_field':
+            assert 'ITAR definition is a U.S. citizen' not in auth.context
+            assert 'ITAR definition is a U.S. citizen' in documentation.context
+        else:
+            assert 'ITAR definition is a U.S. citizen' in auth.context
+        assert run.answers[auth.key].value == 'Yes'
+        assert run.answers[auth.key].source == 'bank'
+        assert page.locator('#workAuth').inner_text() == 'Yes'
+        assert documentation.label == 'Can you provide documentation for the ITAR and EAR requirement above?'
+        if placement == 'zero_rect_unlabeled_field':
+            assert len(auth.context) > 1200
 
 
 def test_workday_itron_prompt_button_resolves_former_employment(page, monkeypatch):
@@ -1702,20 +2198,21 @@ def test_workday_referral_uses_saved_source_when_initial_options_only_offer_othe
 
 
 @pytest.mark.parametrize('source,options', [
-    (None, ['Other', 'Job Board']),
-    ('Simplify', ['Career Center Advisor', 'Career Fair', 'Employee Referral', 'School Career Website']),
+    (None, ['Career Center Advisor', 'Career Fair', 'Employee Referral']),
+    ('Simplify', ['Career Center Advisor', 'Career Fair', 'Employee Referral']),
 ])
-def test_workday_required_referral_needs_a_truthful_source(workday_choice, source, options):
+def test_workday_required_referral_uses_user_authorized_choice(workday_choice, source, options):
     page = workday_choice('How Did You Hear About Us?', options)
     ctx = _Ctx(page)
     ctx.profile = {'preferences': {'how_did_you_hear': source}}
     run = workday._Run(_job(), ctx)
     run.fill_step('My Information')
-    run.fill_step('My Information', repair=['The field How Did You Hear About Us? is required.'])
-    assert page.locator('#choice').inner_text() == 'Select One'
-    result = run.review()
-    assert result.status == workday.ApplyStatus.NEEDS_REVIEW
-    assert result.unanswered_required == ['How Did You Hear About Us?']
+    field = next(iter(run.fields.values()))
+    assert page.locator('#choice').inner_text() in options
+    assert run.answers[field.key].value in options
+    assert run.answers[field.key].source == 'generated'
+    assert run.answers[field.key].note.startswith('user-authorized Workday referral')
+    assert run.expected_answers[field.key].value == run.answers[field.key].value
 
 
 @pytest.mark.parametrize('kind', ['native', 'prompt', 'radio'])
@@ -1833,6 +2330,61 @@ def test_workday_boolean_false_radio_answer_is_verified(workday_choice, monkeypa
     run.fill_step('Application Questions')
     assert page.locator('input:checked').input_value() == 'No'
     assert next(iter(run.answers.values())).value == 'No'
+
+
+def test_workday_explicit_us_person_definition_survives_llm_outage(workday_choice):
+    page = workday_choice('Work Authorization', ['Yes', 'No'])
+    page.locator('[data-automation-id="formField-test"]').evaluate("""el => {
+      const note = document.createElement('p');
+      note.textContent = 'A U.S. person according to the ITAR definition is a U.S. citizen, lawful permanent resident, or protected individual.';
+      el.append(note);
+    }""")
+    ctx = _Ctx(page)
+    ctx.profile = {'work_authorization': {'us_citizen': 'Yes'}}
+    run = workday._Run(_job(), ctx)
+
+    run.fill_step('Application Questions')
+
+    field = next(iter(run.fields.values()))
+    assert 'U.S. person' in field.context
+    assert run.answers[field.key].value == 'Yes'
+    assert run.answers[field.key].source == 'profile'
+    assert page.locator('#choice').inner_text() == 'Yes'
+    assert run.review().unanswered_required == []
+
+
+def test_workday_retries_a_known_answer_once_when_selection_verification_fails(workday_choice, monkeypatch):
+    page = workday_choice('Are you authorized to work in the United States?', ['Yes', 'No'], kind='radio')
+    ctx = _Ctx(page)
+    ctx.profile = {'work_authorization': {'us_citizen': 'Yes'}}
+    run = workday._Run(_job(), ctx)
+    fill_calls = []
+    fill = run.fill_workday_widget
+
+    def retry_once(field, answer):
+        fill_calls.append(field.key)
+        return False if len(fill_calls) == 1 else fill(field, answer)
+
+    monkeypatch.setattr(run, 'fill_workday_widget', retry_once)
+    run.fill_step('Application Questions')
+
+    assert len(fill_calls) == 2
+    assert page.locator('input:checked').input_value() == 'Yes'
+    assert run.answers[run.current_step_fields[0].key].value == 'Yes'
+
+
+def test_workday_does_not_advance_with_an_unresolved_required_answer(workday_choice, monkeypatch):
+    page = workday_choice('Are you authorized to work in the United States?', ['Yes', 'No'], kind='radio')
+    run = workday._Run(_job(), _Ctx(page))
+    click_calls = []
+    monkeypatch.setattr(run, 'click_next', lambda: click_calls.append(True) or True)
+
+    run.fill_step('Application Questions')
+    with pytest.raises(workday._Stop) as exc:
+        run.advance('Application Questions')
+
+    assert exc.value.result.status == workday.ApplyStatus.NEEDS_REVIEW
+    assert click_calls == []
 
 
 def test_workday_radio_recovers_when_a_stale_prompt_covers_its_label(workday_choice):

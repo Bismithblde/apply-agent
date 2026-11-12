@@ -88,7 +88,11 @@ class GreenhouseAdapter:
                 return ApplyResult(ApplyStatus.SKIPPED, "posting closed", screenshot=shot, final_url=page.url)
             return ApplyResult(ApplyStatus.NEEDS_REVIEW, "Greenhouse application form not found",
                                screenshot=shot, final_url=page.url)
-        scope.locator(_FORM_SEL).first.scroll_into_view_if_needed(timeout=5000)
+        try:
+            scope.locator(_FORM_SEL).first.scroll_into_view_if_needed(timeout=5000)
+        except Exception as e:
+            log.info("Greenhouse form scroll failed; continuing with field-level interaction (%s)",
+                     type(e).__name__)
         job_text = page_text(page)
         fields, answers, failed = fill_form(scope, job, ctx.profile, job_text=job_text, layer_context=ctx)
         if not fields:

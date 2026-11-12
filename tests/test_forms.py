@@ -446,6 +446,48 @@ def test_city_autocomplete_commits_full_profile_location_and_rejects_similar_cit
     assert not page.evaluate("window.wrongClick || false")
 
 
+@pytest.mark.parametrize(("shown", "matches"), [
+    ("San Francisco, California, United States", True),
+    ("West New York, New Jersey, United States", False),
+])
+def test_location_combo_verification_requires_same_city_and_state(page, shown, matches):
+    page.set_content(f'<label for="location">Current location</label>'
+                     f'<input id="location" role="combobox" aria-expanded="false" value="{shown}">')
+    field = _by_label(form.extract_fields(page, probe_options=False))["Current location"]
+    assert form._verify(page, field, "San Francisco, CA") is matches
+
+
+def test_location_autocomplete_selects_full_state_name_for_abbreviated_answer(page):
+    page.set_content('''<form><label for="location">Current location</label><div>
+      <input id="location" role="combobox" aria-controls="locations" aria-expanded="false">
+      <div id="locations" role="listbox" hidden>
+        <div role="option" onclick="const input=document.querySelector('#location'); input.value='';
+          input.setAttribute('aria-expanded','false'); this.parentElement.hidden=true;
+          const display=document.createElement('span'); display.className='single-value';
+          display.textContent=this.textContent; this.parentElement.parentElement.append(display)">
+          San Francisco, California, United States</div>
+      </div></div></form>
+      <script>document.querySelector('#location').onclick = () => {
+        document.querySelector('#locations').hidden=false;
+        document.querySelector('#location').setAttribute('aria-expanded','true');
+      };</script>''')
+    field = _by_label(form.extract_fields(page, probe_options=False))["Current location"]
+
+    assert form._fill_one(page, field, "San Francisco, CA")
+    assert form._verify(page, field, "San Francisco, CA")
+
+
+def test_location_profile_answer_maps_abbreviation_to_available_city_option():
+    field = Field("location", "Current location", "combobox", True,
+                  options=["San Francisco, CA, US"])
+    profile = {"personal": {"city": "San Francisco", "state": "California", "state_abbr": "CA",
+                             "country": "United States", "location": "San Francisco, CA"}}
+
+    answer = answers.answer_fields([field], JOB, profile)[0]
+
+    assert answer.value == "San Francisco, CA, US"
+
+
 @pytest.mark.parametrize(("wanted", "offered"), [
     ("Stony Brook University", "Aston University"), ("May 2027", "January 2027"),
     ("May 2027", "May 2028"), ("May 2027", "May 2027 - August 2028"),
@@ -876,6 +918,30 @@ def test_captcha_detect_and_unsupported_without_key(page, monkeypatch):
     assert out.status == "unsupported" and captcha.blocks_submit(out)
 
 
+def test_unrecognized_visible_slider_challenge_blocks_submit_without_provider_request(page, monkeypatch):
+    page.set_content('''<div role="slider" aria-label="Slide to verify" class="security-slider"
+      style="width:320px;height:40px">Complete the CAPTCHA by sliding the puzzle.</div>''')
+    hit = captcha.detect(page)
+    assert hit is not None and hit[2] == "unknown_challenge"
+    monkeypatch.setenv("CAPSOLVER_API_KEY", "test-key")
+    monkeypatch.setattr(captcha.requests, "post", lambda *a, **k: pytest.fail("unknown challenge must not be sent to provider"))
+    monkeypatch.setattr(captcha.db, "captcha_spend_since", lambda *a: pytest.fail("unknown challenge must not reserve budget"))
+
+    result = captcha.solve_if_present(page, {"captcha": {}})
+
+    assert result.status == "unsupported" and result.kind == "unknown_challenge"
+    assert captcha.blocks_submit(result)
+
+
+def test_captcha_detection_error_blocks_submit(page, monkeypatch):
+    monkeypatch.setattr(captcha, "detect", lambda _: (_ for _ in ()).throw(RuntimeError("synthetic")))
+
+    result = captcha.solve_if_present(page, {})
+
+    assert result.status == "unsupported" and result.kind == "unknown_challenge"
+    assert captcha.blocks_submit(result)
+
+
 def test_captcha_none(page):
     _load(page, "form_basic.html")
     assert captcha.solve_if_present(page, {}).status == "none"
@@ -1052,6 +1118,7 @@ def test_computer_use_uses_screenshot_and_field_context(page, monkeypatch):
     page.set_content('<form><label for="name">First Name</label><input id="name" '
                      'style="position:absolute;left:200px;top:200px;width:200px;height:40px"></form>')
     field = form.extract_fields(page)[0]
+    field.context = "Enter the applicant's preferred legal first name."
     answer = Answer(field.key, "Jordan Lee", "profile")
     target = page.locator(f'[data-aa-key="{field.key}"]')
     box = target.bounding_box()
@@ -1077,6 +1144,47 @@ def test_computer_use_uses_screenshot_and_field_context(page, monkeypatch):
     assert observed["images"] and observed["images"][0].startswith(b"\xff\xd8")
     assert "Page and target context" in observed["prompt"]
     assert "First Name" in observed["prompt"]
+    assert field.context in observed["prompt"]
+
+
+def test_extract_fields_keeps_help_text_as_field_context(page):
+    page.set_content('<label for="state">State</label><select id="state" aria-describedby="state-help">'
+                     '<option>New York</option></select><p id="state-help">Select your state of residence.</p>')
+
+    field = form.extract_fields(page)[0]
+
+    assert field.context == "Select your state of residence."
+
+
+def test_computer_use_dropdown_receives_field_context_and_choices(page, monkeypatch):
+    from agent import vision_agent
+
+    page.set_content('<select id="state" data-aa-key="state">'
+                     '<option value="">Select one</option><option value="NY">New York</option>'
+                     '<option value="CA">California</option></select>')
+    field = Field("state", "State", "select", True, ["New York", "California"],
+                  context="Choose the applicant's current state of residence.")
+    answer = Answer(field.key, "New York", "profile")
+    monkeypatch.setattr(form, "_fill_one", lambda *args: False)
+    observed = {}
+
+    def choose(page, locator, label, value, *, context=""):
+        observed["context"] = context
+        locator.select_option(label=value)
+        return True
+
+    monkeypatch.setattr(vision_agent, "vision_choose_option", choose)
+    ctx = _ctx(page, submit_mode="fill_only")
+    ctx.config["computer_use"] = {"enabled": True}
+
+    failed = form.fill_fields(page, [field], [answer], page=page, layer_context=ctx)
+
+    assert failed == []
+    assert observed["context"] == (
+        "Field kind: select. Required: True. Target label: State. "
+        "Field context: Choose the applicant's current state of residence.\n"
+        "Available choices: New York, California"
+    )
     assert any(event.layer == "computer_use" and event.outcome == "verified" for event in ctx.layer_trace)
 
 
