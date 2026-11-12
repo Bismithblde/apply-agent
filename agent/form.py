@@ -625,12 +625,12 @@ def extract_fields(scope, root: str | None = None, *, probe_options: bool = True
         log.warning("extract_fields failed (%s)", type(e).__name__)
         return []
     fields = [Field(key=r["key"], label=r["label"][:2000], kind=r["kind"], required=bool(r["required"]),
-                    options=[o for o in r["options"] if o][:3000], name=r["name"] or "",
+                    options=[o for o in r["options"] if o], name=r["name"] or "",
                     placeholder=r["placeholder"] or "", current_value=str(r["current_value"] or ""),
                     context=str(r.get("context") or "")[:3000])
               for r in raw]
     if probe_options:
-        for f in [f for f in fields if f.kind == "combobox" and not f.options][:30]:
+        for f in (f for f in fields if f.kind == "combobox" and not f.options):
             f.options = _probe_combo(scope, f.key)
     return fields
 
@@ -697,7 +697,7 @@ def _probe_combo(scope, key: str) -> list[str]:
         time.sleep(0.35)
         opts = loc.evaluate(_COMBO_OPTIONS_JS)
         loc.press("Escape", timeout=1500)
-        return list(dict.fromkeys(opts))[:300]
+        return list(dict.fromkeys(opts))
     except Exception:
         return []
 

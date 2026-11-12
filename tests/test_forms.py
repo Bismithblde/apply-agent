@@ -716,7 +716,7 @@ def test_phone_device_type_and_heard_profile():
     assert ans["p2"].value == "Cell" and ans["p2"].source == "profile"
     assert ans["p3"].value == "Cellular" and ans["p3"].source == "profile"
     assert ans["p4"].value == "718-219-8854" and ans["p4"].source == "profile"
-    assert ans["h1"].value is None and ans["h1"].source == "unknown"
+    assert ans["h1"].value == "Billboard" and ans["h1"].source == "generated"
     assert ans["h2"].value == "Simplify" and ans["h2"].source == "profile"
     assert ans["h3"].value == "Job Board" and ans["h3"].source == "profile"
 
@@ -1154,6 +1154,23 @@ def test_extract_fields_keeps_help_text_as_field_context(page):
     field = form.extract_fields(page)[0]
 
     assert field.context == "Select your state of residence."
+
+
+def test_extract_fields_and_combobox_probe_keep_all_observed_options(monkeypatch):
+    from types import SimpleNamespace
+
+    select_options = [f"Select choice {i}" for i in range(3101)]
+    raw = {"key": "choice", "label": "Choice", "kind": "select", "required": False,
+           "options": select_options, "name": "choice", "placeholder": "", "current_value": "", "context": ""}
+    field = form.extract_fields(SimpleNamespace(evaluate=lambda *_: [raw]), probe_options=False)[0]
+    assert field.options == select_options
+
+    combo_options = [f"Combo choice {i}" for i in range(301)]
+    locator = SimpleNamespace(evaluate=lambda *_: combo_options, press=lambda *_args, **_kwargs: None)
+    scope = SimpleNamespace(locator=lambda *_: locator)
+    monkeypatch.setattr(form, "_open_combo", lambda *_: None)
+    monkeypatch.setattr(form.time, "sleep", lambda *_: None)
+    assert form._probe_combo(scope, "choice") == combo_options
 
 
 def test_computer_use_dropdown_receives_field_context_and_choices(page, monkeypatch):
